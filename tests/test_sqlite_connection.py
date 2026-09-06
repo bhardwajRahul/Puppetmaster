@@ -24,6 +24,21 @@ from puppetmaster.sqlite_store import (
 )
 
 class SqliteConnectionPragmaTests(unittest.TestCase):
+    def test_readonly_setup_failure_closes_connection(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp))
+            connection = sqlite3.connect(store.db_path)
+            proxy = mock.MagicMock(wraps=connection)
+            proxy.execute.side_effect = sqlite3.OperationalError("setup failed")
+            try:
+                with mock.patch("sqlite3.connect", return_value=proxy):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        store._connect_readonly()
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            finally:
+                connection.close()
+
     def test_fresh_connections_apply_durable_pragma_policy(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")

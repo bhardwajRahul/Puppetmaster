@@ -7490,7 +7490,8 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             captured.update(kwargs)
             return FakeProcess()
 
-        with patch("subprocess.Popen", side_effect=fake_popen):
+        # Fake the ownership boundary; real Windows Popen must still use a Job Object.
+        with patch("puppetmaster.win_process.popen_owned", side_effect=fake_popen):
             result = run_streamed_subprocess(
                 command=[sys.executable, "-c", "print('ok')"],
                 env={},

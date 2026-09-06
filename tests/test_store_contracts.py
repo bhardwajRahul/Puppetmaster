@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,6 +22,34 @@ from puppetmaster.store_contracts import task_binding
 
 
 class StoreContractTests(unittest.TestCase):
+    def test_migration_and_metadata_connections_close_without_gc(self):
+        connect = sqlite3.connect
+        for name in (
+            "test_metadata_read_does_not_run_migration",
+            "test_projection_schema_change_drops_invalid_source_triggers_first",
+            "test_sqlite_v4_migration_marks_legacy_unknown",
+            "test_v5_init_repairs_old_cardinality_triggers",
+        ):
+            with self.subTest(test=name):
+                connections = []
+
+                def tracked_connect(*args, **kwargs):
+                    c = connect(*args, **kwargs)
+                    connections.append(c)
+                    return c
+
+                try:
+                    # Retain handles so GC cannot hide Windows file-lock leaks.
+                    with patch("sqlite3.connect", side_effect=tracked_connect):
+                        getattr(self, name)()
+                    self.assertTrue(connections)
+                    for c in connections:
+                        with self.assertRaises(sqlite3.ProgrammingError):
+                            c.execute("SELECT 1")
+                finally:
+                    for c in connections:
+                        c.close()
+
     def test_public_store_import_uses_supported_python_syntax(self):
         import ast
         import subprocess
@@ -218,7 +247,7 @@ class StoreContractTests(unittest.TestCase):
             store.init()
             job = store.create_job("existing", origin="host", project_id="p", session_id="s")
             store.save_job(replace(job, status=JobStatus.RUNNING))
-            with sqlite3.connect(store.db_path) as c:
+            with closing(sqlite3.connect(store.db_path)) as c, c:
                 history = c.execute("SELECT * FROM projection_changes ORDER BY revision").fetchall()
                 current = c.execute("SELECT * FROM projection_current ORDER BY kind,id").fetchall()
                 self.assertEqual(len(c.execute("PRAGMA table_info(projection_current)").fetchall()), 13)
@@ -234,7 +263,7 @@ class StoreContractTests(unittest.TestCase):
             for _ in range(2):
                 store = SQLiteSwarmStore(Path(tmp))
                 store.init()
-                with sqlite3.connect(store.db_path) as c:
+                with closing(sqlite3.connect(store.db_path)) as c, c:
                     self.assertEqual(c.execute("SELECT * FROM projection_changes ORDER BY revision").fetchall(), history)
                     self.assertEqual(c.execute("SELECT * FROM projection_current ORDER BY kind,id").fetchall(), current)
             fresh, created = store.create_or_get_job("new", launch_key="repair",
@@ -242,7 +271,7 @@ class StoreContractTests(unittest.TestCase):
             self.assertTrue(created)
             store.save_job(replace(fresh, status=JobStatus.RUNNING, origin="other"))
             store.save_job(replace(job, status=JobStatus.COMPLETE, origin="other"))
-            with sqlite3.connect(store.db_path) as c:
+            with closing(sqlite3.connect(store.db_path)) as c, c:
                 row = c.execute("SELECT status,previous_status,scope,previous_scope FROM projection_changes "
                                 "WHERE id=? ORDER BY revision DESC LIMIT 1", (job.id,)).fetchone()
                 self.assertEqual(row[:2], ("complete", "running"))
@@ -253,7 +282,7 @@ class StoreContractTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
             store.init()
-            with sqlite3.connect(store.db_path) as c:
+            with closing(sqlite3.connect(store.db_path)) as c, c:
                 c.execute("DROP TRIGGER projection_scope")
                 c.execute("ALTER TABLE projection_changes DROP COLUMN previous_scope")
                 c.execute("DROP TRIGGER projection_jobs_INSERT")
@@ -480,7 +509,7 @@ class StoreContractTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
             job = store.create_job("legacy")
-            with sqlite3.connect(store.db_path) as c:
+            with closing(sqlite3.connect(store.db_path)) as c, c:
                 for row in c.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
                     c.execute(f'DROP TRIGGER "{row[0]}"')
                 for table in ("projection_current", "projection_changes", "projection_meta", "projection_pending", "contract_receipts", "cancellation_targets"):
@@ -528,7 +557,7 @@ class StoreContractTests(unittest.TestCase):
     def test_metadata_read_does_not_run_migration(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with sqlite3.connect(root / "state.sqlite3") as c:
+            with closing(sqlite3.connect(root / "state.sqlite3")) as c, c:
                 c.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY, data TEXT)")
                 c.execute("INSERT INTO jobs VALUES('old', '{}')")
             store = SQLiteSwarmStore(root)

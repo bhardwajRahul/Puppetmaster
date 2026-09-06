@@ -2156,9 +2156,13 @@ class SQLiteSwarmStore(SwarmStore):
         connection = sqlite3.connect(
             uri, uri=True, timeout=self.busy_timeout_ms / 1000.0
         )
-        connection.row_factory = sqlite3.Row
-        # busy_timeout is connection-local and read-safe; keeps the probe bounded.
-        connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
+        try:
+            connection.row_factory = sqlite3.Row
+            # busy_timeout is connection-local and read-safe; keeps the probe bounded.
+            connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
+        except Exception:
+            connection.close()
+            raise
         return connection
 
     def backup_to(
