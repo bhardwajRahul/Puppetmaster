@@ -64,7 +64,7 @@ assert.equal(formatSelectedCost({total_marginal_cost_usd: .42}), "$0.4200");
 console.log("selected-cost-ok");
 """
         completed = subprocess.run(
-            [node, "-e", harness], capture_output=True, text=True, timeout=30
+            [node, "-"], input=harness, capture_output=True, text=True, timeout=30
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("selected-cost-ok", completed.stdout)
@@ -141,7 +141,7 @@ assert.ok(legacy.includes("99"));
 console.log("dashboard-renderers-ok");
 """
         completed = subprocess.run(
-            [node, "-e", harness], capture_output=True, text=True, timeout=30
+            [node, "-"], input=harness, capture_output=True, text=True, timeout=30
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("dashboard-renderers-ok", completed.stdout)

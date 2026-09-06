@@ -266,9 +266,11 @@ class ProcessTests(unittest.TestCase):
 
 
 class OwnershipUtilityTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_sigstop_permission_error_preserves_cleanup_and_timeout(self):
         self._check_group_permission_error(signal.SIGSTOP)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_sigkill_permission_error_preserves_cleanup_and_timeout(self):
         self._check_group_permission_error(signal.SIGKILL)
 
@@ -306,18 +308,23 @@ class OwnershipUtilityTests(unittest.TestCase):
                 self.assertEqual(process.kill.call_count, 2)
                 self.assertEqual(process.wait.call_count, 3)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_cleanup_discovery_error_preserves_original_timeout(self):
         self._check_cleanup_failure('discovery')
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_one_denied_descendant_does_not_stop_remaining_kills(self):
         self._check_cleanup_failure('descendant')
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_group_oserror_does_not_stop_remaining_layers(self):
         self._check_cleanup_failure('group')
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_leader_kill_error_still_attempts_bounded_wait(self):
         self._check_cleanup_failure('leader')
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_cleanup_wait_error_preserves_original_timeout(self):
         self._check_cleanup_failure('wait')
 
@@ -356,6 +363,7 @@ class OwnershipUtilityTests(unittest.TestCase):
                 self.assertGreater(process.wait.call_args.kwargs['timeout'], 0)
                 self.assertLessEqual(process.wait.call_args.kwargs['timeout'], 3)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_exhausted_cleanup_deadline_still_kills_group_and_leader(self):
         from puppetmaster import win_process
         from unittest.mock import Mock
@@ -378,6 +386,7 @@ class OwnershipUtilityTests(unittest.TestCase):
             self.assertEqual(win_process._owned_posix_pids('abc', .2), [10])
         self.assertEqual(run.call_args.kwargs['timeout'], .2)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_cleanup_reaps_leader_even_if_discovery_fails(self):
         from puppetmaster import win_process
         from unittest.mock import Mock
@@ -390,6 +399,7 @@ class OwnershipUtilityTests(unittest.TestCase):
         process.kill.assert_called_once()
         process.wait.assert_called_once()
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_cleanup_after_leader_exit_and_repeated_cleanup(self):
         from puppetmaster import win_process
         from unittest.mock import Mock

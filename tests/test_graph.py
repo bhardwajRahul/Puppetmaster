@@ -14,7 +14,7 @@ import json
 import os
 import sqlite3
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -176,7 +176,7 @@ class GraphStoreParityTests(unittest.TestCase):
             artifact = _decision_artifact(job.id, task.id, "preserve me")
             store.save_artifact(artifact)
             before = store.list_edges(job.id)
-            with sqlite3.connect(root / "state.sqlite3") as connection:
+            with closing(sqlite3.connect(root / "state.sqlite3")) as connection, connection:
                 connection.execute("DROP TABLE usage_observations")
                 connection.execute("DROP TABLE execution_attempts")
                 connection.execute("DROP TABLE budget_reservations")

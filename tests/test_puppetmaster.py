@@ -13470,10 +13470,12 @@ class InstallerTests(unittest.TestCase):
         from puppetmaster.installers import resolve_claude_command
 
         # Multi-word commands resolve their head and keep the tail.
-        resolved = resolve_claude_command(f'"{sys.executable}" -m something')
-        self.assertIsNotNone(resolved)
-        self.assertEqual(resolved[1:], ["-m", "something"])
-        self.assertIsNone(resolve_claude_command("/nonexistent/claude-nope"))
+        with patch("puppetmaster.installers.shutil.which", return_value=sys.executable) as which:
+            resolved = resolve_claude_command("python -m something")
+        which.assert_called_once_with("python")
+        self.assertEqual(resolved, [sys.executable, "-m", "something"])
+        with TemporaryDirectory() as tmp, patch("puppetmaster.installers.shutil.which", return_value=None):
+            self.assertIsNone(resolve_claude_command(str(Path(tmp) / "claude-nope")))
 
 class InstallHermesMcpTests(unittest.TestCase):
     """Tests for :func:`install_hermes_mcp` / :func:`uninstall_hermes_mcp`.

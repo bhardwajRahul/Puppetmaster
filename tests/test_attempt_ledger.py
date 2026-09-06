@@ -8,6 +8,7 @@ import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -162,7 +163,7 @@ class SQLiteLedgerTests(LedgerContract, unittest.TestCase):
         self.assertEqual(self.store.list_usage_observations(self.job.id), [])
 
     def test_migration_failure_rolls_back_tables_and_version(self):
-        with sqlite3.connect(Path(self.tmp.name) / "migration.sqlite3") as db:
+        with closing(sqlite3.connect(Path(self.tmp.name) / "migration.sqlite3")) as db, db:
             db.row_factory = sqlite3.Row
             db.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
             db.execute("INSERT INTO metadata VALUES('schema_version', '2')")
@@ -186,7 +187,7 @@ class SQLiteLedgerTests(LedgerContract, unittest.TestCase):
 
     def test_v2_migration_does_not_invent_history(self):
         self.store.save_run(self.run)
-        with sqlite3.connect(self.store.db_path) as db:
+        with closing(sqlite3.connect(self.store.db_path)) as db, db:
             db.execute("DROP TABLE usage_observations")
             db.execute("DROP TABLE execution_attempts")
             db.execute("UPDATE metadata SET value = '2' WHERE key = 'schema_version'")

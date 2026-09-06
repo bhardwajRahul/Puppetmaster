@@ -6,6 +6,7 @@ import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier
@@ -354,7 +355,7 @@ class SQLiteBudgetTests(BudgetContract, unittest.TestCase):
 
     def test_v3_migration_and_foreign_keys(self):
         self.store.record_attempt(self.attempt)
-        with sqlite3.connect(self.store.db_path) as db:
+        with closing(sqlite3.connect(self.store.db_path)) as db, db:
             db.execute("DROP TABLE budget_reservations")
             db.execute("UPDATE metadata SET value = '3' WHERE key = 'schema_version'")
         with self.assertRaises(SqliteSchemaError):
@@ -375,7 +376,7 @@ class SQLiteBudgetTests(BudgetContract, unittest.TestCase):
                 db.execute("INSERT INTO budget_reservations VALUES('absent','id','reserved','{}')")
 
     def test_migration_rollback(self):
-        with sqlite3.connect(self.store.db_path) as db:
+        with closing(sqlite3.connect(self.store.db_path)) as db, db:
             db.row_factory = sqlite3.Row
             db.execute("DROP TABLE budget_reservations")
             db.execute("UPDATE metadata SET value = '3' WHERE key = 'schema_version'")

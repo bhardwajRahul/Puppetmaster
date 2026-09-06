@@ -4,6 +4,7 @@ import os
 import sys
 from types import SimpleNamespace
 import unittest
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -258,7 +259,7 @@ class EconomicsProvenanceTests(unittest.TestCase):
             legacy['id'] = 'artifact_transient'
             legacy['type'] = 'execution_billing'
             legacy['payload'] = {'model_id': model.id, 'billing': 'api'}
-            with sqlite3.connect(store.db_path) as connection:
+            with closing(sqlite3.connect(store.db_path)) as connection, connection:
                 connection.execute(
                     'INSERT INTO artifacts(id, job_id, task_id, type, data) VALUES (?, ?, ?, ?, ?)',
                     (legacy['id'], job.id, task.id, legacy['type'], json.dumps(legacy)))
@@ -285,7 +286,7 @@ class EconomicsProvenanceTests(unittest.TestCase):
             self.assertEqual(price_job([*mixed, usage, route], [model]).tasks[0].billing,
                              'plan')
             reopened.save_artifact(converted)
-            with sqlite3.connect(store.db_path) as connection:
+            with closing(sqlite3.connect(store.db_path)) as connection, connection:
                 for kind, raw in connection.execute('SELECT type, data FROM artifacts'):
                     ReleasedArtifactType(kind)
                     ReleasedArtifactType(json.loads(raw)['type'])
