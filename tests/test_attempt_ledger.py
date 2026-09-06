@@ -172,10 +172,13 @@ class SQLiteLedgerTests(LedgerContract, unittest.TestCase):
                     return sqlite3.SQLITE_DENY
                 return sqlite3.SQLITE_OK
             db.set_authorizer(deny_second_table)
-            with self.assertRaises(sqlite3.DatabaseError):
-                with db:
-                    self.store._migrate_schema(db)
-            db.set_authorizer(None)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    with db:
+                        self.store._migrate_schema(db)
+            finally:
+                # Python 3.9 cannot disable the authorizer with None.
+                db.set_authorizer(lambda *unused: sqlite3.SQLITE_OK)
             self.assertEqual(db.execute("SELECT value FROM metadata").fetchone()[0], "2")
             self.assertIsNone(db.execute(
                 "SELECT name FROM sqlite_master WHERE name = 'execution_attempts'"

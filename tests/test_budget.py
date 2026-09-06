@@ -384,10 +384,13 @@ class SQLiteBudgetTests(BudgetContract, unittest.TestCase):
                 return (sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_CREATE_INDEX and
                         name == "idx_budget_job_state" else sqlite3.SQLITE_OK)
             db.set_authorizer(deny_index)
-            with self.assertRaises(sqlite3.DatabaseError):
-                with db:
-                    self.store._migrate_schema(db)
-            db.set_authorizer(None)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    with db:
+                        self.store._migrate_schema(db)
+            finally:
+                # Python 3.9 cannot disable the authorizer with None.
+                db.set_authorizer(lambda *unused: sqlite3.SQLITE_OK)
             self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "3")
             self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='budget_reservations'").fetchone())
 
