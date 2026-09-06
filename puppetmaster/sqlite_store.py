@@ -95,7 +95,7 @@ class SQLiteSwarmStore(SwarmStore):
     """SQLite-backed coordination store for multi-process worker coordination."""
 
     backend_name = "sqlite"
-    schema_version = 4
+    schema_version = 5
     busy_timeout_ms = _SQLITE_BUSY_TIMEOUT_MS
     synchronous_policy = _SQLITE_SYNCHRONOUS
 
@@ -360,6 +360,13 @@ class SQLiteSwarmStore(SwarmStore):
                 (str(self.schema_version),),
             )
 
+        # Generated SQL can be stale even when the table shape/version is current.
+        from puppetmaster.projections import install_source_triggers
+        install_source_triggers(connection)
+        if current < 5:
+            connection.execute("UPDATE metadata SET value=? WHERE key='schema_version'",
+                               (str(self.schema_version),))
+
     def _backfill_graph_edges(self, connection: sqlite3.Connection) -> None:
         """Materialize depends_on / produces edges from existing v1 rows."""
         existing = {
@@ -579,12 +586,18 @@ class SQLiteSwarmStore(SwarmStore):
         *,
         label: Optional[str] = None,
         budget_policy: Optional[BudgetPolicy] = None,
+        origin: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> Job:
         return self.create_or_get_job(
             goal,
             label=label,
+            origin=origin,
+            project_id=project_id,
+            session_id=session_id,
             budget_policy=budget_policy,
             launch_key=launch_key,
             launch_fingerprint=launch_fingerprint,
@@ -596,6 +609,9 @@ class SQLiteSwarmStore(SwarmStore):
         *,
         label: Optional[str] = None,
         budget_policy: Optional[BudgetPolicy] = None,
+        origin: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> tuple[Job, bool]:
@@ -604,6 +620,9 @@ class SQLiteSwarmStore(SwarmStore):
         job = Job(
             goal=goal,
             label=label,
+            origin=origin,
+            project_id=project_id,
+            session_id=session_id,
             budget_policy=budget_policy,
             launch_key=launch_key,
             launch_fingerprint=fingerprint if launch_key else None,
@@ -620,7 +639,10 @@ class SQLiteSwarmStore(SwarmStore):
                     if existing.launch_key != launch_key:
                         continue
                     if (existing.launch_fingerprint != fingerprint or
-                            existing.budget_policy != budget_policy):
+                            existing.budget_policy != budget_policy or
+                            existing.origin != origin or
+                            existing.project_id != project_id or
+                            existing.session_id != session_id):
                         raise LaunchConflictError(
                             "launch_key already belongs to a different request"
                         )
@@ -1165,6 +1187,9 @@ class SQLiteSwarmStore(SwarmStore):
     @contextmanager
     def _writer_scope(self):
         self._ensure_attached()
+        if getattr(self._completion_connection, "connection", None) is not None:
+            yield True
+            return
         with self._session() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._completion_connection.connection = connection
@@ -1180,12 +1205,21 @@ class SQLiteSwarmStore(SwarmStore):
         return self._completion_scope(job_id)
 
     def _save_completion(self, job_id: str, record: dict[str, Any]) -> None:
+        from puppetmaster.contracts import ContractConflict
         with self._session() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "INSERT INTO completions(id, job_id, data) VALUES (?, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data "
+                "WHERE completions.job_id = excluded.job_id",
                 (record["run"]["id"], job_id, json.dumps(record, sort_keys=True)),
             )
+            if not cursor.rowcount:
+                raise ContractConflict("completion run id belongs to another job")
+
+    def _get_completion(self, job_id: str, run_id: str):
+        rows = self._all("SELECT data FROM completions WHERE job_id = ? AND id = ?",
+                         (job_id, run_id))
+        return json.loads(rows[0]["data"]) if rows else None
 
     def _completion_records(self, job_id: str) -> list[dict[str, Any]]:
         return [json.loads(row["data"]) for row in self._all(
@@ -1497,6 +1531,7 @@ class SQLiteSwarmStore(SwarmStore):
                 task,
                 status=TaskStatus.BLOCKED,
                 attempts=0,
+                generation=(task.generation or 0) + 1,
                 lease_owner=None,
                 lease_expires_at=None,
                 lease_id=None,

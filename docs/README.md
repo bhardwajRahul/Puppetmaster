@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.23.0](CHANGELOG.md#v1230--2026-09-06) — durable completion recovery, invocation accounting, cumulative budgets, setup verification, and a dashboard UI overhaul. See [CHANGELOG.md](CHANGELOG.md) for migration and restart guidance.
+**Current release:** [v1.24.0](CHANGELOG.md#v1240--2026-09-06) — completion receipts, bounded metadata, scoped cancellation, effect replay fences, and process outcomes. Stop long-lived Puppetmaster processes before the SQLite v5 cutover and restart them on the new version. See [CHANGELOG.md](CHANGELOG.md) for migration and trigger repair details.
 
 ## Start here
 
@@ -35,6 +35,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | Doc | What's in it |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
+| [STORE_CONTRACTS.md](STORE_CONTRACTS.md) | Embedded metadata, identity, completion, cancellation, and effect APIs; migration guarantees |
 | [ATTEMPT_LEDGER.md](ATTEMPT_LEDGER.md) | Immutable invocation facts, usage observations, and consumption reports |
 | [BUDGET_RESERVATIONS.md](BUDGET_RESERVATIONS.md) | Cumulative limits, CLI/MCP inputs, reservation lifecycle, and enforcement limits |
 | [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md) | #88 inventory: confidence vs execution/grounding/claim-support/criterion status |

@@ -191,19 +191,14 @@ def stop_owned_process(process: subprocess.Popen, owner: str, deadline: float) -
     """Bound teardown by an absolute deadline, including after leader exit.
 
     POSIX ownership is inherited through the environment, independently of
-    session and parent IDs. Windows Toolhelp retains descendant parent IDs
-    after leader exit; use it before taskkill's already-gone fast path.
+    session and parent IDs. Windows uses the launch-owned Job Object.
     """
     if os.name == "nt":
-        try:
-            _toolhelp_kill_process_tree(process.pid, deadline=deadline)
-        except Exception:
-            pass
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
+        job = getattr(process, "_puppetmaster_job", None)
+        if job is not None:
             try:
-                _taskkill_process_tree(process.pid, timeout=remaining)
-            except Exception:
+                job.terminate()
+            except OSError:
                 pass
     else:
         # Freeze the original group while enumerating escaped descendants.
@@ -243,3 +238,169 @@ def stop_owned_process(process: subprocess.Popen, owner: str, deadline: float) -
             process.wait(timeout=remaining)
         except Exception:
             pass
+
+
+def cleanup_owned_process(process: subprocess.Popen, owner: str, deadline: float):
+    """Conservative cancellation cleanup using a live handle and an owner nonce.
+
+    POSIX groups require an unreaped launch-owned session leader; escaped
+    descendants require current exact nonce evidence. Windows uses a Job Object and the
+    held Popen handle, never cached ancestry or descendant PIDs.
+    This is bounded best effort, not containment or proof of remote cancellation.
+    """
+    descendant_outcome = "unknown"
+    if os.name == "posix" and getattr(process, "_puppetmaster_session", False):
+        # An unreaped child reserves its PID, hence its launch-time PGID.
+        # Exclude concurrent Popen.wait/poll reaping until after signalling;
+        # checking poll() first would release that reservation on leader exit.
+        remaining = deadline - time.monotonic()
+        if remaining > 0 and process._waitpid_lock.acquire(timeout=remaining):
+            try:
+                if process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        descendant_outcome = "partial"
+                    except OSError:
+                        pass
+            finally:
+                process._waitpid_lock.release()
+    if os.name == "nt":
+        job = getattr(process, "_puppetmaster_job", None)
+        if job is not None:
+            try:
+                job.terminate()
+                descendant_outcome = "partial"
+            except OSError:
+                pass
+    if os.name == "posix" and owner and deadline > time.monotonic():
+        try:
+            targets = _owned_posix_pids(owner, deadline - time.monotonic())
+            for pid in targets:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Revalidate each candidate immediately before signalling;
+                # stale discovery from a previous cleanup is never authority.
+                current = _owned_posix_pids(owner, remaining)
+                if pid in current:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            descendant_outcome = "partial"
+        except (OSError, subprocess.SubprocessError):
+            descendant_outcome = "unknown"
+    try:
+        # Popen owns its process handle and guards against a reaped PID.
+        if process.poll() is None:
+            process.kill()
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            process.wait(timeout=remaining)
+        exited = process.poll() is not None
+    except (OSError, subprocess.SubprocessError):
+        exited = False
+    from puppetmaster.contracts import ProcessCleanupReceipt
+    return ProcessCleanupReceipt("observed_exit" if exited else "unknown", descendant_outcome)
+
+
+class WindowsJob:
+    """Own descendants by kernel handle, including after the leader exits."""
+
+    def __init__(self):
+        import ctypes
+        import threading
+        from ctypes import wintypes
+        self.lock = threading.Lock()
+        self.api = ctypes.WinDLL("kernel32", use_last_error=True)
+        signatures = {
+            "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+            "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+            "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+        }
+        for name, (args, result) in signatures.items():
+            function = getattr(self.api, name)
+            function.argtypes, function.restype = args, result
+        self.handle = self.api.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+                        ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
+                        ("max_working_set", ctypes.c_size_t), ("active_processes", wintypes.DWORD),
+                        ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                        ("scheduling", wintypes.DWORD)]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [("basic", BasicLimits), ("io", ctypes.c_uint64 * 6),
+                        ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                        ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
+
+        limits = ExtendedLimits()
+        limits.basic.flags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign_and_resume(self, process):
+        import ctypes
+        from ctypes import wintypes
+        if not self.api.AssignProcessToJobObject(self.handle, int(process._handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # Popen closes the primary thread handle. Resume via the owned process
+        # handle only after assignment, so no descendant can escape the job.
+        resume = ctypes.WinDLL("ntdll").NtResumeProcess
+        resume.argtypes, resume.restype = [wintypes.HANDLE], ctypes.c_long
+        if resume(int(process._handle)) < 0:
+            raise OSError("NtResumeProcess failed")
+
+    def terminate(self):
+        import ctypes
+        with self.lock:
+            if self.handle and not self.api.TerminateJobObject(self.handle, 1):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self):
+        with self.lock:
+            if self.handle:
+                self.api.CloseHandle(self.handle)
+                self.handle = None
+
+
+def popen_owned(*args, **kwargs):
+    """Fail closed if Windows containment cannot be established before execution."""
+    if os.name != "nt":
+        process = subprocess.Popen(*args, **kwargs)
+        process._puppetmaster_session = bool(kwargs.get("start_new_session", False))
+        return process
+    job = WindowsJob()
+    process = None
+    try:
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x00000004  # CREATE_SUSPENDED
+        process = subprocess.Popen(*args, **kwargs)
+        job.assign_and_resume(process)
+        process._puppetmaster_job = job
+        return process
+    except BaseException:
+        try:
+            if process is not None:
+                process.kill()
+                process.wait(timeout=3)
+        finally:
+            job.close()
+        raise
+
+
+def close_owned_process(process):
+    job = getattr(process, "_puppetmaster_job", None)
+    if job is not None:
+        try:
+            job.terminate()
+        except OSError:
+            pass
+        finally:
+            job.close()

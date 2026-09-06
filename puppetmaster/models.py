@@ -154,6 +154,15 @@ class Job:
     # ArtifactType or store table. STALLED must not keep a receipt.
     cost_receipt: Optional[dict[str, Any]] = None
     budget_policy: Optional[BudgetPolicy] = None
+    origin: Optional[str] = None
+    project_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for name in ("origin", "project_id", "session_id"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value or len(value) > 256):
+                raise ValueError(f"invalid {name}")
 
 
 @dataclass(frozen=True)
@@ -176,6 +185,9 @@ class Task:
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     completed_at: Optional[str] = None
+
+    # New task/claim/reset epoch. Missing historical epochs stay unknown.
+    generation: Optional[int] = 0
 
 
 @dataclass(frozen=True)
@@ -398,6 +410,9 @@ def job_from_dict(data: dict[str, Any]) -> Job:
                        if data.get("budget_policy") is not None else None),
         goal=data["goal"],
         label=data.get("label"),
+        origin=data.get("origin"),
+        project_id=data.get("project_id"),
+        session_id=data.get("session_id"),
         status=_job_status_or_stalled(data["status"]),
         created_at=data["created_at"],
         completed_at=data.get("completed_at"),
@@ -423,6 +438,7 @@ def task_from_dict(data: dict[str, Any]) -> Task:
         payload=data.get("payload", {}),
         depends_on=data.get("depends_on", []),
         attempts=data.get("attempts", 0),
+        generation=data.get("generation"),
         lease_owner=data.get("lease_owner"),
         lease_expires_at=data.get("lease_expires_at"),
         lease_id=data.get("lease_id"),

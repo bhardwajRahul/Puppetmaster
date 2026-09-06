@@ -1,23 +1,48 @@
-"""In-process cooperative job cancellation.
+"""Scoped durable cooperative cancellation, with legacy standalone flags.
 
-A host embedding the orchestrator (e.g. Marionette's backend running inline
-agentic workers) calls :func:`request_cancel` with a job id; every agentic
-worker on that job stops at its next cancellation point:
-
-* mid-stream -- the delta sink raises :class:`JobCancelled`, aborting the
-  provider HTTP stream within one chunk (near-instant), and
-* per-turn -- the agent loop checks the flag before each provider call.
-
-Python threads cannot be force-killed, so this registry is the kill switch:
-cheap to check, safe to set from any thread, and keyed by job id so one flag
-stops every worker in the swarm.
+Execution-scoped workers consult their owning store and immutable lease binding.
+Unscoped string flags remain only for callers running adapters outside a store.
+A cooperative stop never proves that a remote provider or domain effect stopped.
 """
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_context = ContextVar("cancellation_scope", default=None)
+
+
+@contextmanager
+def cancellation_scope(store, task):
+    from puppetmaster.models import JobRef
+    from puppetmaster.state import state_identity
+    from puppetmaster.store_contracts import task_binding
+    ref = JobRef(task.job_id, state_identity(store.root))
+    binding = task_binding(task)
+    key = (ref, binding)
+    with _lock:
+        _active[key] = _active.get(key, 0) + 1
+    token = _context.set((store, ref, binding))
+    try:
+        yield
+    finally:
+        try:
+            if store.cancellation_pending(ref, binding):
+                store.observe_cancellation(ref, binding, cleanup="unknown")
+        finally:
+            _context.reset(token)
+            with _lock:
+                _active[key] -= 1
+                if not _active[key]:
+                    del _active[key]
+                    _scoped_cancelled.discard(key)
+
 
 _lock = threading.Lock()
 _cancelled: set = set()
+_active: dict = {}
+_scoped_cancelled: set = set()
 
 
 class JobCancelled(Exception):
@@ -33,10 +58,25 @@ def request_cancel(job_id: str) -> None:
     if not jid:
         return
     with _lock:
-        _cancelled.add(jid)
+        scoped = _context.get()
+        if scoped is not None and scoped[1].job_id == jid:
+            _scoped_cancelled.update(key for key in _active if key[0] == scoped[1])
+        else:
+            matches = [key for key in _active if key[0].job_id == jid]
+            # An unqualified legacy ID cannot select between different stores.
+            if len({key[0].state_id for key in matches}) == 1:
+                _scoped_cancelled.update(matches)
+            elif not matches:
+                _cancelled.add(jid)
 
 
 def is_cancelled(job_id: str) -> bool:
+    scoped = _context.get()
+    if scoped is not None:
+        store, ref, binding = scoped
+        with _lock:
+            legacy = (ref, binding) in _scoped_cancelled
+        return job_id == ref.job_id and (legacy or store.cancellation_pending(ref, binding))
     jid = (job_id or "").strip()
     if not jid:
         return False
@@ -46,4 +86,12 @@ def is_cancelled(job_id: str) -> bool:
 
 def clear_cancel(job_id: str) -> None:
     with _lock:
-        _cancelled.discard((job_id or "").strip())
+        jid = (job_id or "").strip()
+        _cancelled.discard(jid)
+        _scoped_cancelled.difference_update([key for key in _scoped_cancelled if key[0].job_id == jid])
+
+
+def check_cancellation():
+    scoped = _context.get()
+    if scoped is not None and is_cancelled(scoped[1].job_id):
+        raise JobCancelled(scoped[1].job_id)

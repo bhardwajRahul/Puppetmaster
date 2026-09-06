@@ -1209,7 +1209,11 @@ class PuppetmasterTests(unittest.TestCase):
             stderr="",
         )
         with TemporaryDirectory() as tmp:
-            arguments = {"job_id": "job_123", "state_dir": str(Path(tmp) / ".pm-test")}
+            state_root = Path(tmp) / ".pm-test"
+            store = SwarmStore(state_root)
+            job = store.create_job("transport fixture")
+            store.save_job(replace(job, id="job_123"))
+            arguments = {"job_id": "job_123", "state_dir": str(state_root)}
             with patch("puppetmaster.mcp_server.subprocess.run", return_value=completed) as run:
                 artifacts = call_tool(
                     "puppetmaster_live_artifacts",
@@ -8368,6 +8372,8 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             project_b = projects_root / "ff-ios-589b71a4121f"
             (project_a / "jobs" / "job_476cbf98144f").mkdir(parents=True)
             (project_b / "jobs" / "job_83a3481f7ae8").mkdir(parents=True)
+            (project_a / "jobs" / "job_476cbf98144f" / "job.json").write_text("{}")
+            (project_b / "jobs" / "job_83a3481f7ae8" / "job.json").write_text("{}")
 
             with patch.object(state_module, "app_state_root", return_value=Path(tmp)):
                 self.assertEqual(
@@ -8807,8 +8813,8 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             status = store.schema_status()
             checks = {check.name: check for check in run_doctor(root, root / ".puppetmaster")}
 
-            self.assertEqual(status["schema_version"], "4")
-            self.assertEqual(status["expected_schema_version"], "4")
+            self.assertEqual(status["schema_version"], "5")
+            self.assertEqual(status["expected_schema_version"], "5")
             self.assertEqual(checks["sqlite-state"].status, "ok")
 
     def test_cli_last_and_clean_support_daily_run_management(self) -> None:
@@ -29442,7 +29448,8 @@ class NPlusOneRegressionTests(unittest.TestCase):
                         transaction.append(sql)
 
             self.assertEqual(len(recovery_transactions), 1)
-            recovery_writes = recovery_transactions[0]
+            # SQLite tracing repeats the outer SQL while projection triggers run.
+            recovery_writes = list(dict.fromkeys(recovery_transactions[0]))
             self.assertEqual(
                 sum(s.startswith("UPDATE TASKS ") for s in recovery_writes), len(stale)
             )

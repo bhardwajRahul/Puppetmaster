@@ -76,11 +76,17 @@ class UsageObservation:
     cost_state: str = "unknown"
     cost_usd: Optional[float] = None
     cost_basis: str = "unknown"
+    returncode: Optional[int] = None
+    timed_out: Optional[bool] = None
 
     def __post_init__(self) -> None:
         for value in (self.job_id, self.attempt_id, self.observation_id,
                       self.source, self.observed_at):
             _identity(value)
+        if self.returncode is not None and type(self.returncode) is not int:
+            raise ValueError("returncode must be an integer or None")
+        if self.timed_out is not None and type(self.timed_out) is not bool:
+            raise ValueError("timed_out must be a boolean or None")
         for state in (self.usage_state, self.cost_state):
             if state not in ("unknown", "measured", "estimated"):
                 raise ValueError("state must be unknown, measured, or estimated")

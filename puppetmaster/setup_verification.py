@@ -141,7 +141,8 @@ def _run_owned(command: list[str], cwd: str, env: dict, deadline: float) -> int:
     child_env = dict(env, PUPPETMASTER_PROCESS_OWNER=owner)
     options = ({"creationflags": effective_creationflags(0)} if os.name == "nt"
                else {"start_new_session": True})
-    process = subprocess.Popen(command, cwd=cwd, env=child_env,
+    from puppetmaster.win_process import popen_owned, close_owned_process
+    process = popen_owned(command, cwd=cwd, env=child_env,
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, **options)
     try:
@@ -150,7 +151,10 @@ def _run_owned(command: list[str], cwd: str, env: dict, deadline: float) -> int:
             raise subprocess.TimeoutExpired(command, _DEADLINE_SECONDS)
         return process.wait(timeout=remaining)
     finally:
-        stop_owned_process(process, owner, min(deadline, time.monotonic() + _CLEANUP_SECONDS))
+        try:
+            stop_owned_process(process, owner, min(deadline, time.monotonic() + _CLEANUP_SECONDS))
+        finally:
+            close_owned_process(process)
 
 
 def _inspect(state: str, model: str, fixture_name: str, output: str) -> None:

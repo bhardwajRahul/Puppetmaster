@@ -177,3 +177,153 @@ export async function isJobDone(
   const result = await awaitJob(jobId, { ...options, timeoutSeconds: 0.001 });
   return result.terminal;
 }
+
+/** Store-scoped identity. Equal job IDs in separate stores are distinct. */
+export interface JobRef {
+  readonly job_id: string;
+  readonly state_id: string;
+}
+
+export interface TaskBinding {
+  readonly task_id: string;
+  /** null denotes a legacy task with no known generation. */
+  readonly generation: number | null;
+  readonly lease_id: string | null;
+  readonly owner: string | null;
+}
+
+export interface CompletionReceipt {
+  readonly job_ref: JobRef;
+  readonly run_id: string;
+  readonly intent_digest: string | null;
+  readonly outcome: "pending_publication" | "published" | "stale_lease" | "invalidated" | "legacy_unknown";
+}
+
+export interface CancellationReceipt {
+  readonly job_ref: JobRef;
+  readonly request_id: string;
+  readonly bindings: readonly TaskBinding[];
+  readonly outcome: "requested" | "observed_stop" | "stale_binding" | "already_terminal" | "conflict";
+  readonly revision: number;
+  /** Local cleanup evidence only; never proof of stopped remote effects. */
+  readonly cleanup: "unknown" | "partial" | "local_process_exited";
+}
+
+export interface EffectReceipt {
+  readonly job_ref: JobRef;
+  readonly effect_id: string;
+  readonly request_digest: string;
+  readonly binding: TaskBinding;
+  readonly run_id: string;
+  readonly attempt_id: string;
+  readonly revision: number;
+  readonly outcome: "not_dispatched" | "in_flight" | "succeeded" | "failed_no_effect" | "unknown";
+  readonly replay_policy: "safe" | "reconcile_first" | "requires_authorization" | "provider_idempotent";
+  readonly evidence_refs: readonly string[];
+}
+
+export interface MetadataRef {
+  readonly job_ref: JobRef;
+  readonly id: string;
+  readonly kind: "job" | "task" | "artifact";
+  readonly status: string | null;
+  readonly sha256: string | null;
+  readonly revision: number;
+  readonly stamp: "known" | "legacy_unknown";
+  readonly deleted: boolean;
+  readonly task_count: number | null;
+  readonly artifact_count: number | null;
+  readonly binding: TaskBinding | null;
+  readonly task_id: string | null;
+  readonly artifact_type: string | null;
+  readonly origin: string | null;
+  readonly project_id: string | null;
+  readonly session_id: string | null;
+
+}
+
+/** Optional stamps on a job launch. Omitted legacy values remain unknown. */
+export interface JobScope {
+  readonly origin?: string | null;
+  readonly project_id?: string | null;
+  readonly session_id?: string | null;
+}
+
+export interface JobSummaryFilter extends JobScope {
+  readonly status?: string;
+  readonly job_ref?: JobRef;
+}
+
+export interface JobSummaryOptions extends MetadataPageOptions, JobSummaryFilter {}
+
+export interface MetadataPage {
+  readonly items: readonly MetadataRef[];
+  readonly outcome: "complete" | "partial" | "unavailable" | "cursor_expired";
+  readonly revision: number;
+  readonly next_cursor: string | null;
+  readonly scanned: number;
+}
+
+/** Bounds are validated by the store. Tokens bind query filters and store identity. */
+export interface MetadataPageOptions {
+  readonly cursor?: string;
+  readonly limit?: number; // 1..200
+  readonly max_bytes?: number; // 1024..262144, including the JSON envelope
+  readonly max_scan?: number; // 1..1000
+  readonly status?: string;
+}
+
+export interface ConsumptionMetric {
+  readonly total: number | null;
+  readonly known_subtotal: number;
+  readonly status: "unknown" | "partial" | "measured" | "estimated";
+  readonly known_attempts: number;
+  readonly unknown_attempts: number;
+  readonly estimated_attempts: number;
+  readonly conflicting_attempts: number;
+}
+
+export type ConsumptionTotals = Readonly<Record<
+  "tokens_in" | "tokens_out" | "cache_read_tokens" | "cache_write_tokens" |
+  "api_cost_usd" | "plan_marginal_cost_usd" | "api_equivalent_cost_usd", ConsumptionMetric>>;
+
+export interface ExecutionAttempt {
+  readonly job_id: string;
+  readonly task_id: string;
+  readonly run_id: string;
+  readonly attempt_id: string;
+  readonly started_at: string;
+  readonly adapter: string;
+  readonly model: string | null;
+  readonly provider: string | null;
+}
+
+export interface ProcessOutcomeObservation {
+  readonly job_id: string;
+  readonly attempt_id: string;
+  readonly observation_id: string;
+  readonly source: string;
+  readonly observed_at: string;
+  readonly usage_state: "unknown" | "measured" | "estimated";
+  readonly tokens_in: number | null;
+  readonly tokens_out: number | null;
+  readonly cache_read_tokens: number | null;
+  readonly cache_write_tokens: number | null;
+  readonly cost_state: "unknown" | "measured" | "estimated";
+  readonly cost_usd: number | null;
+  readonly cost_basis: "unknown" | "api" | "plan_marginal" | "api_equivalent";
+  readonly returncode?: number | null;
+  readonly timed_out?: boolean | null;
+}
+
+export interface AttemptConsumptionReport {
+  readonly job_id: string;
+  readonly attempt_count: number;
+  readonly attempts: readonly {
+    readonly attempt: ExecutionAttempt;
+    readonly observation_ids: readonly string[];
+    readonly process_outcomes: readonly ProcessOutcomeObservation[];
+    readonly totals: ConsumptionTotals;
+  }[];
+  readonly totals: ConsumptionTotals;
+}

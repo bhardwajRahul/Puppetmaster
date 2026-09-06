@@ -346,9 +346,19 @@ class Orchestrator:
         label: Optional[str] = None,
         launch_key: Optional[str] = None,
         budget_policy: Optional[BudgetPolicy] = None,
+        *,
+        origin: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> RunResult:
         if launch_key is None:
             launch_key = os.environ.get("PUPPETMASTER_LAUNCH_KEY")
+        if origin is None:
+            origin = os.environ.get("PUPPETMASTER_JOB_ORIGIN")
+        if project_id is None:
+            project_id = os.environ.get("PUPPETMASTER_JOB_PROJECT_ID")
+        if session_id is None:
+            session_id = os.environ.get("PUPPETMASTER_JOB_SESSION_ID")
         launch_specs = specs or specs_for_roles(roles)
         output_limit = os.environ.get("PUPPETMASTER_MAX_OUTPUT_BYTES")
         if output_limit:
@@ -380,6 +390,9 @@ class Orchestrator:
         job, created = self.store.create_or_get_job(
             goal,
             label=label,
+            origin=origin,
+            project_id=project_id,
+            session_id=session_id,
             launch_key=launch_key,
             launch_fingerprint=fingerprint,
             budget_policy=budget_policy,
@@ -514,8 +527,13 @@ class Orchestrator:
         crash_role: str = "implement",
         roles: Optional[list[str]] = None,
         budget_policy: Optional[BudgetPolicy] = None,
+        *,
+        origin: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> RunResult:
-        job = self.store.create_job(goal, budget_policy=budget_policy)
+        job = self.store.create_job(goal, budget_policy=budget_policy,
+                                    origin=origin, project_id=project_id, session_id=session_id)
         _tag_job_effort(self.store, job.id)
         _snapshot_evaluator_epoch(self.store, job)
         self._begin_trace()

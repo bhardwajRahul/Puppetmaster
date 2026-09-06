@@ -139,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hard limit for captured worker stdout+stderr where the adapter supports streaming.",
     )
 
+    for name in ("origin", "project_id", "session_id"):
+        parser.add_argument("--" + name.replace("_", "-"), help="Explicit job scope metadata.")
+
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     def _add_routing_flags(adapter_parser: argparse.ArgumentParser) -> None:
@@ -583,6 +586,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     run = subcommands.add_parser("run", help="Run a local swarm against a goal.")
+    for name in ("origin", "project_id", "session_id"):
+        run.add_argument("--" + name.replace("_", "-"), default=argparse.SUPPRESS,
+                         help="Explicit job scope metadata.")
     run.add_argument("goal", nargs="?", help="The swarm goal (interactive compatibility form).")
     run.add_argument(
         "--goal-file",

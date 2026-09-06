@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from puppetmaster.fs_permissions import mkdir_private, open_private, write_private_text
-from puppetmaster.models import Task
+from puppetmaster.models import Task, new_id
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.worker_fence import stamp_worker_env
 
@@ -240,6 +240,8 @@ def run_streamed_subprocess(
     env = dict(env) if env is not None else os.environ.copy()
     env.setdefault("PAGER", "cat")
     env["GIT_PAGER"] = "cat"
+    process_owner = new_id("process")
+    env["PUPPETMASTER_PROCESS_OWNER"] = process_owner
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
     stamp_worker_env(
         env,
@@ -264,7 +266,8 @@ def run_streamed_subprocess(
         raise
 
     try:
-        process = subprocess.Popen(
+        from puppetmaster.win_process import popen_owned
+        process = popen_owned(
             command,
             cwd=cwd,
             env=env,
@@ -319,6 +322,11 @@ def run_streamed_subprocess(
             spawn_error=message,
         )
 
+    from puppetmaster.win_process import cleanup_owned_process
+
+    def cleanup():
+        return cleanup_owned_process(process, process_owner, _time.monotonic() + 3)
+
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     output_limit_hit = threading.Event()
@@ -333,7 +341,7 @@ def run_streamed_subprocess(
                     over_limit = bool(max_output_bytes and output_bytes["value"] > max_output_bytes)
                 if over_limit:
                     output_limit_hit.set()
-                    _kill_process_tree(process, start_new_session)
+                    cleanup()
                     break
                 buffer.append(line)
                 _write_live(line if line.endswith("\n") else line + "\n")
@@ -383,15 +391,29 @@ def run_streamed_subprocess(
     heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat_thread.start()
 
+    from puppetmaster.cancellation import check_cancellation, JobCancelled
     timed_out = False
     try:
-        process.wait(timeout=timeout_seconds)
+        deadline = _time.monotonic() + timeout_seconds
+        while True:
+            check_cancellation()
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            try:
+                process.wait(timeout=min(remaining, 0.25))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except JobCancelled:
+        cleanup()
+        raise
     except subprocess.TimeoutExpired:
         timed_out = True
         # Kill the whole process group when we launched a new session, so
         # grandchildren (e.g. Hermes' own spawned tree) don't survive the
         # timeout as orphans; otherwise kill just the direct child.
-        _kill_process_tree(process, start_new_session)
+        cleanup()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -400,6 +422,8 @@ def run_streamed_subprocess(
         if output_limit_hit.is_set():
             timed_out = True
         stop_heartbeat.set()
+        from puppetmaster.win_process import close_owned_process
+        close_owned_process(process)
         for thread in threads:
             thread.join(timeout=2)
         elapsed = _time.monotonic() - started

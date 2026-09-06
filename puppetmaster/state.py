@@ -95,24 +95,15 @@ def list_project_state_dirs() -> list[Path]:
 
 
 def find_state_dir_for_job(job_id: str) -> Optional[Path]:
-    """Locate the project state dir that owns ``job_id``, if any.
-
-    Scans every project state dir and returns the first one whose
-    ``jobs/<job_id>`` directory exists. The SQLite store stores jobs
-    on disk under ``<state_dir>/jobs/<job_id>/`` (we don't need to
-    actually open the DB to detect ownership — a directory check is
-    enough and avoids spinning up the WAL writer just for a search).
-
-    Returns None when no project knows about the job — callers should
-    surface the user-facing error in that case rather than swallowing.
-    """
+    """Legacy unscoped lookup rejects duplicate IDs instead of first-matching."""
     if not job_id:
         return None
-    for project in list_project_state_dirs():
-        job_dir = project / "jobs" / job_id
-        if job_dir.is_dir():
-            return project
-    return None
+    if Path(job_id).name != job_id or job_id in {".", ".."} or "\\" in job_id:
+        raise ValueError("invalid job_id")
+    matches = [p for p in list_project_state_dirs() if state_owns_job(p, job_id)]
+    if len(matches) > 1:
+        raise ValueError("ambiguous job_id; provide job_ref or state_dir")
+    return matches[0] if matches else None
 
 
 def _resolve_user_path(value: Union[Path, str], cwd: Path) -> Path:
@@ -137,3 +128,56 @@ def _git_root(cwd: Path) -> Optional[Path]:
         return None
     output = completed.stdout.strip()
     return Path(output) if output else None
+
+
+def resolve_job_state(*, job_id=None, job_ref=None, state_dir=None, cwd=None, default_dir=None) -> Path:
+    """Resolve identity before choosing a store, including explicit directories."""
+    from puppetmaster.models import JobRef
+    if isinstance(job_ref, JobRef):
+        job_ref = job_ref.as_dict()
+    if job_ref is not None:
+        if not isinstance(job_ref, dict):
+            raise ValueError("job_ref must contain job_id and state_id")
+        if any(not isinstance(job_ref.get(k), str) or not job_ref[k].strip()
+               for k in ("job_id", "state_id")):
+            raise ValueError("job_ref must contain job_id and state_id")
+        if job_id is not None and job_id != job_ref["job_id"]:
+            raise ValueError("job_id conflicts with job_ref.job_id")
+        job_id = job_ref["job_id"]
+    if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()
+                              or Path(job_id).name != job_id or job_id in {".", ".."}
+                              or "/" in job_id or "\\" in job_id):
+        raise ValueError("invalid job_id")
+    resolved = Path(default_dir) if default_dir is not None and not state_dir else resolve_state_dir(state_dir, cwd=cwd)
+    expected = job_ref.get("state_id") if job_ref else None
+    if state_dir:
+        if expected and state_identity(resolved) != expected:
+            raise ValueError("job_ref.state_id does not match explicit state_dir")
+        if job_id and not state_owns_job(resolved, job_id):
+            raise ValueError("explicit state_dir does not own job_id")
+        return resolved
+    if not job_id:
+        return resolved
+    candidates = set(list_project_state_dirs()) | {resolved}
+    matches = [p for p in candidates if (not expected or state_identity(p) == expected)
+               and state_owns_job(p, job_id)]
+    if len(matches) > 1:
+        raise ValueError("ambiguous job_id; provide job_ref or state_dir")
+    if matches:
+        return matches[0]
+    if expected:
+        raise ValueError("job_ref.state_id has no matching owning store")
+    return resolved
+
+
+def state_owns_job(root: Path, job_id: str) -> bool:
+    """Metadata-only ownership lookup; a leftover directory is not a SQL row."""
+    import sqlite3
+    database = root / "state.sqlite3"
+    if database.exists():
+        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            return connection.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone() is not None
+        finally:
+            connection.close()
+    return (root / "jobs" / job_id / "job.json").is_file()

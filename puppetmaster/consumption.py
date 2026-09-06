@@ -53,6 +53,7 @@ class AttemptConsumption:
     attempt: ExecutionAttempt
     observation_ids: Tuple[str, ...]
     totals: ConsumptionTotals
+    process_outcomes: Tuple[UsageObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -131,7 +132,10 @@ def build_attempt_consumption_report(
                           key=lambda observation: observation.observation_id)
         rows.append(AttemptConsumption(attempt,
                                        tuple(obs.observation_id for obs in captured),
-                                       _attempt_totals(captured)))
+                                       _attempt_totals(captured),
+                                       tuple(obs for obs in captured if
+                                             obs.returncode is not None or
+                                             obs.timed_out is not None)))
     totals = ConsumptionTotals(**{
         field: _sum_metrics(getattr(row.totals, field) for row in rows)
         for field in ConsumptionTotals.__dataclass_fields__

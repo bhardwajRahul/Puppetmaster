@@ -1,3 +1,15 @@
+## v1.24.0 — 2026-09-06
+
+- Add immutable completion receipts and conflict detection while retaining `complete_task` compatibility. Job receipts include attempt consumption; `process_outcomes` records exit codes and timeouts separately from artifact delivery quality and selected-result economics.
+- Add bounded job, task, and artifact metadata projections, projected counts, deletion changes, and authenticated, filter-bound cursors. Validate `JobRef` ownership and support explicit origin, project, and session scope.
+- Persist cancellation requests with task generation and lease bindings. Skip cancelled queued targets without starving eligible tasks behind them.
+- Add minimal external-effect intent/outcome replay fences: an opt-in execution boundary, explicit observations, and revision-checked transitions. Replaying an intent does not authorize another dispatch.
+- Use ownership-checked POSIX process-group cleanup and nonce checks for escaped descendants. Windows cleanup uses the launch-owned Job Object and held process handle. Local cleanup does not prove remote cancellation.
+- Stop the feature playbook from injecting `require_diff` into read-only, no-edit, or dry-run work. Preserve explicit gates and implementation defaults.
+- Migrate SQLite v4 to v5 and repair stale projection triggers during supervisor initialization, including databases already at v5. File storage adds a versioned metadata index with pending-write detection. See [store contracts](STORE_CONTRACTS.md) and [attempt accounting](ATTEMPT_LEDGER.md) for API guarantees and limits.
+
+Upgrade: stop long-lived Puppetmaster processes before the schema cutover. Restart supervisors, workers, MCP servers, and dashboards on v1.24.0; the supervisor migrates and repairs the schema before workers attach. Old and new writers are not hot-compatible. Migration preserves unknown historical evidence. The file backend retains its weaker concurrency and power-loss guarantees.
+
 ## v1.23.0 — 2026-09-06
 
 **Durable completion, invocation accounting, and cumulative job budgets.**
