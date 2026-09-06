@@ -496,6 +496,11 @@ class InstalledModuleTests(unittest.TestCase):
             shutil.copytree(Path(verification.__file__).parent, Path(site) / 'puppetmaster', ignore=shutil.ignore_patterns('__pycache__'))
             registry = root / 'models.json'
             save_registry([ModelSpec(id=MODEL, adapter='codex', adapter_model_name='test-model')], registry)
+            # Billing preflight reads Codex auth independently of CODEX_COMMAND.
+            # Keep the simulated login independent of the host's CLI and account.
+            codex_home = root / 'codex-home'
+            codex_home.mkdir()
+            (codex_home / 'auth.json').write_text(json.dumps({'auth_mode': 'chatgpt'}))
             fake = root / 'fake_codex.py'
             fake.write_text('''import json, sys
 from pathlib import Path
@@ -515,7 +520,8 @@ finding = {'type': 'finding', 'claim': 'FIRST_RUN_PROOF nonce=' + nonce + ' sum=
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'artifacts':[finding]})}}))
 print(json.dumps({'type':'turn.completed','usage':{'input_tokens':100,'output_tokens':50}}))
 ''')
-            env = {**os.environ, 'CODEX_COMMAND': f'{python} {fake}', 'PUPPETMASTER_MODELS_PATH': str(registry),
+            env = {**os.environ, 'CODEX_HOME': str(codex_home),
+                   'CODEX_COMMAND': f'{python} {fake}', 'PUPPETMASTER_MODELS_PATH': str(registry),
                    'PUPPETMASTER_ONLY_ADAPTERS': 'codex', 'PUPPETMASTER_LAUNCH_KEY': 'must-be-removed',
                    'PUPPETMASTER_STATE_DIR': str(root / 'unused-state'), 'PYTHONPATH': '/does-not-exist'}
             env.pop('PUPPETMASTER_WORKER', None)
