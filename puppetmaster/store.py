@@ -243,6 +243,7 @@ class SwarmStore(StoreContracts):
         # event_cursor skip re-counting the whole file on every poll.
         self._event_cursor_cache: dict[str, tuple[int, int]] = {}
         self._metadata_initialized = False
+        self._budget_locks = threading.local()
 
     def init(self) -> None:
         for directory in [
@@ -2557,17 +2558,29 @@ class SwarmStore(StoreContracts):
             finally:
                 self.release_lock(name, owner=owner)
 
+    def budget_dispatch_scope(self, job_id: str):
+        """Keep file admission stages together; SQLite stages commit separately."""
+        return self._budget_scope(job_id) if self.backend_name == "file" else nullcontext()
+
     @contextmanager
     def _budget_scope(self, job_id: str):
         """Job-wide admission lock; file backend has the existing 300s TTL limits."""
         self._assert_safe_job_dir(job_id)
+        held = getattr(self._budget_locks, "held", None)
+        if held is None:
+            held = self._budget_locks.held = set()
+        if job_id in held:
+            yield
+            return
         owner = new_id("budget")
         name = f"budget:{job_id}"
         if not self.acquire_lock(name, owner, ttl_seconds=300):
             raise RuntimeError("budget busy; retry")
+        held.add(job_id)
         try:
             yield
         finally:
+            held.remove(job_id)
             self.release_lock(name, owner=owner)
 
     def _budget_records(self, job_id: str) -> list[dict[str, Any]]:

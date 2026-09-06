@@ -238,7 +238,7 @@ class SQLiteSwarmStore(SwarmStore):
             # on attach() and fail closed instead of racing DDL.
             self.ensure_schema()
             return
-        connection = self.connect()
+        connection = self._connect_with_lock_retry()
         try:
             self._assert_schema(connection)
         finally:
@@ -1191,7 +1191,19 @@ class SQLiteSwarmStore(SwarmStore):
             yield True
             return
         with self._session() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            # Retry only reservation: no reads or writes have run yet. Replaying
+            # the yielded body could duplicate external completion side effects.
+            for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not _is_sqlite_lock_error(exc):
+                        raise
+                    if attempt + 1 >= _SQLITE_LOCK_RETRY_ATTEMPTS:
+                        raise  # _session records the final failure.
+                    self._record_lock_error()
+                    self._sleep_lock_backoff(attempt)
             self._completion_connection.connection = connection
             try:
                 yield True

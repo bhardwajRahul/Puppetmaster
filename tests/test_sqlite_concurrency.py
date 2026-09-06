@@ -6,6 +6,7 @@ import os
 import sqlite3
 import sys
 import threading
+import traceback
 
 _HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _HERMETIC_DIR not in sys.path:
@@ -41,9 +42,9 @@ def _attach_claim_complete_worker(
             poll_seconds=0.05,
         )
         runtime.run_until_idle()
-    except Exception as exc:  # noqa: BLE001 — surface in the parent assert
+    except Exception:  # noqa: BLE001 — surface in the parent assert
         Path(error_path).write_text(
-            f"{type(exc).__name__}: {exc}", encoding="utf-8"
+            traceback.format_exc(), encoding="utf-8"
         )
 
 
@@ -130,6 +131,84 @@ class SqliteAttachEnsureTests(unittest.TestCase):
 
 
 class SqliteSessionRetryTests(unittest.TestCase):
+    def test_attach_retries_real_open_lock(self) -> None:
+        with TemporaryDirectory() as tmp:
+            supervisor = SQLiteSwarmStore(tmp)
+            supervisor.ensure_schema()
+            blocker = supervisor.connect()
+            try:
+                blocker.execute("PRAGMA locking_mode = EXCLUSIVE")
+                blocker.execute("BEGIN EXCLUSIVE")
+                worker = SQLiteSwarmStore(tmp)
+                worker.busy_timeout_ms = 0
+                # Release only after SQLite has actually reported contention.
+                with mock.patch.object(worker, "_sleep_lock_backoff",
+                                       side_effect=lambda attempt: blocker.close()) as retry:
+                    worker.attach()
+                retry.assert_called_once_with(0)
+                self.assertEqual(worker.lock_error_count, 1)
+                self.assertEqual(worker.list_jobs(), [])
+            finally:
+                blocker.close()
+
+    def test_writer_retries_real_reservation_lock_before_body(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("writer contention")
+            blocker = store.connect()
+            try:
+                blocker.execute("BEGIN IMMEDIATE")
+                store.busy_timeout_ms = 0
+                with mock.patch.object(store, "_sleep_lock_backoff",
+                                       side_effect=lambda attempt: blocker.rollback()) as retry:
+                    with store._writer_scope():
+                        store.emit(job.id, "test.once", {})
+                        with store._writer_scope():
+                            store.emit(job.id, "test.nested", {})
+                retry.assert_called_once_with(0)
+                self.assertEqual(store.lock_error_count, 1)
+                events = store.read_events(job.id)
+                self.assertEqual(sum(e["event"] == "test.once" for e in events), 1)
+                self.assertEqual(sum(e["event"] == "test.nested" for e in events), 1)
+            finally:
+                blocker.close()
+
+    def test_writer_contention_is_bounded_and_never_enters_body(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            blocker = store.connect()
+            try:
+                blocker.execute("BEGIN IMMEDIATE")
+                store.busy_timeout_ms = 0
+                with mock.patch.object(store, "_sleep_lock_backoff") as retry:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        with store._writer_scope():
+                            self.fail("contended transaction body must not run")
+                self.assertEqual(retry.call_count, 4)
+                self.assertIsNone(getattr(store._completion_connection, "connection", None))
+                blocker.rollback()
+                with store._writer_scope():
+                    pass
+            finally:
+                blocker.close()
+
+    def test_writer_does_not_retry_body_and_rolls_back_nested_writes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("rollback")
+            with mock.patch.object(store, "_sleep_lock_backoff") as retry:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    with store._writer_scope():
+                        with store._writer_scope():
+                            store.emit(job.id, "test.rollback", {})
+                        raise sqlite3.OperationalError("database is locked")
+            retry.assert_not_called()
+            self.assertIsNone(store._completion_connection.connection)
+            self.assertFalse(any(e["event"] == "test.rollback" for e in store.read_events(job.id)))
+
     def test_session_retries_locked_then_succeeds(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")

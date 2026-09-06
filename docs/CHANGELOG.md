@@ -7,6 +7,7 @@
 - Use ownership-checked POSIX process-group cleanup and nonce checks for escaped descendants. Windows cleanup uses the launch-owned Job Object and held process handle. Local cleanup does not prove remote cancellation.
 - Stop the feature playbook from injecting `require_diff` into read-only, no-edit, or dry-run work. Preserve explicit gates and implementation defaults.
 - Migrate SQLite v4 to v5 and repair stale projection triggers during supervisor initialization, including databases already at v5. File storage adds a versioned metadata index with pending-write detection. See [store contracts](STORE_CONTRACTS.md) and [attempt accounting](ATTEMPT_LEDGER.md) for API guarantees and limits.
+- Harden release-gate concurrency with bounded SQLite attach and `BEGIN IMMEDIATE` lock-acquisition retries that never replay transaction bodies, deterministic Windows-safe connection closure, and atomic file-backend final-attempt admission across reservation, adoption, and reconciliation.
 
 Upgrade: stop long-lived Puppetmaster processes before the schema cutover. Restart supervisors, workers, MCP servers, and dashboards on v1.24.0; the supervisor migrates and repairs the schema before workers attach. Old and new writers are not hot-compatible. Migration preserves unknown historical evidence. The file backend retains its weaker concurrency and power-loss guarantees.
 

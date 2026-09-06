@@ -106,24 +106,25 @@ class Invocation:
             values.setdefault("plan_marginal_usd", 0)
             values.setdefault("cost_state", "known")
         allowance = BudgetLiability(**values)
-        self.store.reserve_dispatch(self.attempt, allowance)
-        if self.lease_lost is not None and self.lease_lost():
-            self.store.release_undispatched(
+        with self.store.budget_dispatch_scope(self.attempt.job_id):
+            self.store.reserve_dispatch(self.attempt, allowance)
+            if self.lease_lost is not None and self.lease_lost():
+                self.store.release_undispatched(
+                    self.attempt.job_id, self.attempt.attempt_id,
+                    non_dispatch_proof="lease lost before adoption and external call")
+                raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
+            self.store.adopt_dispatch(self.attempt.job_id, self.attempt.attempt_id,
+                                      adoption_id=self.attempt.attempt_id)
+            lost_after_adoption = self.lease_lost is not None and self.lease_lost()
+            # Persist uncertainty before dispatch, so a killed process cannot leave
+            # its original allowance masquerading as complete consumption forever.
+            self.store.reconcile_reservation(
                 self.attempt.job_id, self.attempt.attempt_id,
-                non_dispatch_proof="lease lost before adoption and external call")
-            raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
-        self.store.adopt_dispatch(self.attempt.job_id, self.attempt.attempt_id,
-                                  adoption_id=self.attempt.attempt_id)
-        lost_after_adoption = self.lease_lost is not None and self.lease_lost()
-        # Persist uncertainty before dispatch, so a killed process cannot leave
-        # its original allowance masquerading as complete consumption forever.
-        self.store.reconcile_reservation(
-            self.attempt.job_id, self.attempt.attempt_id,
-            reconciliation_id="dispatch:pending", liability=BudgetLiability(),
-            final=False, evidence="dispatch owned; outcome not yet available")
-        if lost_after_adoption:
-            raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
-        self.check_dispatch_lease()
+                reconciliation_id="dispatch:pending", liability=BudgetLiability(),
+                final=False, evidence="dispatch owned; outcome not yet available")
+            if lost_after_adoption:
+                raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
+            self.check_dispatch_lease()
 
     def check_dispatch_lease(self):
         if self.budgeted and self.lease_lost is not None and self.lease_lost():

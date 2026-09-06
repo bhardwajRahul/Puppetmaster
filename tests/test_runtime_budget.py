@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -411,18 +411,21 @@ with execution_scope(store, SimpleNamespace(id='crashed-run'), task):
     def test_concurrent_invocations_cannot_both_take_last_attempt(self):
         self.configure(BudgetPolicy(max_attempts=1))
         barrier = Barrier(2)
+        dispatched = []
         def call(index):
             store = self.store_type(self.root)
             barrier.wait(timeout=5)
             try:
                 with execution_scope(store, SimpleNamespace(id=f'run-{index}'), self.task):
                     with invocation():
+                        dispatched.append(index)
                         return True
             except (BudgetAdmissionError, RuntimeError):
                 return False
         with ThreadPoolExecutor(max_workers=2) as pool:
             admitted = list(pool.map(call, [1, 2]))
         self.assertEqual(sum(admitted), 1)
+        self.assertEqual(len(dispatched), 1)
         self.assertEqual(self.snapshot()['totals']['attempts'], 1)
 
     def test_lease_loss_exception_does_not_overwrite_successor(self):
@@ -436,8 +439,72 @@ with execution_scope(store, SimpleNamespace(id='crashed-run'), task):
 
 
 class FileRuntimeBudgetTests(BudgetRuntimeContract, unittest.TestCase):
-    pass
+    def test_contender_between_reservation_and_adoption(self):
+        self.configure(BudgetPolicy(max_attempts=1))
+        reserved, contender_tried, winner_done = Event(), Event(), Event()
+        winner = self.store_type(self.root)
+        contender = self.store_type(self.root)
+        reserve = winner.reserve_dispatch
+        acquire = contender.acquire_lock
+        records = contender._budget_records
+
+        def pause_after_reservation(*args, **kwargs):
+            result = reserve(*args, **kwargs)
+            reserved.set()
+            self.assertTrue(contender_tried.wait(5))
+            return result
+
+        def signal_acquisition(*args, **kwargs):
+            result = acquire(*args, **kwargs)
+            contender_tried.set()
+            return result
+
+        def hold_contender_lock(*args, **kwargs):
+            self.assertTrue(winner_done.wait(5))
+            return records(*args, **kwargs)
+
+        def call(store, index):
+            try:
+                with execution_scope(store, SimpleNamespace(id=f'run-{index}'), self.task):
+                    with invocation():
+                        return True
+            except (BudgetAdmissionError, RuntimeError) as exc:
+                return str(exc)
+            finally:
+                if store is winner:
+                    winner_done.set()
+
+        with mock.patch.object(winner, 'reserve_dispatch', side_effect=pause_after_reservation), \
+                mock.patch.object(contender, 'acquire_lock', side_effect=signal_acquisition), \
+                mock.patch.object(contender, '_budget_records', side_effect=hold_contender_lock), \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(call, winner, 1)
+            self.assertTrue(reserved.wait(5))
+            second = pool.submit(call, contender, 2)
+            outcomes = [first.result(timeout=5), second.result(timeout=5)]
+        self.assertIs(outcomes[0], True, outcomes)
+        self.assertIsNot(outcomes[1], True, outcomes)
+        self.assertEqual(self.snapshot()['totals']['attempts'], 1)
 
 
 class SQLiteRuntimeBudgetTests(BudgetRuntimeContract, unittest.TestCase):
     store_type = SQLiteSwarmStore
+
+    def test_transient_writer_lock_admits_final_attempt_once(self):
+        self.configure(BudgetPolicy(max_attempts=1))
+        blocker = self.store.connect()
+        self.addCleanup(blocker.close)
+        blocker.execute("BEGIN IMMEDIATE")
+        self.store.busy_timeout_ms = 0
+        dispatched = []
+        with mock.patch.object(self.store, '_sleep_lock_backoff',
+                               side_effect=lambda attempt: blocker.rollback()) as retry:
+            with execution_scope(self.store, SimpleNamespace(id='run'), self.task):
+                with invocation():
+                    dispatched.append('first')
+                with self.assertRaises(BudgetAdmissionError):
+                    with invocation():
+                        dispatched.append('second')
+        retry.assert_called_once_with(0)
+        self.assertEqual(dispatched, ['first'])
+        self.assertEqual(self.snapshot()['totals']['attempts'], 1)
