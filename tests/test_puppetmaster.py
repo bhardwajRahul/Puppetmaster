@@ -29403,6 +29403,7 @@ class NPlusOneRegressionTests(unittest.TestCase):
                 self.assertNotIn(dep.id, fetched_ids)
 
     def test_recover_stale_tasks_batches_into_one_transaction(self) -> None:
+        # Keep the historical test selector; the contract is now one writer per CAS.
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
             store.init()
@@ -29425,8 +29426,30 @@ class NPlusOneRegressionTests(unittest.TestCase):
                 connection.set_trace_callback(statements.append)
                 return connection
 
-            with patch.object(store, "_connect_with_lock_retry", side_effect=tracing_connect):
+            original_recover = store._atomic_recover_stale
+            cas_traces: list[list[list[str]]] = []
+
+            def observed_recover(task, queued):
+                start = len(traces)
+                result = original_recover(task, queued)
+                cas_traces.append(traces[start:])
+                return result
+
+            with (
+                patch.object(store, "_connect_with_lock_retry", side_effect=tracing_connect),
+                patch.object(store, "_atomic_recover_stale", side_effect=observed_recover) as cas,
+                patch.object(store, "_emit", wraps=store._emit) as emit,
+            ):
                 recovered = store.recover_stale_tasks(job.id)
+            self.assertEqual(cas.call_count, len(stale))
+            self.assertEqual(emit.call_count, len(stale))
+            for connections in cas_traces:
+                self.assertEqual(len(connections), 1)
+                statements = [" ".join(sql.upper().split()) for sql in connections[0]]
+                self.assertEqual([sql for sql in statements if sql.startswith("BEGIN")],
+                                 ["BEGIN IMMEDIATE"])
+                self.assertEqual(statements.count("COMMIT"), 1)
+                self.assertNotIn("ROLLBACK", statements)
 
             self.assertEqual(
                 sorted(task.id for task in recovered),
@@ -29440,7 +29463,7 @@ class NPlusOneRegressionTests(unittest.TestCase):
                 for statement in statements:
                     sql = " ".join(statement.upper().split())
                     if sql.startswith("BEGIN"):
-                        transaction = []
+                        transaction = [sql]
                     elif sql == "COMMIT":
                         if any(s.startswith("UPDATE TASKS ") for s in transaction):
                             recovery_transactions.append(transaction)
@@ -29448,19 +29471,95 @@ class NPlusOneRegressionTests(unittest.TestCase):
                     else:
                         transaction.append(sql)
 
-            self.assertEqual(len(recovery_transactions), 1)
-            # SQLite tracing repeats the outer SQL while projection triggers run.
-            recovery_writes = list(dict.fromkeys(recovery_transactions[0]))
-            self.assertEqual(
-                sum(s.startswith("UPDATE TASKS ") for s in recovery_writes), len(stale)
+            self.assertEqual(len(recovery_transactions), len(stale))
+            for transaction in recovery_transactions:
+                self.assertEqual(transaction[0], "BEGIN IMMEDIATE")
+                # Projection triggers repeat trace text, but not Python execute calls.
+                writes = list(dict.fromkeys(transaction))
+                self.assertEqual(sum(sql.startswith("UPDATE TASKS ") for sql in writes), 1)
+                self.assertEqual(sum(sql.startswith("INSERT INTO EVENTS")
+                                     and "'TASK.RECOVERED'" in sql for sql in writes), 1)
+                self.assertFalse(any(sql.startswith("SELECT ") for sql in writes))
+            task_reads = [sql for statements in traces for statement in statements
+                          if (sql := " ".join(statement.upper().split())).startswith("SELECT ")
+                          and "FROM TASKS" in sql]
+            self.assertEqual(len(task_reads), 1, task_reads)
+            events = [event for event in store.read_events(job.id)
+                      if event["event"] == "task.recovered"]
+            self.assertCountEqual(
+                [event["payload"] for event in events],
+                [{"task_id": task.id, "previous_owner": f"worker-{i}"}
+                 for i, task in enumerate(stale)],
             )
-            self.assertEqual(
-                sum(s.startswith("INSERT INTO EVENTS") and "'TASK.RECOVERED'" in s
-                    for s in recovery_writes),
-                len(stale),
-            )
-            for task in stale:
-                self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.QUEUED)
+            for task in recovered:
+                self.assertEqual(store.get_task_by_id(task.id), task)
+                self.assertEqual(task.status, TaskStatus.QUEUED)
+                self.assertIsNone(task.lease_owner)
+                self.assertIsNone(task.lease_expires_at)
+
+    def test_recover_stale_tasks_partial_failure_preserves_committed_prefix(self) -> None:
+        import sqlite3
+
+        for failure in ("cas", "event"):
+            with self.subTest(failure=failure), TemporaryDirectory() as tmp:
+                root = Path(tmp) / ".puppetmaster"
+                store = SQLiteSwarmStore(root)
+                store.init()
+                job = store.create_job("partial recovery")
+                for i in range(3):
+                    task = Task(job_id=job.id, role=f"r{i}", instruction="x")
+                    store.save_task(task)
+                    claimed = store.claim_task(task.id, f"worker-{i}", lease_seconds=60)
+                    store.save_task(replace(claimed, lease_expires_at=seconds_from_now(-1)))
+                # Use the actual scan order so the second CAS deterministically fails.
+                first, failing, later = store.list_tasks(job.id)
+                if failure == "cas":
+                    with store._session() as connection:
+                        connection.execute("""
+                            CREATE TRIGGER reject_recovery BEFORE UPDATE ON tasks
+                            WHEN OLD.id = '%s' AND NEW.status = 'queued'
+                            BEGIN SELECT RAISE(ABORT, 'injected recovery failure'); END
+                        """ % failing.id)
+                original_emit = store._emit
+
+                def emit_recovery(connection, job_id, event, payload):
+                    if failure == "event" and payload.get("task_id") == failing.id:
+                        # A lock error after mutation must roll back, never replay the body.
+                        raise sqlite3.OperationalError("database is locked")
+                    return original_emit(connection, job_id, event, payload)
+
+                with (
+                    patch.object(store, "_emit", side_effect=emit_recovery) as emit,
+                    patch.object(store, "_atomic_recover_stale", wraps=store._atomic_recover_stale) as cas,
+                    self.assertRaisesRegex(sqlite3.DatabaseError,
+                                           "injected recovery failure|database is locked"),
+                ):
+                    store.recover_stale_tasks(job.id)
+                # Exceptions abort the call: later candidates are left for the next scan.
+                self.assertEqual([call.args[0].id for call in cas.call_args_list],
+                                 [first.id, failing.id])
+                self.assertEqual(emit.call_count, 1 if failure == "cas" else 2)
+                reopened = SQLiteSwarmStore(root)
+                reopened.attach()
+                persisted = reopened.get_task_by_id(first.id)
+                self.assertEqual(persisted, replace(
+                    first, status=TaskStatus.QUEUED, lease_owner=None,
+                    lease_expires_at=None, updated_at=persisted.updated_at,
+                ))
+                self.assertEqual(reopened.get_task_by_id(failing.id), failing)
+                self.assertEqual(reopened.get_task_by_id(later.id), later)
+                events = [event for event in reopened.read_events(job.id)
+                          if event["event"] == "task.recovered"]
+                self.assertEqual([event["payload"]["task_id"] for event in events], [first.id])
+                if failure == "cas":
+                    with reopened._session() as connection:
+                        connection.execute("DROP TRIGGER reject_recovery")
+                self.assertEqual([task.id for task in reopened.recover_stale_tasks(job.id)],
+                                 [failing.id, later.id])
+                events = [event for event in reopened.read_events(job.id)
+                          if event["event"] == "task.recovered"]
+                self.assertEqual([event["payload"]["task_id"] for event in events],
+                                 [first.id, failing.id, later.id])
 
     def test_recover_stale_tasks_skips_fresh_leases(self) -> None:
         with TemporaryDirectory() as tmp:

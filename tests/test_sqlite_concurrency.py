@@ -16,21 +16,29 @@ import hermetic_env  # noqa: F401  # process-wide host-env isolation
 
 import multiprocessing
 import unittest
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from puppetmaster.models import AgentRun, Job, JobStatus, Task, TaskStatus
+from puppetmaster.models import AgentRun, Job, JobStatus, MemoryRecord, Task, TaskStatus
 from puppetmaster.sqlite_store import SQLiteSwarmStore, SqliteSchemaError
 from puppetmaster.store import SwarmStore
 from puppetmaster.store_factory import create_store, create_worker_store
 from puppetmaster.worker_runtime import WorkerDaemon, WorkerRuntime
+from puppetmaster.workers import LocalWorker
 
 
 def _attach_claim_complete_worker(
     state_dir: str, job_id: str, worker_id: str, error_path: str
 ) -> None:
     """Spawn-safe worker body: attach only, then claim/complete local tasks."""
+    thread_errors: list[str] = []
+    previous_hook = threading.excepthook
+    threading.excepthook = lambda args: thread_errors.append(
+        "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    )
     try:
         store = SQLiteSwarmStore(state_dir)
         store.attach()
@@ -48,6 +56,11 @@ def _attach_claim_complete_worker(
         Path(error_path).write_text(
             traceback.format_exc(), encoding="utf-8"
         )
+    finally:
+        threading.excepthook = previous_hook
+        if thread_errors:
+            with Path(error_path).open("a", encoding="utf-8") as output:
+                output.write("\n".join(thread_errors))
 
 
 class SqliteAttachEnsureTests(unittest.TestCase):
@@ -133,6 +146,115 @@ class SqliteAttachEnsureTests(unittest.TestCase):
 
 
 class SqliteSessionRetryTests(unittest.TestCase):
+    def test_artifact_write_contention_does_not_fail_task_and_exit_cleanly(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("contended publication")
+            task = Task(job_id=job.id, role="implement", instruction="noop",
+                        adapter="local", payload={"skip_preflight": True})
+            store.save_task(task)
+            store.busy_timeout_ms = 0
+            blocker = store.connect()
+            execute = LocalWorker.run
+            save_artifact = store.save_artifact
+            executions = []
+
+            def execute_then_contend(worker, *args):
+                result = execute(worker, *args)
+                executions.append(task.id)
+                blocker.execute("BEGIN IMMEDIATE")
+                return result
+
+            def publish(artifact):
+                try:
+                    return save_artifact(artifact)
+                finally:
+                    # Let the runtime persist FAILED on the broken path so
+                    # the regression observes its otherwise clean idle exit.
+                    blocker.rollback()
+
+            runtime = WorkerRuntime(store, job.id, "implement", "w-1",
+                                    lease_seconds=30, heartbeat_seconds=10)
+            try:
+                with mock.patch.object(LocalWorker, "run", execute_then_contend), \
+                     mock.patch.object(store, "save_artifact", publish), \
+                     mock.patch.object(store, "_sleep_lock_backoff",
+                                       side_effect=lambda attempt: blocker.rollback()) as retry:
+                    self.assertEqual(runtime.run_until_idle(), 1)
+                self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+                retry.assert_called_once_with(0)
+                self.assertEqual(executions, [task.id])
+                events = store.read_events(job.id)
+                self.assertEqual(sum(e["event"] == "worker.completed_task" for e in events), 1)
+                self.assertFalse(any(e["event"] == "worker.failed_task" for e in events))
+                self.assertEqual(len(store.list_artifacts(job.id)), 1)
+                with store._session() as connection:
+                    rows = connection.execute("SELECT status, data FROM tasks").fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["status"], TaskStatus.COMPLETE.value)
+                self.assertEqual(json.loads(rows[0]["data"])["status"], rows[0]["status"])
+            finally:
+                blocker.close()
+
+    def test_coalesced_heartbeat_retries_real_writer_contention(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("contended heartbeat")
+            task = Task(job_id=job.id, role="implement", instruction="noop")
+            store.save_task(task)
+            claimed = store.claim_task(task.id, "w-1")
+            run = AgentRun(job_id=job.id, task_id=task.id, role=task.role, worker_id="w-1")
+            store.save_run(run)
+            store.busy_timeout_ms = 0
+            blocker = store.connect()
+            try:
+                blocker.execute("BEGIN IMMEDIATE")
+                with mock.patch.object(store, "_sleep_lock_backoff",
+                                       side_effect=lambda attempt: blocker.rollback()) as retry:
+                    _, renewed = store.heartbeat_run_and_renew_lease(
+                        run, task.id, "w-1", lease_id=claimed.lease_id)
+                retry.assert_called_once_with(0)
+                self.assertIsNotNone(renewed)
+                self.assertEqual(renewed.lease_id, claimed.lease_id)
+                events = store.read_events(job.id)
+                for event in ("task.lease_renewed", "run.heartbeat"):
+                    self.assertEqual(sum(e["event"] == event for e in events), 1)
+            finally:
+                blocker.close()
+
+    def test_waiting_heartbeat_cannot_overwrite_completion_or_successor_lease(self) -> None:
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal), TemporaryDirectory() as tmp:
+                store = SQLiteSwarmStore(tmp)
+                store.ensure_schema()
+                job = store.create_job("heartbeat fencing")
+                task = Task(job_id=job.id, role="implement", instruction="noop")
+                store.save_task(task)
+                claimed = store.claim_task(task.id, "same-worker")
+                run = AgentRun(job_id=job.id, task_id=task.id,
+                               role=task.role, worker_id="same-worker")
+                changed = (store._build_status_update(claimed, TaskStatus.COMPLETE)
+                           if terminal else replace(claimed, lease_id="successor",
+                                                    attempts=claimed.attempts + 1))
+                store.busy_timeout_ms = 0
+                blocker = store.connect()
+                try:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    blocker.execute("UPDATE tasks SET status = ?, data = ? WHERE id = ?",
+                                    (str(changed.status), store._dumps(changed), task.id))
+                    with mock.patch.object(store, "_sleep_lock_backoff",
+                                           side_effect=lambda attempt: blocker.commit()):
+                        _, renewed = store.heartbeat_run_and_renew_lease(
+                            run, task.id, "same-worker", lease_id=claimed.lease_id)
+                    self.assertIsNone(renewed)
+                    self.assertEqual(store.get_task_by_id(task.id), changed)
+                    self.assertFalse(any(e["event"] == "task.lease_renewed"
+                                         for e in store.read_events(job.id)))
+                finally:
+                    blocker.close()
+
     def test_attach_retries_real_open_lock(self) -> None:
         with TemporaryDirectory() as tmp:
             supervisor = SQLiteSwarmStore(tmp)
@@ -152,6 +274,175 @@ class SqliteSessionRetryTests(unittest.TestCase):
                 self.assertEqual(worker.list_jobs(), [])
             finally:
                 blocker.close()
+
+    def test_recovery_cas_retries_writer_contention(self) -> None:
+        for publish_intent in (False, True):
+            with self.subTest(publish_intent=publish_intent), TemporaryDirectory() as tmp:
+                store = SQLiteSwarmStore(tmp)
+                store.ensure_schema()
+                job = store.create_job("recovery contention")
+                task = Task(job_id=job.id, role="implement", instruction="noop")
+                store.save_task(task)
+                task = store.claim_task(task.id, "worker")
+                task = replace(task, lease_expires_at="2000-01-01T00:00:00+00:00")
+                store.save_task(task)
+                publisher = SQLiteSwarmStore(tmp)
+                publisher.attach()
+                store.busy_timeout_ms = 0
+                blocker = store.connect()
+                original = store._atomic_recover_stale
+
+                def interleaved(*args, **kwargs):
+                    blocker.execute("BEGIN IMMEDIATE")
+                    return original(*args, **kwargs)
+
+                def release_writer(attempt):
+                    blocker.rollback()
+                    if publish_intent:
+                        run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
+                                       worker_id="worker", status=TaskStatus.COMPLETE)
+                        with mock.patch.object(publisher, "reconcile_completions"):
+                            publisher.complete_task(task, run, [], {"task_id": task.id})
+
+                try:
+                    with mock.patch.object(store, "_atomic_recover_stale", side_effect=interleaved), \
+                         mock.patch.object(store, "_sleep_lock_backoff", side_effect=release_writer) as retry:
+                        recovered = store.recover_stale_tasks(job.id)
+                    retry.assert_called_once_with(0)
+                    self.assertEqual([item.id for item in recovered],
+                                     [] if publish_intent else [task.id])
+                    events = [event for event in store.read_events(job.id)
+                              if event["event"] == "task.recovered"]
+                    self.assertEqual(len(events), 0 if publish_intent else 1)
+                    store.reconcile_completions(job.id)
+                    self.assertEqual(store.get_task_by_id(task.id).status,
+                                     TaskStatus.COMPLETE if publish_intent else TaskStatus.QUEUED)
+                finally:
+                    blocker.close()
+
+    def test_recovery_event_failure_rolls_back_cas_without_replaying(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("recovery rollback")
+            task = Task(job_id=job.id, role="implement", instruction="noop")
+            store.save_task(task)
+            task = store.claim_task(task.id, "worker")
+            task = replace(task, lease_expires_at="2000-01-01T00:00:00+00:00")
+            store.save_task(task)
+            with mock.patch.object(store, "_emit", side_effect=sqlite3.OperationalError("database is locked")) as emit, \
+                 mock.patch.object(store, "_sleep_lock_backoff") as retry:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    store.recover_stale_tasks(job.id)
+            emit.assert_called_once()
+            retry.assert_not_called()
+            self.assertEqual(store.get_task_by_id(task.id), task)
+            self.assertFalse(any(event["event"] == "task.recovered"
+                                 for event in store.read_events(job.id)))
+
+    def test_previously_bare_mutations_retry_reservation(self) -> None:
+        for operation in ("create", "reset", "edge", "delete", "memory", "forget", "memories", "schema"):
+            with self.subTest(operation=operation), TemporaryDirectory() as tmp:
+                store = SQLiteSwarmStore(tmp)
+                store.ensure_schema()
+                job = store.create_job("contention")
+                task = Task(job_id=job.id, role="implement", instruction="noop")
+                store.save_task(task)
+                memory = MemoryRecord(scope="test", statement="remember", evidence=[],
+                                      source_artifacts=[], confidence=1.0)
+                store.promote_memory(memory)
+                actions = {
+                    "create": lambda: store.create_or_get_job("second"),
+                    "reset": lambda: store.reset_subgraph(job.id, [task.id]),
+                    "edge": lambda: store.delete_edge(job.id, "missing"),
+                    "delete": lambda: store.delete_job(job.id),
+                    "memory": lambda: store.promote_memory(replace(memory, statement="new")),
+                    "forget": lambda: store._delete_memory_record(memory.id),
+                    "memories": lambda: store.promote_memories([memory]),
+                    "schema": store.ensure_schema,
+                }
+                if operation == "schema":
+                    store._initialized = False
+                store.busy_timeout_ms = 0
+                blocker = store.connect()
+                try:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    with mock.patch.object(store, "_sleep_lock_backoff",
+                                           side_effect=lambda attempt: blocker.rollback()) as retry:
+                        actions[operation]()
+                    retry.assert_called_once_with(0)
+                finally:
+                    blocker.close()
+
+    def test_recovery_cannot_overwrite_expired_successor(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("successor recovery")
+            task = Task(job_id=job.id, role="implement", instruction="noop")
+            store.save_task(task)
+            scanned = store.claim_task(task.id, "same-worker")
+            expired = "2000-01-01T00:00:00+00:00"
+            scanned = replace(scanned, lease_expires_at=expired)
+            store.save_task(scanned)
+            original = store._atomic_recover_stale
+            successors = []
+
+            def interleaved(old, queued):
+                successor = store.claim_task(task.id, "same-worker")
+                self.assertIsNotNone(successor)
+                successor = replace(successor, lease_expires_at=expired)
+                store.save_task(successor)
+                successors.append(successor)
+                return original(old, queued)
+
+            with mock.patch.object(store, "_atomic_recover_stale", side_effect=interleaved):
+                self.assertEqual(store.recover_stale_tasks(job.id), [])
+            current = store.get_task_by_id(task.id)
+            self.assertEqual(current, successors[0])
+            self.assertGreater(current.attempts, scanned.attempts)
+            self.assertFalse(any(e["event"] == "task.recovered" for e in store.read_events(job.id)))
+            recovered = store.recover_stale_tasks(job.id)
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0].attempts, current.attempts)
+
+    def test_recovery_fences_each_scanned_identity_field(self) -> None:
+        for change in ({"lease_id": "new-token"}, {"generation": 9},
+                       {"lease_owner": "new-owner"}, {"attempts": 9}):
+            with self.subTest(change=change), TemporaryDirectory() as tmp:
+                store = SQLiteSwarmStore(tmp)
+                store.ensure_schema()
+                job = store.create_job("identity fence")
+                scanned = Task(job_id=job.id, role="implement", instruction="noop",
+                               status=TaskStatus.RUNNING, attempts=2, generation=None,
+                               lease_id=None, lease_owner="worker",
+                               lease_expires_at="2000-01-01T00:00:00+00:00")
+                store.save_task(scanned)
+                successor = replace(scanned, **change)
+                store.save_task(successor)
+                self.assertFalse(store._atomic_recover_stale(scanned, store._build_recovered_task(scanned)))
+                self.assertEqual(store.get_task_by_id(scanned.id), successor)
+                self.assertTrue(store._atomic_recover_stale(successor, store._build_recovered_task(successor)))
+
+    def test_reset_and_memory_share_outer_rollback(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("nested reset")
+            task = Task(job_id=job.id, role="implement", instruction="noop", status=TaskStatus.COMPLETE)
+            store.save_task(task)
+            memory = MemoryRecord(scope="test", statement="nested", evidence=[],
+                                  source_artifacts=[], confidence=1.0)
+            with self.assertRaisesRegex(RuntimeError, "abort"):
+                with store._writer_scope():
+                    store.reset_subgraph(job.id, [task.id])
+                    self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.QUEUED)
+                    store.promote_memory(memory)
+                    self.assertEqual(len(store.list_memory()), 1)
+                    raise RuntimeError("abort")
+            self.assertEqual(store.get_task_by_id(task.id), task)
+            self.assertEqual(store.list_memory(), [])
+            self.assertFalse(any(e["event"] == "subgraph.reset" for e in store.read_events(job.id)))
 
     def test_writer_retries_real_reservation_lock_before_body(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -365,16 +656,9 @@ class WorkerHeartbeatLifecycleTests(unittest.TestCase):
             join_timeouts = []
             errors = []
             original_heartbeat = runtime._heartbeat_run_and_lease
-            original_renew = store._renew_lease_on_connection
             original_complete = store.complete_task
             original_save = store.save_run
             original_join = threading.Thread.join
-
-            def renew(*args, **kwargs):
-                # The heartbeat has opened its SQLite session and read the task;
-                # its next statement writes against the held BEGIN IMMEDIATE.
-                entered.set()
-                return original_renew(*args, **kwargs)
 
             def join(target, timeout=None):
                 if target is not blocker and target is not thread:
@@ -408,6 +692,9 @@ class WorkerHeartbeatLifecycleTests(unittest.TestCase):
                 try:
                     if not locked.wait(5):
                         raise AssertionError("writer did not acquire lock")
+                    # The heartbeat now reserves the writer before reading the
+                    # task, so it cannot reach renewal until this lock releases.
+                    entered.set()
                     updated, renewed = original_heartbeat(*args)
                     return updated, None if lose_lease else renewed
                 finally:
@@ -435,7 +722,6 @@ class WorkerHeartbeatLifecycleTests(unittest.TestCase):
             with mock.patch.object(runtime, "_heartbeat_run_and_lease", delayed_heartbeat), \
                  mock.patch("puppetmaster.worker_runtime.LocalWorker.run", side_effect=local_work), \
                  mock.patch.object(store, "complete_task", side_effect=complete), \
-                 mock.patch.object(store, "_renew_lease_on_connection", side_effect=renew), \
                  mock.patch.object(store, "save_run", side_effect=save_run), \
                  mock.patch.object(threading.Thread, "join", join):
                 blocker = threading.Thread(target=block_writer)
@@ -535,10 +821,33 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
 
             self.assertEqual(errors, [])
             tasks = supervisor.list_tasks(job.id)
+            status_counts = Counter(str(task.status) for task in tasks)
+            failed_events = [e["payload"] for e in supervisor.read_events(job.id)
+                             if e["event"] == "worker.failed_task"]
+            diagnostics = {"statuses": dict(status_counts), "failed_events": failed_events}
+            self.assertEqual(len(tasks), task_count, diagnostics)
             complete = sum(task.status == TaskStatus.COMPLETE for task in tasks)
             failed = sum(task.status == TaskStatus.FAILED for task in tasks)
-            self.assertEqual(complete, task_count)
-            self.assertEqual(failed, 0)
+            self.assertEqual(complete, task_count, diagnostics)
+            self.assertEqual(failed, 0, diagnostics)
+            self.assertTrue(all(task.attempts == 1 for task in tasks))
+            completed_events = Counter(e["payload"]["task_id"]
+                                       for e in supervisor.read_events(job.id)
+                                       if e["event"] == "worker.completed_task")
+            self.assertEqual(completed_events, Counter({task.id: 1 for task in tasks}))
+            self.assertEqual(len(supervisor.list_artifacts(job.id)), task_count)
+            with supervisor._session() as connection:
+                rows = connection.execute("SELECT role, status, data FROM tasks").fetchall()
+                pending = connection.execute(
+                    "SELECT COUNT(*) FROM completions WHERE json_extract(data, '$.done') = 0"
+                ).fetchone()[0]
+            self.assertEqual(pending, 0)
+            self.assertEqual(len(rows), task_count)
+            for row in rows:
+                data = json.loads(row["data"])
+                self.assertEqual(row["status"], TaskStatus.COMPLETE.value)
+                self.assertEqual(row["status"], data["status"])
+                self.assertEqual(row["role"], data["role"])
 
     def test_create_worker_store_attaches_only(self) -> None:
         with TemporaryDirectory() as tmp:
