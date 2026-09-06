@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import sys
 import threading
@@ -40,6 +41,7 @@ def _attach_claim_complete_worker(
             worker_id=worker_id,
             lease_seconds=30,
             poll_seconds=0.05,
+            heartbeat_seconds=0.01,
         )
         runtime.run_until_idle()
     except Exception:  # noqa: BLE001 — surface in the parent assert
@@ -329,15 +331,166 @@ class SqliteHeartbeatCoalesceTests(unittest.TestCase):
             self.assertEqual(persisted.lease_expires_at, renewed.lease_expires_at)
 
 
+class WorkerHeartbeatLifecycleTests(unittest.TestCase):
+    def test_completion_waits_for_inflight_sqlite_heartbeat(self) -> None:
+        self._assert_heartbeat_drained_before_terminal(exception=False)
+
+    def test_exception_waits_for_inflight_sqlite_heartbeat(self) -> None:
+        self._assert_heartbeat_drained_before_terminal(exception=True)
+
+    def test_lease_loss_during_exception_drain_skips_publication(self) -> None:
+        self._assert_heartbeat_drained_before_terminal(exception=True, lose_lease=True)
+
+    def test_lease_loss_during_completion_drain_skips_publication(self) -> None:
+        self._assert_heartbeat_drained_before_terminal(exception=False, lose_lease=True)
+
+    def _assert_heartbeat_drained_before_terminal(
+        self, *, exception: bool, lose_lease: bool = False
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("heartbeat shutdown")
+            store.save_task(Task(job_id=job.id, role="implement", instruction="noop",
+                                 adapter="local", payload={"skip_preflight": True}))
+            runtime = WorkerRuntime(store, job.id, "implement", "w-1",
+                                    lease_seconds=30, heartbeat_seconds=0.01)
+            entered = threading.Event()
+            release = threading.Event()
+            request_lock = threading.Event()
+            locked = threading.Event()
+            heartbeat_finished = threading.Event()
+            publishing = threading.Event()
+            joining = threading.Event()
+            join_timeouts = []
+            errors = []
+            original_heartbeat = runtime._heartbeat_run_and_lease
+            original_renew = store._renew_lease_on_connection
+            original_complete = store.complete_task
+            original_save = store.save_run
+            original_join = threading.Thread.join
+
+            def renew(*args, **kwargs):
+                # The heartbeat has opened its SQLite session and read the task;
+                # its next statement writes against the held BEGIN IMMEDIATE.
+                entered.set()
+                return original_renew(*args, **kwargs)
+
+            def join(target, timeout=None):
+                if target is not blocker and target is not thread:
+                    join_timeouts.append(timeout)
+                    joining.set()
+                return original_join(target, timeout)
+
+            def assert_drained():
+                publishing.set()
+                if not heartbeat_finished.is_set():
+                    raise AssertionError("terminal publication preceded heartbeat drain")
+
+            def save_run(run):
+                if run.status == TaskStatus.FAILED:
+                    assert_drained()
+                return original_save(run)
+
+            def block_writer():
+                try:
+                    if not request_lock.wait(5):
+                        raise AssertionError("worker did not request contention")
+                    with store._session() as connection:
+                        connection.execute("BEGIN IMMEDIATE")
+                        locked.set()
+                        if not release.wait(5):
+                            raise AssertionError("writer release was not signaled")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def delayed_heartbeat(*args):
+                try:
+                    if not locked.wait(5):
+                        raise AssertionError("writer did not acquire lock")
+                    updated, renewed = original_heartbeat(*args)
+                    return updated, None if lose_lease else renewed
+                finally:
+                    heartbeat_finished.set()
+
+            def local_work(*args, **kwargs):
+                request_lock.set()
+                if not entered.wait(5):
+                    raise AssertionError("heartbeat did not start")
+                if exception:
+                    raise RuntimeError("injected worker failure")
+                return AgentRun(job_id=job.id, task_id=args[0].id,
+                                role="implement", worker_id="w-1", status=TaskStatus.COMPLETE), []
+
+            def complete(*args, **kwargs):
+                assert_drained()
+                return original_complete(*args, **kwargs)
+
+            def run():
+                try:
+                    runtime.run_once()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(runtime, "_heartbeat_run_and_lease", delayed_heartbeat), \
+                 mock.patch("puppetmaster.worker_runtime.LocalWorker.run", side_effect=local_work), \
+                 mock.patch.object(store, "complete_task", side_effect=complete), \
+                 mock.patch.object(store, "_renew_lease_on_connection", side_effect=renew), \
+                 mock.patch.object(store, "save_run", side_effect=save_run), \
+                 mock.patch.object(threading.Thread, "join", join):
+                blocker = threading.Thread(target=block_writer)
+                thread = threading.Thread(target=run)
+                blocker.start()
+                thread.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertTrue(joining.wait(5), "runtime did not reach heartbeat shutdown")
+                    # The lock is held until shutdown reaches join. A timed join
+                    # cannot establish drain ordering, regardless of scheduling.
+                    self.assertEqual(join_timeouts, [None])
+                    self.assertFalse(publishing.is_set(),
+                                     "terminal publication raced an outstanding heartbeat")
+                finally:
+                    release.set()
+                    blocker.join(10)
+                    thread.join(10)
+                    self.assertTrue(heartbeat_finished.wait(5))
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertFalse(blocker.is_alive())
+            self.assertEqual(publishing.is_set(), not lose_lease)
+            self.assertEqual(runtime._lease_lost.is_set(), lose_lease)
+            expected = (TaskStatus.RUNNING if lose_lease else
+                        TaskStatus.FAILED if exception else TaskStatus.COMPLETE)
+            self.assertEqual(store.list_tasks(job.id)[0].status, expected)
+            with store._session() as connection:
+                rows = connection.execute("SELECT data FROM runs WHERE job_id = ?", (job.id,)).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(json.loads(rows[0]["data"])["status"], expected.value)
+
+    def test_previous_lease_loss_does_not_abandon_next_claim(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("next lease")
+            store.save_task(Task(job_id=job.id, role="implement", instruction="noop",
+                                 adapter="local", payload={"skip_preflight": True}))
+            runtime = WorkerRuntime(store, job.id, "implement", "w-1")
+            runtime._lease_lost.set()
+            self.assertTrue(runtime.run_once())
+            self.assertEqual(store.list_tasks(job.id)[0].status, TaskStatus.COMPLETE)
+
+
 class SqliteMultiprocessAttachTests(unittest.TestCase):
     def test_supervisor_ensure_then_n_workers_attach_claim_complete(self) -> None:
         worker_count = 32
+        task_count = worker_count * 3
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / ".puppetmaster"
             supervisor = SQLiteSwarmStore(root)
             supervisor.ensure_schema()
             job = supervisor.create_job("local attach stress")
-            for index in range(worker_count):
+            for index in range(task_count):
                 supervisor.save_task(
                     Task(
                         job_id=job.id,
@@ -377,12 +530,14 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
                     errors.append(f"exit:{error_path.name}={process.exitcode}")
                 if error_path.is_file():
                     errors.append(error_path.read_text(encoding="utf-8"))
+                if not process.is_alive():
+                    process.close()
 
             self.assertEqual(errors, [])
             tasks = supervisor.list_tasks(job.id)
             complete = sum(task.status == TaskStatus.COMPLETE for task in tasks)
             failed = sum(task.status == TaskStatus.FAILED for task in tasks)
-            self.assertEqual(complete, worker_count)
+            self.assertEqual(complete, task_count)
             self.assertEqual(failed, 0)
 
     def test_create_worker_store_attaches_only(self) -> None:
