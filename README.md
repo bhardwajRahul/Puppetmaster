@@ -101,7 +101,7 @@ To verify an installed Codex route on macOS, Linux, or Windows, run
 `puppetmaster setup --verify-first-run codex/<model>` with an exact registry ID.
 This opt-in check makes one live call in temporary state and returns nonzero if
 it cannot prove delivery within 120 seconds. Ordinary setup does not make this
-call. See [first-run verification](docs/CLI_REFERENCE.md#verify-a-first-run).
+call. See [first-run verification](docs/CLI_REFERENCE.md).
 
 More recipes are in [DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md) and [MODEL_ROUTING.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/MODEL_ROUTING.md).
 
