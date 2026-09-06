@@ -17,7 +17,7 @@ import os
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
@@ -127,7 +127,7 @@ class ProviderHealthStore:
             if self._initialized:
                 return
             mkdir_private(self.path.parent)
-            with self._connect() as connection:
+            with closing(self._connect()) as connection, connection:
                 connection.executescript(_SCHEMA)
                 connection.commit()
             chmod_private_file(self.path)
