@@ -17,6 +17,7 @@ from puppetmaster.adapters import StreamedProcess
 from puppetmaster.cli._dispatch import _main
 from puppetmaster.model_registry import ModelSpec, save_registry, stamp_model_billing
 from puppetmaster.orchestrator import Orchestrator, merge_routing_payload
+from puppetmaster.platform_billing import BillingStatus
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.store import SwarmStore
 from puppetmaster.worker_runtime import WorkerRuntime
@@ -184,7 +185,11 @@ class BillingProvenanceTests(unittest.TestCase):
                             'cached_input_tokens': 169600}}
                         adapter = CliAdapter(lambda task: StreamedProcess(
                             returncode=0, stdout=json.dumps(event), stderr=''))
+                        # The fake CLI is ready regardless of host Codex login state.
                         with patch('puppetmaster.workers.get_adapter', return_value=adapter), \
+                                patch('puppetmaster.preflight.detect_adapter_billing',
+                                      return_value=BillingStatus('codex', billing, True,
+                                                                 'fixture CLI ready')), \
                                 patch('puppetmaster.adapters.git_snapshot', return_value={}):
                             self.assertTrue(runtime.run_once())
                         raise InterruptedError('captured real dispatch')
