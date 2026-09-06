@@ -1392,7 +1392,8 @@ def resolve_claude_command(claude_executable: Optional[str] = None) -> Optional[
     """
     candidate = claude_executable or os.environ.get("CLAUDE_CODE_COMMAND") or "claude"
     try:
-        parts = shlex.split(candidate, posix=(os.name != "nt"))
+        parts = ([candidate] if os.path.isfile(os.path.expanduser(candidate))
+                 else shlex.split(candidate, posix=(os.name != "nt")))
     except ValueError:
         return None
     if not parts:

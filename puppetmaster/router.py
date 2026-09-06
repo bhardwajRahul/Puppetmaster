@@ -314,6 +314,8 @@ class TaskSignals:
     # tasks still route to cheap models while expensive ones stop at the cap.
     explicit_max_capability: Optional[int] = None
     explicit_max_cost_usd: Optional[float] = None
+    billing_payload: dict = field(default_factory=dict)
+    billing_adapter: Optional[str] = None
     required_tags: list[str] = field(default_factory=list)
     estimated_tokens_in: Optional[int] = None
     estimated_tokens_out: Optional[int] = None
@@ -673,13 +675,17 @@ class RoutingDecision:
     # Optional counterfactual evidence. This is deliberately metadata on the
     # already-computed production decision; it never supplies dispatch fields.
     shadow_routing: Optional[dict] = None
+    registry_billing: Optional[str] = None
 
-    def to_artifact_payload(self) -> dict:
+    def to_artifact_payload(self, *, effective_billing: Optional[str] = None) -> dict:
         payload = {
             "model_id": self.model.id,
             "adapter": self.model.adapter,
             "adapter_model_name": self.model.adapter_model_name,
-            "billing": self.model.billing,
+            "billing": (
+                effective_billing if effective_billing is not None else self.model.billing
+            ),
+            "registry_billing": self.registry_billing or self.model.billing,
             "policy": self.policy,
             "capability_needed": self.capability_needed,
             "capability_score": self.model.capability_score,
@@ -1409,7 +1415,16 @@ def route_task(
     ``generation_presence`` is the bound registry used to decide whether a
     GPT-5.6 successor still exists in-lane after fallback shrinks ``registry``.
     """
-    models = tuple(registry)
+    from puppetmaster.model_registry import stamp_model_billing
+
+    original_models = tuple(registry)
+    if generation_presence is not None:
+        generation_presence = tuple(generation_presence)
+    authority = generation_presence if generation_presence is not None else original_models
+    models = tuple(replace(model, billing=stamp_model_billing(
+        task.billing_payload, model, registry=authority,
+        previous_adapter=task.billing_adapter,
+    )["billing"]) for model in original_models)
     production = _route_task_once(
         task,
         models,
@@ -1418,6 +1433,9 @@ def route_task(
         local_receipts=local_receipts,
         generation_presence=generation_presence,
     )
+    production = replace(production, registry_billing=next(
+        model.billing for model in original_models if model.id == production.model.id
+    ))
     if shadow_policy is None:
         return production
     if shadow_policy not in VALID_POLICIES:
@@ -1660,6 +1678,8 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
 
     return TaskSignals(
         instruction=instruction,
+        billing_payload={key: payload[key] for key in ("model", "router_model_id", "billing") if key in payload},
+        billing_adapter=getattr(spec, "adapter", None),
         role=getattr(spec, "role", "explore") or "explore",
         payload_size_chars=payload_size_chars,
         explicit_min_capability=payload.get("min_capability"),

@@ -88,7 +88,7 @@ def resolve_and_bind_explicit_pin(
             f"model pin {source!r} for adapter {adapter!r} is not enabled and "
             f"routable in registry {path}; it may be disabled, retired, or absent"
         )
-    stamped = stamp_resolved_model_pin(dict(payload or {}), pin)
+    stamped = stamp_resolved_model_pin(dict(payload or {}), pin, registry=registry)
     return bind_registry_authority(stamped, path, registry)
 
 
@@ -115,7 +115,7 @@ def validate_pinned_dispatch(payload: dict, *, adapter: str) -> dict:
                     f"or absent in registry {path}"
                 )
             return bind_registry_authority(
-                stamp_resolved_model_pin(dict(payload or {}), pin),
+                stamp_resolved_model_pin(dict(payload or {}), pin, registry=registry),
                 path,
                 registry,
             )
@@ -144,4 +144,4 @@ def validate_pinned_dispatch(payload: dict, *, adapter: str) -> dict:
             f"registry authority invalid for model pin {pinned!r}: "
             "router_model_id and pinned registry identity diverge"
         )
-    return dict(payload or {})
+    return stamp_resolved_model_pin(dict(payload or {}), pin, registry=registry)

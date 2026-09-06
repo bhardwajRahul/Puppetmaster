@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional, TextIO
 
+from puppetmaster.budget import BUDGET_FIELDS, budget_policy_from_inputs
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
@@ -604,13 +605,20 @@ def _run_dashboard_command(args: argparse.Namespace, state_dir: Path) -> int:
 def _main(argv: Optional[list[str]] = None) -> int:
     import puppetmaster.cli as cli
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        budget_policy = budget_policy_from_inputs(vars(args))
+    except ValueError as exc:
+        parser.error(str(exc))
     nested_msg = nested_start_blocked(getattr(args, "command", None))
     if nested_msg:
         print(nested_msg, file=sys.stderr)
         return 2
     if getattr(args, "max_output_bytes", None) is not None:
         os.environ["PUPPETMASTER_MAX_OUTPUT_BYTES"] = str(args.max_output_bytes)
+    if args.command == "setup" and getattr(args, "verify_first_run", None) is not None:
+        return _run_setup(args)
     state_dir = _resolve_command_state_dir(args)
     store = create_store(args.backend, state_dir)
     on_job_created = early_job_printer if args.emit_job_id_early else None
@@ -836,6 +844,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -903,6 +912,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -939,6 +950,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -981,6 +994,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1023,6 +1038,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1065,6 +1082,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1101,6 +1120,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1153,6 +1174,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1197,6 +1220,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode="inline",
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1258,6 +1283,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1346,6 +1373,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 worker_mode=args.worker_mode,
                 on_job_created=on_job_created or early_job_printer,
                 label=args.label,
+                budget_policy=budget_policy,
+                launch_key=getattr(args, "launch_key", None),
             )
             return cli.finalize_cli_run(result)
 
@@ -1363,6 +1392,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 routing_policy=getattr(args, "routing_policy", None),
                 disable_memory=disable_memory,
                 label=args.label,
+                budget_policy=budget_policy,
                 worker_mode=args.worker_mode,
                 backend=args.backend,
                 launch_key=getattr(args, "launch_key", None),
@@ -1426,11 +1456,13 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            budget_policy=budget_policy,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
     if args.command == "demo":
-        result = cli.Orchestrator(store).run(args.goal)
+        result = cli.Orchestrator(store).run(args.goal, budget_policy=budget_policy)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         print("\n" + result.summary)
         return 0
@@ -1439,6 +1471,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         result = cli.Orchestrator(store).run_crash_recovery_demo(
             args.goal,
             crash_role=args.crash_role,
+            budget_policy=budget_policy,
         )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         print(f"recovered_tasks: {result.recovered_tasks}")
@@ -1614,7 +1647,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             return 1
         apply_fn = adapter_apply_fn(
             adapter=args.adapter, model=args.model, provider=args.provider,
-            use_verify_loop=not args.no_verify_loop,
+            use_verify_loop=not args.no_verify_loop, budget_policy=budget_policy,
         )
         report = run_eval(cases, apply_fn, adapter=args.adapter, model=args.model)
         if args.json:
@@ -1819,6 +1852,15 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "rerun":
         source_job = store.get_job(args.job_id or require_latest_job_id(store))
+        if source_job.budget_policy is not None:
+            for field in BUDGET_FIELDS:
+                supplied = getattr(args, "budget_" + field)
+                if supplied is not None and supplied != getattr(source_job.budget_policy, field):
+                    raise ValueError(
+                        "rerun preserves the source budget policy; "
+                        "use run to launch an independent job with different limits"
+                    )
+            budget_policy = source_job.budget_policy
         if args.config:
             config = load_config(args.config)
             result = cli.Orchestrator(store).run(
@@ -1826,9 +1868,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 specs=config.workers,
                 lease_seconds=config.lease_seconds,
                 label=source_job.label,
+                budget_policy=budget_policy,
             )
         else:
-            result = cli.Orchestrator(store).run(source_job.goal, label=source_job.label)
+            result = cli.Orchestrator(store).run(
+                source_job.goal, label=source_job.label, budget_policy=budget_policy
+            )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 

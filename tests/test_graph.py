@@ -15,6 +15,7 @@ import os
 import sqlite3
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -164,6 +165,31 @@ class GraphStoreParityTests(unittest.TestCase):
                 assert got is not None
                 self.assertEqual(got.type, GraphEdgeType.DEPENDS_ON)
 
+    def test_sqlite_v2_upgrade_preserves_graph_and_adds_accounting_tables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteSwarmStore(root)
+            store.init()
+            job = store.create_job("v2 graph")
+            task = Task(job_id=job.id, role=PLAN_ROLE, instruction="plan")
+            store.save_task(task)
+            artifact = _decision_artifact(job.id, task.id, "preserve me")
+            store.save_artifact(artifact)
+            before = store.list_edges(job.id)
+            with sqlite3.connect(root / "state.sqlite3") as connection:
+                connection.execute("DROP TABLE usage_observations")
+                connection.execute("DROP TABLE execution_attempts")
+                connection.execute("DROP TABLE budget_reservations")
+                connection.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
+            upgraded = SQLiteSwarmStore(root)
+            upgraded.init()
+            self.assertEqual(upgraded.schema_status()["schema_version"],
+                             str(SQLiteSwarmStore.schema_version))
+            self.assertEqual(upgraded.list_edges(job.id), before)
+            self.assertEqual(upgraded.list_attempts(job.id), [])
+            self.assertEqual(upgraded.list_usage_observations(job.id), [])
+            self.assertEqual(upgraded.budget_snapshot(job.id)["reservations"], [])
+
     def test_sqlite_migration_backfills_v1_edges(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "legacy"
@@ -272,8 +298,8 @@ class GraphStoreParityTests(unittest.TestCase):
             store = SQLiteSwarmStore(root)
             store.init()
             status = store.schema_status()
-            self.assertEqual(status["schema_version"], "2")
-            self.assertEqual(status["expected_schema_version"], "2")
+            self.assertEqual(status["schema_version"], str(SQLiteSwarmStore.schema_version))
+            self.assertEqual(status["expected_schema_version"], str(SQLiteSwarmStore.schema_version))
             depends = store.list_edges(
                 "job_legacy", edge_type=GraphEdgeType.DEPENDS_ON
             )
@@ -1202,6 +1228,67 @@ class FileConsumesJournalTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
 class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
+    def test_sqlite_reset_excludes_concurrent_claim_and_preserves_active_work(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            worker = SQLiteSwarmStore(store.root)
+            worker.busy_timeout_ms = 0
+            worker.attach()
+            job = store.create_job("reset claim race")
+            task = Task(
+                job_id=job.id,
+                role=IMPLEMENT_ROLE,
+                instruction="implement",
+                status=TaskStatus.QUEUED,
+            )
+            store.save_task(task)
+            fresh = _decision_artifact(job.id, task.id, "worker output")
+            blocked = []
+            real_has_active_lease = store.has_active_lease
+
+            def claim_after_lease_check(candidate):
+                active = real_has_active_lease(candidate)
+                try:
+                    claimed = worker.claim_task(task.id, "worker-live")
+                except sqlite3.OperationalError as exc:
+                    self.assertIn("locked", str(exc))
+                    blocked.append(task.id)
+                else:
+                    self.assertIsNotNone(claimed)
+                    worker.save_artifact(fresh)
+                return active
+
+            with mock.patch.object(
+                store, "has_active_lease", side_effect=claim_after_lease_check
+            ):
+                store.reset_subgraph(job.id, [task.id])
+            self.assertEqual(blocked, [task.id])
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.QUEUED)
+
+            # Once reset commits, the other connection can claim and publish.
+            claimed = worker.claim_task(task.id, "worker-live")
+            self.assertIsNotNone(claimed)
+            worker.save_artifact(fresh)
+            store.save_job(replace(
+                store.get_job(job.id),
+                status=JobStatus.COMPLETE,
+                completed_at="2026-01-01T00:03:00+00:00",
+                cost_receipt={"sentinel": "preserve on refusal"},
+            ))
+            before_task = store.get_task_by_id(task.id)
+            before_job = store.get_job(job.id)
+            before_artifacts = store.list_artifacts(job.id)
+            before_edges = store.list_edges(job.id)
+            before_events = store.read_events(job.id)
+            with self.assertRaises(ActiveTaskLeaseError):
+                store.reset_subgraph(job.id, [task.id])
+            self.assertEqual(store.get_task_by_id(task.id), before_task)
+            self.assertEqual(store.get_job(job.id), before_job)
+            self.assertEqual(store.list_artifacts(job.id), before_artifacts)
+            self.assertEqual(store.list_edges(job.id), before_edges)
+            self.assertEqual(store.read_events(job.id), before_events)
+
     def test_sqlite_reset_subgraph_is_single_transaction(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
@@ -1280,7 +1367,8 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
             def boom_after_writes():
                 with real_session() as connection:
                     yield connection
-                    raise sqlite3.OperationalError("simulated busy/crash")
+                    if connection.total_changes:
+                        raise sqlite3.OperationalError("simulated busy/crash")
 
             with mock.patch.object(store, "_session", boom_after_writes):
                 with self.assertRaises(sqlite3.OperationalError):
@@ -1323,6 +1411,9 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
             )
             store.save_artifact(artifact)
 
+            before_job = store.get_job(job.id)
+            before_edges = store.list_edges(job.id)
+            before_events = store.read_events(job.id)
             real_session = store._session
             from contextlib import contextmanager
 
@@ -1330,7 +1421,8 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
             def boom_after_writes():
                 with real_session() as connection:
                     yield connection
-                    raise sqlite3.OperationalError("simulated busy/crash")
+                    if connection.total_changes:
+                        raise sqlite3.OperationalError("simulated busy/crash")
 
             with mock.patch.object(store, "_session", boom_after_writes):
                 with self.assertRaises(sqlite3.OperationalError):
@@ -1345,6 +1437,10 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
                 ),
                 "fresh",
             )
+
+            self.assertEqual(store.get_job(job.id), before_job)
+            self.assertEqual(store.list_edges(job.id), before_edges)
+            self.assertEqual(store.read_events(job.id), before_events)
 
             result = store.reset_subgraph(job.id, [implement.id])
             self.assertEqual(result.superseded_artifact_ids, [artifact.id])
@@ -1387,7 +1483,7 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
             checks = {check.name: check for check in run_doctor(root, state_dir)}
             sqlite_check = checks["sqlite-state"]
             self.assertEqual(sqlite_check.status, "warn")
-            self.assertIn("expected=2", sqlite_check.detail)
+            self.assertIn(f"expected={SQLiteSwarmStore.schema_version}", sqlite_check.detail)
             self.assertIn("999", sqlite_check.detail)
             self.assertIn("differs", sqlite_check.detail)
 
@@ -1607,7 +1703,7 @@ class GraphCliMcpTests(unittest.TestCase):
             self.assertIn("depends_on", edge_types)
             self.assertIn("produces", edge_types)
             status = SQLiteSwarmStore(root).schema_status()
-            self.assertEqual(status["schema_version"], "2")
+            self.assertEqual(status["schema_version"], str(SQLiteSwarmStore.schema_version))
 
 if __name__ == "__main__":
     unittest.main()

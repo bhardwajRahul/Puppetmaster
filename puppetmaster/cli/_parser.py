@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional, TextIO
 
+from puppetmaster.budget import BUDGET_FIELDS
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
@@ -191,7 +192,15 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
+    def _add_budget_arguments(job_parser: argparse.ArgumentParser) -> None:
+        for field, kind in BUDGET_FIELDS.items():
+            job_parser.add_argument(
+                "--budget-" + field.replace("_", "-"), type=kind, default=None,
+                help="Positive cumulative job-total limit; separate from --max-cost-usd.",
+            )
+
     def _add_label_argument(job_parser: argparse.ArgumentParser) -> None:
+        _add_budget_arguments(job_parser)
         job_parser.add_argument(
             "--label",
             default=None,
@@ -463,6 +472,10 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser = subcommands.add_parser(
         "setup",
         help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-hermes-mcp (+ Hermes hooks) + install-pi-mcp when --platforms includes pi + install-omp-mcp when --platforms includes omp/ohmypi + install-rules + install-hooks. Skips steps where the tool isn't present.",
+    )
+    setup_parser.add_argument(
+        "--verify-first-run", metavar="codex/<model>",
+        help="Only verify one live first run on this exact Codex model; do not install anything.",
     )
     setup_parser.add_argument(
         "--skip-doctor",
@@ -747,6 +760,7 @@ def build_parser() -> argparse.ArgumentParser:
         "eval",
         help="Run the seeded-bug eval harness against an implement adapter (pass-rate + diff quality).",
     )
+    _add_budget_arguments(eval_cmd)
     eval_cmd.add_argument(
         "--adapter", default="agentic",
         help="Adapter to evaluate (default: agentic). Also accepts cursor / claude-code.",
@@ -1239,6 +1253,7 @@ def build_parser() -> argparse.ArgumentParser:
     reject.add_argument("--reason", default="Rejected by operator.")
 
     rerun = subcommands.add_parser("rerun", help="Rerun the goal from a previous job.")
+    _add_budget_arguments(rerun)
     rerun.add_argument("job_id", nargs="?")
     rerun.add_argument("--config", help="Path to a Puppetmaster JSON workflow config.")
 
@@ -2298,6 +2313,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
+    _add_budget_arguments(demo)
     demo.add_argument(
         "--goal",
         default="Build Puppetmaster: agentic swarms meets Redis/Gunicorn.",
@@ -2307,6 +2323,7 @@ def build_parser() -> argparse.ArgumentParser:
         "crash-demo",
         help="Run a subprocess swarm where one worker crashes and the task is recovered.",
     )
+    _add_budget_arguments(crash_demo)
     crash_demo.add_argument(
         "--goal",
         default="Prove Puppetmaster can recover abandoned agent work.",

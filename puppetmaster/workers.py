@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import AbstractSet, Callable, Mapping, Optional
 
-from puppetmaster.adapters import get_adapter, verification_artifact
+from puppetmaster.adapters import get_adapter, tool_list, verification_artifact
 from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
 
 # Adapters that bill an LLM provider and therefore benefit from a pre-dispatch
@@ -292,11 +292,24 @@ class LocalWorker:
             status=TaskStatus.COMPLETE,
             completed_at=now_iso(),
         )
-        if task.adapter == "cursor":
-            return run, get_adapter("cursor").run(task, goal, self.worker_id)
-        if task.adapter == "shell":
-            return run, get_adapter("shell").run(task, goal, self.worker_id)
-        return run, get_adapter(task.adapter).run(task, goal, self.worker_id)
+        adapter = get_adapter(task.adapter)
+        if getattr(type(adapter), "accounts_invocations", False) is True:
+            return run, adapter.run(task, goal, self.worker_id)
+        from puppetmaster.invocation import invocation
+
+        with invocation(adapter=task.adapter) as capture:
+            artifacts = adapter.run(task, goal, self.worker_id)
+            # Generic adapters expose usage only in their return artifacts.
+            # The invocation-aware adapters capture raw usage before this point.
+            for artifact in artifacts:
+                payload = artifact.payload or {}
+                if any(key in payload for key in (
+                    "tokens_in", "tokens_out", "cache_read_tokens", "cache_write_tokens",
+                    "real_cost_usd", "cost_usd",
+                )):
+                    capture.observe(payload, key=f"artifact:{artifact.id}",
+                                    cost_basis=payload.get("cost_basis", "unknown"))
+            return run, artifacts
 
     def _normalize_cursor_pin(self, task: Task) -> Task:
         """Stamp an explicit Cursor pin before preflight and adapter dispatch."""
@@ -440,9 +453,12 @@ def spec_has_side_effects(spec: WorkerSpec) -> bool:
     if payload.get("allow_browser"):
         return True
     toolsets = payload.get("toolsets")
+    if isinstance(toolsets, list) and all(isinstance(item, str) for item in toolsets):
+        toolsets = tool_list(toolsets)
     if isinstance(toolsets, str):
         return "browser" in {part.strip() for part in toolsets.split(",")}
-    return False
+    # Unknown toolset shapes cannot establish that external actions are absent.
+    return toolsets is not None
 
 
 def swarm_is_acting(specs: list[WorkerSpec]) -> bool:
@@ -970,4 +986,3 @@ def specs_for_roles(roles: Optional[list[str]] = None) -> list[WorkerSpec]:
         known.get(role, WorkerSpec(role=role, instruction=f"Run the {role} worker."))
         for role in roles
     ]
-

@@ -7,6 +7,8 @@ from enum import Enum
 from typing import Any, Optional, Union
 from uuid import uuid4
 
+from puppetmaster.budget import BudgetPolicy
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -151,6 +153,7 @@ class Job:
     # Older records omit the key. JSON on the job row only — not a new
     # ArtifactType or store table. STALLED must not keep a receipt.
     cost_receipt: Optional[dict[str, Any]] = None
+    budget_policy: Optional[BudgetPolicy] = None
 
 
 @dataclass(frozen=True)
@@ -391,6 +394,8 @@ def job_from_dict(data: dict[str, Any]) -> Job:
     raw_receipt = data.get("cost_receipt")
     return Job(
         id=data["id"],
+        budget_policy=(BudgetPolicy(**data["budget_policy"])
+                       if data.get("budget_policy") is not None else None),
         goal=data["goal"],
         label=data.get("label"),
         status=_job_status_or_stalled(data["status"]),
@@ -428,6 +433,13 @@ def task_from_dict(data: dict[str, Any]) -> Task:
 
 
 def artifact_from_dict(data: dict[str, Any]) -> Artifact:
+    # Development builds briefly persisted a new enum unknown to released MCP
+    # readers. Normalize those rows on read; all subsequent writes use the
+    # existing verification schema, without inventing a routing decision.
+    if data["type"] == "execution_billing":
+        data = {**data, "type": ArtifactType.VERIFICATION.value,
+                "payload": {**data["payload"], "check": "execution_billing",
+                            "result": "recorded"}, "sha256": None}
     return Artifact(
         id=data["id"],
         job_id=data["job_id"],

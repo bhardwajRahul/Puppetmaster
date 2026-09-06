@@ -118,11 +118,11 @@ class DashboardFrontierTests(unittest.TestCase):
         self.assertEqual(activity[0]["text"], "Gist: no admission field")
 
     def test_renderer_includes_frontier_sidecar(self) -> None:
-        self.assertIn("renderFrontierSidecar", _PAGE_APP_JS)
-        self.assertIn("frontier-sidecar", _PAGE_APP_JS)
-        self.assertIn("gists admitted", _PAGE_APP_JS)
-        self.assertIn("renderGistSection", _PAGE_APP_JS)
-        self.assertIn("frontier-gist-list", _PAGE_APP_JS)
+        self.assertIn("function renderFrontier", _PAGE_APP_JS)
+        self.assertIn('class="frontier"', _PAGE_APP_JS)
+        self.assertIn("gists ${esc(key)}", _PAGE_APP_JS)
+        self.assertIn('["Gists", "gist"]', _PAGE_APP_JS)
+        self.assertIn("source_artifact_ids", _PAGE_APP_JS)
 
     def test_snapshot_exposes_gist_claims(self) -> None:
         with TemporaryDirectory() as tmp:

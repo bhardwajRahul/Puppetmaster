@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from puppetmaster.budget import BudgetPolicy, budget_cli_flags
 from puppetmaster.run_id import reserve_run_logs, write_exclusive_run_text
 from puppetmaster.state import state_identity
 from puppetmaster.playbooks import recipe_for, stamp_payload
@@ -347,6 +348,7 @@ def detach_analysis_swarm(
     label: Optional[str] = None,
     worker_mode: str = "subprocess",
     backend: str = "sqlite",
+    budget_policy: Optional[BudgetPolicy] = None,
     job_id_timeout_seconds: float = EARLY_JOB_ID_TIMEOUT_SECONDS,
     launch_key: Optional[str] = None,
     playbook: Optional[str] = None,
@@ -395,6 +397,7 @@ def detach_analysis_swarm(
         "--worker-mode",
         worker_mode,
     ]
+    full_command.extend(budget_cli_flags(budget_policy))
     if disable_memory:
         full_command.append("--disable-memory")
     else:

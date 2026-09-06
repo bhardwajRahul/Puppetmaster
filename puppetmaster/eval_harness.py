@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from puppetmaster.budget import BudgetPolicy
+
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "pmeval", "GIT_AUTHOR_EMAIL": "eval@puppetmaster",
     "GIT_COMMITTER_NAME": "pmeval", "GIT_COMMITTER_EMAIL": "eval@puppetmaster",
@@ -229,6 +231,7 @@ def adapter_apply_fn(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     use_verify_loop: bool = True,
+    budget_policy: Optional[BudgetPolicy] = None,
 ) -> "Callable[[Path, EvalCase], None]":
     """An ``apply_fn`` that runs a real Puppetmaster implement worker on the repo.
 
@@ -236,6 +239,10 @@ def adapter_apply_fn(
     independently. When ``use_verify_loop`` is set, the case's own verification
     command is handed to the agentic verify-before-submit loop as well, so the
     adapter gets the same self-correction signal a real user would configure.
+
+    Each case creates its own job/store and receives the same immutable policy.
+    Totals are independent per case, never shared across the evaluation suite.
+    Omitting the policy preserves unbudgeted execution.
     """
     from puppetmaster.orchestrator import Orchestrator
     from puppetmaster.store_factory import create_store
@@ -260,7 +267,9 @@ def adapter_apply_fn(
         state_dir = Path(tempfile.mkdtemp(prefix="pmeval_state_"))
         try:
             store = create_store("sqlite", str(state_dir))
-            Orchestrator(store).run(case.task, specs=[spec], worker_mode="inline")
+            Orchestrator(store).run(
+                case.task, specs=[spec], worker_mode="inline", budget_policy=budget_policy
+            )
         finally:
             shutil.rmtree(state_dir, ignore_errors=True)
 

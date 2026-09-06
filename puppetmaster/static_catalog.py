@@ -133,6 +133,24 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
     ],
     "codex": [
         {
+            "model": "gpt-6-astra",
+            "capability": 100,
+            "input": 10.0,
+            "output": 50.0,
+            "context": 1_050_000,
+            "billing": "plan",
+            "tags": [
+                "tools",
+                "codex",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "agent-loop",
+                "long-context",
+            ],
+        },
+        {
             "model": "gpt-5.4-mini",
             "capability": 72,
             "input": 0.75,

@@ -43,6 +43,7 @@ class OpenAIAdapter:
     """
 
     name = "openai"
+    accounts_invocations = True
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         base_prompt = task.payload.get("prompt") or task.instruction
@@ -161,9 +162,20 @@ class OpenAIAdapter:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-                status_code = response.getcode()
-                raw_body = response.read().decode("utf-8", errors="replace")
+            from puppetmaster.invocation import invocation, check_external_dispatch
+
+            with invocation(adapter="openai", model=model, billing="api") as capture:
+                check_external_dispatch()
+                with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                    status_code = response.getcode()
+                    raw_body = response.read().decode("utf-8", errors="replace")
+                try:
+                    response_data = json.loads(raw_body)
+                except ValueError:
+                    response_data = {}
+                capture.observe(response_data.get("usage"), cost_basis=(
+                    "api_equivalent" if capture.billing == "plan"
+                    else capture.billing or "unknown"), final=True)
         except urllib.error.HTTPError as exc:  # 4xx/5xx
             err_body = ""
             try:
@@ -324,4 +336,3 @@ class OpenAIAdapter:
             )
         artifacts.extend(parsed_artifacts)
         return artifacts
-

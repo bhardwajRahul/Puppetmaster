@@ -49,6 +49,7 @@ from puppetmaster.failure import (
     TIMEOUT,
     classify_provider_failure,
 )
+from puppetmaster.invocation import check_external_dispatch
 
 _PROMPT_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 # All Claude breakpoints (system + last tool + moving history) use 1h TTL by
@@ -553,6 +554,9 @@ class AssistantTurn:
     raw: dict = field(default_factory=dict)
     reasoning: str = ""
     reasoning_details: Optional[list] = None
+    # Raw present fields for the invocation ledger; normalized usage stays compatible.
+    accounting_usage: Optional[dict] = None
+    accounting_complete: bool = True
 
 
 class ProviderError(Exception):
@@ -611,6 +615,7 @@ def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
         method="POST",
     )
     try:
+        check_external_dispatch()
         with urllib.request.urlopen(request, timeout=timeout) as response:
             _harvest_response_headers(getattr(response, "headers", None), http_status=200)
             raw = response.read().decode("utf-8", errors="replace")
@@ -738,6 +743,7 @@ def _openai_chat(
         text=str(message.get("content") or "").strip(),
         tool_calls=tool_calls,
         finish_reason=str(finish or ""),
+        accounting_usage=usage,
         usage=_openai_usage_fields(usage),
         raw=data,
         reasoning=reasoning_text,
@@ -1016,6 +1022,7 @@ def _anthropic_chat(
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=str(data.get("stop_reason") or ""),
+        accounting_usage=usage,
         usage={
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -1093,6 +1100,7 @@ def _open_stream(url: str, *, headers: dict, body: dict, timeout: int):
         method="POST",
     )
     try:
+        check_external_dispatch()
         response = urllib.request.urlopen(request, timeout=timeout)
         _harvest_response_headers(getattr(response, "headers", None), http_status=200)
         return response
@@ -1157,11 +1165,13 @@ def _openai_chat_stream(
     reasoning_parts: list[str] = []
     reasoning_details_acc: list = []
     tool_acc: dict[int, dict] = {}
+    complete = False
     finish = ""
     usage: dict = {}
     try:
         for payload in _iter_sse_data(response):
             if payload == "[DONE]":
+                complete = True
                 break
             try:
                 chunk = json.loads(payload)
@@ -1213,6 +1223,8 @@ def _openai_chat_stream(
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=str(finish or ""),
+        accounting_usage=usage,
+        accounting_complete=complete,
         usage=_openai_usage_fields(usage),
         raw={},
         reasoning="".join(reasoning_parts).strip(),
@@ -1251,7 +1263,9 @@ def _anthropic_chat_stream(
     )
     text_parts: list[str] = []
     blocks: dict[int, dict] = {}
+    complete = False
     finish = ""
+    accounting_usage: dict = {}
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
@@ -1265,6 +1279,7 @@ def _anthropic_chat_stream(
             etype = event.get("type")
             if etype == "message_start":
                 msg_usage = ((event.get("message") or {}).get("usage") or {})
+                accounting_usage.update(msg_usage)
                 prompt_tokens = int(msg_usage.get("input_tokens") or 0)
                 cached_tokens = int(msg_usage.get("cache_read_input_tokens") or 0)
                 cache_write_tokens = int(msg_usage.get("cache_creation_input_tokens") or 0)
@@ -1290,8 +1305,10 @@ def _anthropic_chat_stream(
                     slot["args"] += delta.get("partial_json") or ""
             elif etype == "message_delta":
                 finish = str((event.get("delta") or {}).get("stop_reason") or finish)
+                accounting_usage.update(event.get("usage") or {})
                 completion_tokens = int((event.get("usage") or {}).get("output_tokens") or completion_tokens)
             elif etype == "message_stop":
+                complete = True
                 break
     finally:
         response.close()
@@ -1310,6 +1327,8 @@ def _anthropic_chat_stream(
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=finish,
+        accounting_usage=accounting_usage,
+        accounting_complete=complete,
         usage={
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -1595,6 +1614,7 @@ def _assistant_turn_from_responses(data: dict) -> AssistantTurn:
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=finish,
+        accounting_usage=data.get("usage") or {},
         usage=_responses_usage_fields(data.get("usage") or {}),
         raw=data,
         reasoning=reasoning,
@@ -1694,6 +1714,7 @@ def _openai_responses_chat_stream(
     tool_slots: dict[int, dict] = {}
     collected_items: list[dict] = []
     usage: dict = {}
+    complete = False
     status = ""
     stream_error: Optional[str] = None
     try:
@@ -1815,6 +1836,7 @@ def _openai_responses_chat_stream(
                 "response.incomplete",
                 "response.failed",
             ):
+                complete = True
                 resp_obj = event.get("response")
                 if isinstance(resp_obj, dict):
                     if resp_obj.get("usage"):
@@ -1839,8 +1861,6 @@ def _openai_responses_chat_stream(
                     status = etype.rsplit(".", 1)[-1]
                 break
 
-            if etype == "response.completed" or etype.endswith(".completed"):
-                break
     finally:
         response.close()
 
@@ -1849,7 +1869,7 @@ def _openai_responses_chat_stream(
 
     if collected_items:
         assembled = {
-            "status": status or "completed",
+            "status": status or "incomplete",
             "output": collected_items,
             "usage": usage,
             "reasoning": "".join(reasoning_parts),
@@ -1873,6 +1893,7 @@ def _openai_responses_chat_stream(
                 turn.finish_reason = "tool_calls"
         if usage and not turn.usage.get("total_tokens"):
             turn.usage = _responses_usage_fields(usage)
+        turn.accounting_complete = complete
         return turn
 
     tool_calls: list[dict] = []
@@ -1883,13 +1904,15 @@ def _openai_responses_chat_stream(
             "name": slot.get("name") or "",
             "arguments": _parse_function_call_arguments(slot.get("args")),
         })
-    finish = "tool_calls" if tool_calls else (status or "completed")
+    finish = "tool_calls" if tool_calls else (status or "incomplete")
     if finish == "incomplete":
         finish = "length"
     return AssistantTurn(
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=finish,
+        accounting_usage=usage,
+        accounting_complete=complete,
         usage=_responses_usage_fields(usage),
         raw={},
         reasoning="".join(reasoning_parts).strip(),

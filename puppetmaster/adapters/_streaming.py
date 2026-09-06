@@ -255,6 +255,14 @@ def run_streamed_subprocess(
         # that teardown confined to the child and away from Puppetmaster.
         popen_kwargs["start_new_session"] = True
 
+    from puppetmaster.invocation import check_external_dispatch
+    try:
+        check_external_dispatch()
+    except Exception:
+        if live_handle is not None:
+            live_handle.close()
+        raise
+
     try:
         process = subprocess.Popen(
             command,

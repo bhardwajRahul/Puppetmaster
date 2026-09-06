@@ -8807,8 +8807,8 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             status = store.schema_status()
             checks = {check.name: check for check in run_doctor(root, root / ".puppetmaster")}
 
-            self.assertEqual(status["schema_version"], "2")
-            self.assertEqual(status["expected_schema_version"], "2")
+            self.assertEqual(status["schema_version"], "4")
+            self.assertEqual(status["expected_schema_version"], "4")
             self.assertEqual(checks["sqlite-state"].status, "ok")
 
     def test_cli_last_and_clean_support_daily_run_management(self) -> None:
@@ -10376,11 +10376,9 @@ class ModelRouterTests(unittest.TestCase):
             )
             self.assertEqual(len(data["tasks"]), 1)
             self.assertEqual(data["tasks"][0]["role"], "audit")
-            # The routing-present job also reports an actual_cost block (zero
-            # here, since no worker ran and no usage was recorded) — proving the
-            # actual-spend path is additive and never breaks the routing fields.
+            # Actual cost is unknown because no worker usage was recorded.
             self.assertIn("actual_cost", data)
-            self.assertEqual(data["actual_cost"]["total_marginal_cost_usd"], 0.0)
+            self.assertIsNone(data["actual_cost"]["total_marginal_cost_usd"])
 
     def _usage_verification(self, task_id, *, model, tokens_in, tokens_out, estimated, job_id="job_x", **extra):
         from puppetmaster.models import Artifact, ArtifactType
@@ -13445,11 +13443,34 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "unchanged")
 
+    def test_executable_paths_with_spaces_remain_one_argument(self):
+        from puppetmaster.adapters._base import command_parts
+        from puppetmaster.installers import resolve_claude_command
+
+        with TemporaryDirectory(prefix="cli path ") as tmp:
+            executable = Path(tmp) / "fake cli"
+            executable.touch()
+            command = str(executable)
+            self.assertEqual(command_parts(command), [command])
+            self.assertEqual(resolve_claude_command(command), [command])
+            self.assertEqual(command_parts([command, "--version"]), [command, "--version"])
+            with patch.dict(os.environ, {"CLAUDE_CODE_COMMAND": command}):
+                self.assertEqual(resolve_claude_command(), [command])
+
+    def test_command_parts_keeps_command_syntax(self):
+        import shlex
+        from puppetmaster.adapters._base import command_parts
+
+        for command in ("npx -y @anthropic-ai/claude-code", 'cli "two words"',
+                        "cli --version && echo ok", "cli | cat", "cli > output"):
+            with self.subTest(command=command):
+                self.assertEqual(command_parts(command), shlex.split(command, posix=(os.name != "nt")))
+
     def test_resolve_claude_command_multiword_and_missing(self):
         from puppetmaster.installers import resolve_claude_command
 
         # Multi-word commands resolve their head and keep the tail.
-        resolved = resolve_claude_command(f"{sys.executable} -m something")
+        resolved = resolve_claude_command(f'"{sys.executable}" -m something')
         self.assertIsNotNone(resolved)
         self.assertEqual(resolved[1:], ["-m", "something"])
         self.assertIsNone(resolve_claude_command("/nonexistent/claude-nope"))
@@ -24905,7 +24926,7 @@ class PuppetmasterGateReplayCliTests(unittest.TestCase):
             metric_file.write_text("5", encoding="utf-8")
             # A tiny oracle that prints {"metrics": {"violations": N}} from a file.
             oracle = (
-                f'{sys.executable} -c "import json,pathlib;'
+                f'"{sys.executable}" -c "import json,pathlib;'
                 f"print(json.dumps({{'metrics': {{'violations': "
                 f"int(pathlib.Path('metric.txt').read_text())}}}}))\""
             )
@@ -29385,25 +29406,49 @@ class NPlusOneRegressionTests(unittest.TestCase):
                 store.save_task(replace(claimed, lease_expires_at=seconds_from_now(-1)))
                 stale.append(task)
 
-            sessions = {"count": 0}
-            original_session = store._session
+            traces: list[list[str]] = []
+            original_connect = store._connect_with_lock_retry
 
-            def counting_session(*args, **kwargs):
-                sessions["count"] += 1
-                return original_session(*args, **kwargs)
+            def tracing_connect():
+                connection = original_connect()
+                statements: list[str] = []
+                traces.append(statements)
+                connection.set_trace_callback(statements.append)
+                return connection
 
-            with patch.object(store, "_session", side_effect=counting_session):
+            with patch.object(store, "_connect_with_lock_retry", side_effect=tracing_connect):
                 recovered = store.recover_stale_tasks(job.id)
 
             self.assertEqual(
                 sorted(task.id for task in recovered),
                 sorted(task.id for task in stale),
             )
-            # Constant session count for the whole wave (init + one batched
-            # write transaction), not one session per stale task. Pre-fix this
-            # was 1 + len(stale); the regression is a count that scales with N.
-            self.assertLess(sessions["count"], len(stale))
-            self.assertLessEqual(sessions["count"], 2)
+            # Journal reconciliation has its own transaction and nested reads.
+            # Measure committed recovery writes, not calls to the session helper.
+            recovery_transactions = []
+            for statements in traces:
+                transaction: list[str] = []
+                for statement in statements:
+                    sql = " ".join(statement.upper().split())
+                    if sql.startswith("BEGIN"):
+                        transaction = []
+                    elif sql == "COMMIT":
+                        if any(s.startswith("UPDATE TASKS ") for s in transaction):
+                            recovery_transactions.append(transaction)
+                        transaction = []
+                    else:
+                        transaction.append(sql)
+
+            self.assertEqual(len(recovery_transactions), 1)
+            recovery_writes = recovery_transactions[0]
+            self.assertEqual(
+                sum(s.startswith("UPDATE TASKS ") for s in recovery_writes), len(stale)
+            )
+            self.assertEqual(
+                sum(s.startswith("INSERT INTO EVENTS") and "'TASK.RECOVERED'" in s
+                    for s in recovery_writes),
+                len(stale),
+            )
             for task in stale:
                 self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.QUEUED)
 
@@ -29838,11 +29883,12 @@ class DashboardMobileTests(unittest.TestCase):
     def test_mobile_css_media_query_present(self) -> None:
         import puppetmaster.dashboard as dash
 
-        self.assertIn("@media (max-width: 640px)", dash.INDEX_HTML)
-        # Mobile job rows stack into a grid-areas card so a long hash can't
-        # stretch the row (see .job-row override in the media query).
+        self.assertIn("@media (max-width: 700px)", dash.INDEX_HTML)
+        # Mobile run rows stack into named areas so a long hash cannot stretch
+        # the row or hide project identity.
         self.assertIn("grid-template-areas:", dash.INDEX_HTML)
-        self.assertIn('"pill time"', dash.INDEX_HTML)
+        self.assertIn('"status time"', dash.INDEX_HTML)
+        self.assertIn(".workspace-name", dash.INDEX_HTML)
 
     def test_background_runfile_roundtrip_and_stop_is_idempotent(self) -> None:
         import puppetmaster.dashboard as dash
@@ -29998,10 +30044,10 @@ class DashboardPhaseStripTests(unittest.TestCase):
         import puppetmaster.dashboard as dash
 
         self.assertIn(".phase-seg", dash.INDEX_HTML)
-        self.assertIn("@keyframes phase-pulse", dash.INDEX_HTML)
+        self.assertIn("prefers-reduced-motion", dash.INDEX_HTML)
         self.assertIn("phase-seg.failed", dash.INDEX_HTML)
         self.assertIn("function phaseStrip(", dash.INDEX_HTML)
-        self.assertIn("phaseStrip(d.phase)", dash.INDEX_HTML)
+        self.assertIn("phaseStrip(job.phase)", dash.INDEX_HTML)
 
 class EvaluatorRegistryTests(unittest.TestCase):
     def test_missing_registry_returns_empty(self) -> None:

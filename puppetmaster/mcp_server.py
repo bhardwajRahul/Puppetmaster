@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from puppetmaster.budget import budget_cli_flags, budget_policy_from_inputs, budget_schema_properties
 from puppetmaster.codegraph import (
     CODEGRAPH_MISSING_HINT,
     CODEGRAPH_NATIVE_SQLITE_HINT,
@@ -2304,6 +2305,7 @@ def cursor_command(
     if disable_memory is True or (disable_memory is None and (review or plan)):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2392,6 +2394,7 @@ def codex_command(args: JsonObject) -> list[str]:
     if args.get("disable_memory"):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2420,6 +2423,7 @@ def hermes_command(args: JsonObject, implement: bool = True) -> list[str]:
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
     _append_routing_cli_flags(command, args)
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2442,6 +2446,7 @@ def antigravity_command(args: JsonObject, implement: bool = True) -> list[str]:
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
     _append_routing_cli_flags(command, args)
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2498,6 +2503,7 @@ def _review_command(args: JsonObject, adapter: str) -> list[str]:
     _append_swarm_timeout_flags(command, args)
     _append_swarm_memory_flags(command, args)
     _append_label_flag(command, args)
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2604,6 +2610,7 @@ def edit_command(args: JsonObject) -> list[str]:
     append_allowed_models_cli_flags(
         command, allowed_model_ids_list_from_mapping(args)
     )
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2662,6 +2669,7 @@ def browser_swarm_command(args: JsonObject) -> list[str]:
         command.extend(["--worker-mode", str(args["worker_mode"])])
     if args.get("executable"):
         command.extend(["--executable", str(args["executable"])])
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2728,6 +2736,7 @@ def prewalk_command(args: JsonObject) -> list[str]:
         command.append("--disable-memory")
     if args.get("worker_mode"):
         command.extend(["--worker-mode", str(args["worker_mode"])])
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2859,6 +2868,7 @@ def agentic_command(args: JsonObject, implement: Optional[bool] = None) -> list[
     if args.get("disable_memory"):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2903,6 +2913,7 @@ def claude_command(args: JsonObject) -> list[str]:
     if args.get("disable_memory"):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_budget_cli_flags(command, args)
     return command
 
 
@@ -2943,7 +2954,15 @@ def openai_command(args: JsonObject) -> list[str]:
         command.append("--disable-codegraph")
     if args.get("disable_memory"):
         command.append("--disable-memory")
+    _append_budget_cli_flags(command, args)
     return command
+
+
+def _append_budget_cli_flags(command: list[str], args: JsonObject) -> None:
+    flags = budget_cli_flags(budget_policy_from_inputs(args))
+    for index in range(0, len(flags), 2):
+        if flags[index] not in command:
+            command.extend(flags[index:index + 2])
 
 
 def _append_label_flag(command: list[str], args: JsonObject) -> None:
@@ -3069,6 +3088,7 @@ def start_swarm(args: JsonObject) -> JsonObject:
     _append_swarm_timeout_flags(command, args)
     _append_swarm_memory_flags(command, args)
     _append_label_flag(command, args)
+    _append_budget_cli_flags(command, args)
     result = start_cli(command, args)
     _normalized, duplicated = normalize_role_specs(role_inputs, goal)
     if duplicated and not result.get("isError"):
@@ -3152,6 +3172,7 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
         command.extend(["--worker-mode", str(worker_mode)])
     _append_swarm_timeout_flags(command, args)
     _append_label_flag(command, args)
+    _append_budget_cli_flags(command, args)
     return start_cli(command, args)
 
 
@@ -3638,6 +3659,7 @@ def run_worker_cli(command: list[str], args: JsonObject) -> JsonObject:
 
 
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:
+    _append_budget_cli_flags(command, args)
     state_dir = str(mcp_state_dir(args))
     timeout_seconds = int(args.get("runner_timeout_seconds") or 1800)
     try:
@@ -4203,6 +4225,7 @@ def run_await_job(args: JsonObject) -> JsonObject:
 
 
 def start_cli(command: list[str], args: JsonObject) -> JsonObject:
+    _append_budget_cli_flags(command, args)
     if command:
         nested_msg = nested_start_blocked(command[0])
         if nested_msg:
@@ -4825,6 +4848,7 @@ def goal_schema(default_goal: str) -> JsonObject:
     from puppetmaster.playbooks import PLAYBOOK_IDS
 
     schema = base_schema()
+    schema["properties"].update(budget_schema_properties())
     schema["properties"].update(
         {
             "goal": {
@@ -5374,6 +5398,7 @@ def edit_schema() -> JsonObject:
     return {
         "type": "object",
         "properties": {
+            **budget_schema_properties(),
             "instruction": {
                 "type": "string",
                 "description": "What to change, in plain language (one focused edit).",
@@ -5432,6 +5457,7 @@ def browser_swarm_schema() -> JsonObject:
     return {
         "type": "object",
         "properties": {
+            **budget_schema_properties(),
             "tasks": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -5502,6 +5528,7 @@ def prewalk_schema() -> JsonObject:
     return {
         "type": "object",
         "properties": {
+            **budget_schema_properties(),
             "goal": {
                 "type": "string",
                 "description": (

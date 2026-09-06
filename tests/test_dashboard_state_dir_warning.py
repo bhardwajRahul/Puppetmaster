@@ -518,31 +518,31 @@ class BannerCallSiteTests(unittest.TestCase):
 
     @staticmethod
     def _load_index() -> str:
-        start = _PAGE_APP_JS.index("async function loadIndex")
-        return _PAGE_APP_JS[start : _PAGE_APP_JS.index("function rows(", start)]
+        start = _PAGE_APP_JS.index("function renderIndex")
+        return _PAGE_APP_JS[start : _PAGE_APP_JS.index("function actualCost", start)]
 
     def test_banner_sits_after_the_jobs_heading(self) -> None:
         body = self._load_index()
-        self.assertGreater(body.index("stateDirHint("), body.index("<h2>Jobs</h2>"))
+        self.assertGreater(body.index("stateDirHint("), body.index("<h1>Runs</h1>"))
 
     def test_banner_is_not_in_the_empty_state_branch(self) -> None:
         """The reported bad dir held exactly ONE job, so the empty state never
         rendered — a hint placed there would have missed the real incident."""
         body = self._load_index()
         self.assertEqual(body.count("stateDirHint("), 1)
-        self.assertLess(body.index("stateDirHint("), body.index("if (!shown.length)"))
+        self.assertLess(body.index("stateDirHint("), body.index("if (!latestJobs.length)"))
 
     def test_diagnostics_is_fetched_once_at_bootstrap_not_polled(self) -> None:
         for needle in (
             "/api/diagnostics",
             "async function loadDiagnostics",
-            "loadDiagnostics();",
+            "loadDiagnostics()",
         ):
             self.assertIn(needle, _PAGE_APP_JS, needle)
-        self.assertEqual(_PAGE_APP_JS.count("loadDiagnostics();"), 1)
+        self.assertEqual(_PAGE_APP_JS.count("loadDiagnostics()"), 2)
         # Same seam as loadMeta(): after tick()'s definition, never inside it.
         self.assertGreater(
-            _PAGE_APP_JS.index("loadDiagnostics();"),
+            _PAGE_APP_JS.rindex("loadDiagnostics()"),
             _PAGE_APP_JS.index("async function tick()"),
         )
         tick_region = _PAGE_APP_JS[
@@ -554,8 +554,8 @@ class BannerCallSiteTests(unittest.TestCase):
 
     def test_load_diagnostics_owns_its_own_failure(self) -> None:
         start = _PAGE_APP_JS.index("async function loadDiagnostics")
-        body = _PAGE_APP_JS[start : _PAGE_APP_JS.index("loadMeta();", start)]
-        for needle in ("try {", "catch", "r.ok"):
+        body = _PAGE_APP_JS[start : _PAGE_APP_JS.index("document.addEventListener", start)]
+        for needle in ("try {", "catch", 'requestJson("/api/diagnostics")'):
             self.assertIn(needle, body, needle)
 
 

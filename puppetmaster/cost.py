@@ -72,6 +72,8 @@ class TaskCost:
     tokens_estimated: bool
     marginal_cost_usd: float
     priced: bool
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass
@@ -123,6 +125,7 @@ def _model_index(registry: list) -> tuple[dict, dict]:
 # Pricing must follow the model that actually ran, not the initial pick that
 # failed over (e.g. plan-billed cursor -> agentic glm).
 _ROUTING_CREATED_BY_RANK = {
+    "router-review-escalation": 3,
     "router-escalation": 3,
     "router-fallback": 2,
     "router": 1,
@@ -138,7 +141,10 @@ def _is_current_routing_artifact(artifact: Artifact) -> bool:
 
 
 def final_routing_artifacts(artifacts: Iterable[Artifact]) -> dict[str, Artifact]:
-    best: dict[str, tuple[int, Artifact]] = {}
+    # Versioned routes win by monotonic per-task revision, independent of replay
+    # order. Historical routes use creation time, then creator rank and id for
+    # deterministic timestamp ties; their true append order is unrecoverable.
+    best = {}
     for artifact in artifacts:
         if artifact.type != ArtifactType.ROUTING:
             continue
@@ -148,10 +154,28 @@ def final_routing_artifacts(artifacts: Iterable[Artifact]) -> dict[str, Artifact
         task_id = getattr(artifact, "task_id", None)
         if rank == 0 or not task_id:
             continue
+        revision = (artifact.payload or {}).get("route_revision")
+        versioned = type(revision) is int and revision > 0
+        key = (versioned, revision if versioned else 0,
+               artifact.created_at or "", rank, artifact.id)
         previous = best.get(task_id)
-        if previous is None or rank > previous[0]:
-            best[task_id] = (rank, artifact)
+        if previous is None or key > previous[0]:
+            best[task_id] = (key, artifact)
     return {task_id: artifact for task_id, (_rank, artifact) in best.items()}
+
+
+def execution_billing_artifacts(artifacts: Iterable[Artifact]) -> dict[str, Artifact]:
+    """Actual routes supersede immutable pin provenance; legacy jobs need neither."""
+    artifacts = list(artifacts)
+    pins = {}
+    for artifact in sorted(artifacts, key=lambda a: (a.created_at or "", a.id)):
+        if (artifact.type == ArtifactType.VERIFICATION
+                and (artifact.payload or {}).get("check") == "execution_billing"
+                and artifact.created_by == "orchestrator" and artifact.task_id
+                and _is_current_routing_artifact(artifact)):
+            pins[artifact.task_id] = artifact
+    pins.update(final_routing_artifacts(artifacts))
+    return pins
 
 
 def _usage_records(artifacts: Iterable[Artifact]) -> dict:
@@ -199,9 +223,11 @@ def _add_priced_task(
     cost: float,
     priced: bool,
     nominal_cost: float = 0.0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> None:
     result.nominal_usage_cost_usd += nominal_cost
-    result.measured_usage_tokens += tokens_in + tokens_out
+    result.measured_usage_tokens += tokens_in + tokens_out + cache_read_tokens + cache_write_tokens
     if priced:
         result.priced_tasks += 1
     else:
@@ -237,6 +263,8 @@ def _add_priced_task(
             tokens_estimated=estimated,
             marginal_cost_usd=round(cost, 6),
             priced=priced,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
     )
 
@@ -281,9 +309,22 @@ def _resolve_spec(
     return None
 
 
-def _cost_with_cache_discount(spec, tokens_in: int, tokens_out: int, tokens_cached: int) -> float:
-    """Price input tokens with cache-read discount on the cached portion."""
-    uncached_in = max(0, tokens_in - tokens_cached)
+def _cost_with_cache_discount(
+    spec, tokens_in: int, tokens_out: int, tokens_cached: int,
+    *, cache_read_tokens: Optional[int] = None,
+    cache_write_tokens: Optional[int] = None,
+) -> float:
+    """Legacy cached input is inclusive; SDK split input is fresh-only.
+
+    Split fields take precedence over the legacy alias. Cache writes use the
+    registry input rate: ModelSpec has no separate write tier, so this remains
+    selected-model registry pricing, not a provider invoice reconstruction.
+    """
+    if cache_read_tokens is not None or cache_write_tokens is not None:
+        uncached_in = tokens_in + (cache_write_tokens or 0)
+        tokens_cached = cache_read_tokens or 0
+    else:
+        uncached_in = max(0, tokens_in - tokens_cached)
     scaled_tokens_out = tokens_out * getattr(spec, "output_token_multiplier", 1)
     return (
         (uncached_in / 1_000_000.0) * spec.input_per_mtok_usd
@@ -295,8 +336,10 @@ def _cost_with_cache_discount(spec, tokens_in: int, tokens_out: int, tokens_cach
 def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
     """Price each task, then sum a selected-model usage cost.
 
-    Per-task precedence (unchanged): matching registry model with
-    ``billing="plan"`` → $0 marginal; else positive artifact
+    Persisted execution billing (with final routing taking precedence) overrides
+    registry defaults even when the model is no longer registered. Legacy
+    artifacts without billing retain registry behavior.
+    Per-task precedence: effective ``billing="plan"`` → $0 marginal; else positive artifact
     ``real_cost_usd`` → that reported value; else matching registry model →
     tokens × registry prices (cache-read discount + output multiplier);
     else unpriced (aggregate unknown, not $0). Measured vs estimated
@@ -305,7 +348,7 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
     """
     artifacts = list(artifacts)
     by_id, by_adapter_name = _model_index(registry)
-    final_routes = final_routing_artifacts(artifacts)
+    final_routes = execution_billing_artifacts(artifacts)
     routing_models = {
         task_id: str((artifact.payload or {}).get("model_id"))
         for task_id, artifact in final_routes.items()
@@ -316,43 +359,42 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
         spec = _resolve_spec(
             routing_models.get(task_id), record["model"], by_id, by_adapter_name
         )
+        route = final_routes.get(task_id)
+        effective_billing = (route.payload or {}).get("billing") if route else None
+        if effective_billing not in ("plan", "api", "unknown"):
+            effective_billing = getattr(spec, "billing", None)
+        model_id = (spec.id if spec is not None else
+                    routing_models.get(task_id) or record["model"] or "<unknown>")
         tokens_in = record["tokens_in"]
         tokens_out = record["tokens_out"]
         tokens_cached = record["tokens_cached"]
         estimated = record["tokens_estimated"]
         real_cost_f = _real_cost_usd(record["real_cost_usd"])
-        plan_billed = spec is not None and getattr(spec, "billing", None) == "plan"
+        plan_billed = effective_billing == "plan"
         nominal_cost = (
-            _cost_with_cache_discount(spec, tokens_in, tokens_out, tokens_cached)
+            _cost_with_cache_discount(
+                spec, tokens_in, tokens_out, tokens_cached,
+                cache_read_tokens=record.get("cache_read_tokens"),
+                cache_write_tokens=record.get("cache_write_tokens"),
+            )
             if spec is not None
             else 0.0
         )
 
         if plan_billed:
-            model_id = spec.id
-            billing = spec.billing
+            billing = effective_billing
             cost = 0.0
             priced = True
         elif real_cost_f > 0:
             cost = real_cost_f
             priced = True
-            if spec is not None:
-                model_id = spec.id
-                billing = spec.billing
-            else:
-                model_id = routing_models.get(task_id) or record["model"] or "<unknown>"
-                billing = "reported"
+            billing = effective_billing or "reported"
         elif spec is not None:
-            model_id = spec.id
-            billing = spec.billing
-            if tokens_cached > 0:
-                cost = _cost_with_cache_discount(spec, tokens_in, tokens_out, tokens_cached)
-            else:
-                cost = spec.marginal_cost_usd(tokens_in, tokens_out)
+            billing = effective_billing
+            cost = nominal_cost
             priced = True
         else:
-            model_id = routing_models.get(task_id) or record["model"] or "<unknown>"
-            billing = "unknown"
+            billing = effective_billing or "unknown"
             cost = 0.0
             priced = False
 
@@ -367,6 +409,8 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
             cost=cost,
             priced=priced,
             nominal_cost=nominal_cost,
+            cache_read_tokens=record.get("cache_read_tokens", 0),
+            cache_write_tokens=record.get("cache_write_tokens", 0),
         )
     return _finalize_job_cost(result)
 
@@ -377,13 +421,19 @@ def job_counterfactual(job_cost: JobCost, registry: list) -> Optional[Counterfac
 
     Answers "what would this job have cost if every task had run on
     <reference> at metered rates?" — computable post-hoc, pinned or not. Returns
-    ``None`` for an empty registry."""
+    ``None`` for an empty registry. The naive baseline prices all input at the
+    full reference rate, including exclusive split cache reads and writes.
+    Legacy cached tokens are already included in tokens_in.
+    """
     reference = resolve_counterfactual_model(registry)
     if reference is None:
         return None
     naive = 0.0
     for task in job_cost.tasks:
-        naive += reference.estimate_cost_usd(task.tokens_in, task.tokens_out)
+        naive += reference.estimate_cost_usd(
+            task.tokens_in + task.cache_read_tokens + task.cache_write_tokens,
+            task.tokens_out,
+        )
     actual = job_cost.total_marginal_cost_usd
     in_price = getattr(reference, "input_per_mtok_usd", 0) or 0
     out_price = getattr(reference, "output_per_mtok_usd", 0) or 0
@@ -422,7 +472,7 @@ def routing_estimate_rows(artifacts: Iterable[Artifact]) -> tuple[list[dict], di
             seen_router_tasks.add(task_id)
         payload = artifact.payload or {}
         model_id = payload.get("model_id", "<unknown>")
-        cost = float(payload.get("estimated_cost_usd") or 0.0)
+        cost = _real_cost_usd(payload.get("estimated_cost_usd"))
         total += cost
         rows.append(
             {
@@ -470,7 +520,7 @@ def _actual_cost_payload(
         sum(task.marginal_cost_usd for task in job_cost.tasks if task.priced),
         6,
     )
-    selected_unknown = job_cost.unpriced_tasks > 0
+    selected_unknown = not job_cost.tasks or job_cost.unpriced_tasks > 0
     unpriced_models = {task.model_id for task in job_cost.tasks if not task.priced}
     actual_by_model = {}
     for model_id, bucket in job_cost.by_model.items():
@@ -511,7 +561,7 @@ def _counterfactual_payload(job_cost: JobCost, registry: list) -> Optional[dict]
     if counterfactual is None:
         return None
     payload = asdict(counterfactual)
-    actual_priced = job_cost.unpriced_tasks == 0
+    actual_priced = bool(job_cost.tasks) and job_cost.unpriced_tasks == 0
     payload["actual_priced"] = actual_priced
     if not actual_priced:
         payload["actual_cost_usd"] = None
@@ -594,7 +644,7 @@ def price_job_from_artifacts(artifacts: Iterable[Artifact]) -> JobCost:
     without an artifact price stays honestly unpriced.
     """
     artifacts = list(artifacts)
-    final_routes = final_routing_artifacts(artifacts)
+    final_routes = execution_billing_artifacts(artifacts)
     result = _job_cost_from_routes(final_routes)
     for task_id, record in _usage_records(artifacts).items():
         route = final_routes.get(task_id)
@@ -628,6 +678,8 @@ def price_job_from_artifacts(artifacts: Iterable[Artifact]) -> JobCost:
             estimated=estimated,
             cost=cost,
             priced=priced,
+            cache_read_tokens=record.get("cache_read_tokens", 0),
+            cache_write_tokens=record.get("cache_write_tokens", 0),
         )
     return _finalize_job_cost(result)
 

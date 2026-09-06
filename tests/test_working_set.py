@@ -316,6 +316,120 @@ class MaybeReuseTests(unittest.TestCase):
                 [source.id],
             )
 
+    def test_read_only_toolset_strings_and_lists_reuse_valid_hit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            _git_init_with_file(root, "src/a.py", "alpha\n")
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job, _, source = self._seed_labeled_finding(store, root, INSTRUCTION)
+            for toolsets in (
+                "file,web,vision", ["file", "web", "vision"],
+                "file, web, vision", ["file", " web", " vision"],
+                ["file,web", "vision"], "", [], None,
+            ):
+                with self.subTest(toolsets=toolsets):
+                    task = Task(
+                        job_id=job.id, role="explore", instruction=INSTRUCTION,
+                        payload=_analysis_payload(root, extra={"toolsets": toolsets}),
+                    )
+                    clones = maybe_reuse_artifacts(store, task)
+                    self.assertEqual(len(clones), 1)
+                    self.assertEqual(validation_status_of(clones[0]), "reused")
+                    self.assertEqual(
+                        clones[0].payload["validation"]["source_artifact_ids"],
+                        [source.id],
+                    )
+
+    def test_external_effects_reject_valid_hit_before_fingerprinting(self) -> None:
+        signals = [
+            {"side_effecting": True}, {"allow_browser": True},
+            {"toolsets": "file, browser, web"},
+            {"toolsets": ["browser"]}, {"toolsets": {"browser": True}},
+            {"toolsets": ["file", " browser ", "vision"]},
+            {"toolsets": ["file, browser", "vision"]},
+            {"toolsets": ["file", None]}, {"toolsets": [1]},
+            {"toolsets": [["browser"]]}, {"toolsets": [{}]},
+            {"toolsets": {}}, {"toolsets": ("file", "web")},
+            {"toolsets": 0}, {"toolsets": False},
+            {"side_effecting": "false"}, {"allow_browser": "false"},
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            _git_init_with_file(root, "src/a.py", "alpha\n")
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job, _, _ = self._seed_labeled_finding(store, root, INSTRUCTION)
+            for signal in signals:
+                with self.subTest(signal=signal):
+                    task = Task(job_id=job.id, role="explore", instruction=INSTRUCTION,
+                                payload=_analysis_payload(root, extra=signal))
+                    self.assertTrue(store.lookup_artifacts_by_validation_fingerprint(
+                        reuse_fingerprint(task), job_ids=[job.id]))
+                    with mock.patch("puppetmaster.working_set.reuse_fingerprint") as fp:
+                        self.assertEqual(maybe_reuse_artifacts(store, task), [])
+                        fp.assert_not_called()
+
+    def test_validation_inputs_bind_stamp_and_reuse(self) -> None:
+        cases = [
+            ({"rules_version": "1"}, {"rules_version": "2"}),
+            ({"evaluator_version": "1"}, {"evaluator_version": "2"}),
+            ({"evaluator_digest": "one"}, {"evaluator_digest": "two"}),
+            ({"evaluator": {"a": 1, "b": 2}}, {"evaluator": {"a": 2, "b": 2}}),
+            ({"rules_paths": ["rules.txt"]}, {"rules_paths": ["other.txt"]}),
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            _git_init_with_file(root, "src/a.py", "alpha\n")
+            (root / "rules.txt").write_text("one")
+            (root / "other.txt").write_text("two")
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            for original, changed in cases:
+                with self.subTest(original=original):
+                    job = store.create_job(INSTRUCTION)
+                    task = Task(job_id=job.id, role="explore", instruction=INSTRUCTION,
+                                payload=_analysis_payload(root, extra=original))
+                    stamped = stamp_fresh_validation(task, [_finding(job.id, task.id, "claim")])[0]
+                    store.save_artifact(stamped)
+                    self.assertEqual(stamped.payload["validation"]["fingerprint"], reuse_fingerprint(task))
+                    self.assertEqual(len(maybe_reuse_artifacts(store, task)), 1)
+                    task.payload.update(changed)
+                    self.assertNotEqual(stamped.payload["validation"]["fingerprint"], reuse_fingerprint(task))
+                    self.assertEqual(maybe_reuse_artifacts(store, task), [])
+
+            task.payload.clear()
+            task.payload.update(_analysis_payload(root, extra={"rules_paths": ["rules.txt"]}))
+            before = reuse_fingerprint(task)
+            stamped = stamp_fresh_validation(task, [_finding(job.id, task.id, "dirty rules")])[0]
+            store.save_artifact(stamped)
+            self.assertTrue(maybe_reuse_artifacts(store, task))
+            (root / "rules.txt").write_text("changed dirty rule bytes")
+            self.assertNotEqual(before, reuse_fingerprint(task))
+            self.assertEqual(maybe_reuse_artifacts(store, task), [])
+            task.payload["rules_paths"] = ["missing.txt"]
+            self.assertIsNone(reuse_fingerprint(task))
+            self.assertEqual(maybe_reuse_artifacts(store, task), [])
+
+    def test_validation_canonicalization_and_defaults(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _git_init_with_file(root, "src/a.py", "alpha\n")
+            task = Task(job_id="job", role="explore", instruction=INSTRUCTION,
+                        payload=_analysis_payload(root))
+            default = reuse_fingerprint(task)
+            task.payload.update(rules_paths=[], rules_version=None, evaluator=None,
+                                evaluator_version=None, evaluator_digest=None)
+            self.assertEqual(default, reuse_fingerprint(task))
+            task.payload.update(evaluator={"a": 1, "b": 2})
+            canonical = reuse_fingerprint(task)
+            task.payload["evaluator"] = {"b": 2, "a": 1}
+            self.assertEqual(canonical, reuse_fingerprint(task))
+            task.payload.update(evaluator_digest=" digest ", evaluator_version="v1")
+            explicit_digest = reuse_fingerprint(task)
+            task.payload.update(evaluator_digest="digest", evaluator_version="v2", evaluator={})
+            self.assertEqual(explicit_digest, reuse_fingerprint(task))
+
     def test_persist_reused_does_not_enqueue_follow_ups(self) -> None:
         from puppetmaster.working_set import persist_reused_artifacts
 
@@ -476,6 +590,7 @@ class WorkerRuntimeReuseTests(unittest.TestCase):
         return store, job
 
     def test_warm_skip_does_not_call_adapter(self) -> None:
+        from dataclasses import replace
         from puppetmaster.worker_runtime import WorkerRuntime
 
         with TemporaryDirectory() as tmp:
@@ -491,6 +606,9 @@ class WorkerRuntimeReuseTests(unittest.TestCase):
             )
             store.save_task(source_task)
             finding = _finding(job.id, source_task.id, "retry is missing")
+            finding = replace(finding, payload={**finding.payload, "enqueue_subtasks": [
+                {"role": "review", "instruction": "must not replay cached proposal"}
+            ]})
             store.save_artifact(stamp_fresh_validation(source_task, [finding])[0])
 
             queued = Task(
@@ -523,6 +641,10 @@ class WorkerRuntimeReuseTests(unittest.TestCase):
             ]
             self.assertTrue(reused)
             self.assertEqual(reused[0].task_id, queued.id)
+            self.assertEqual(store.list_attempts(job.id), [])
+            self.assertEqual(store.list_usage_observations(job.id), [])
+            store.reconcile_completions(job.id)
+            self.assertEqual(len(store.list_tasks(job.id)), 2)
 
     def test_different_instruction_calls_adapter(self) -> None:
         from puppetmaster.worker_runtime import WorkerRuntime
@@ -579,6 +701,66 @@ class WorkerRuntimeReuseTests(unittest.TestCase):
                 self.assertTrue(runtime.run_once())
             self.assertEqual(called["n"], 1)
             self.assertEqual(store.get_task_by_id(queued.id).status, TaskStatus.COMPLETE)
+
+    def test_external_action_calls_adapter_with_valid_hit(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        for signal in ({"side_effecting": True}, {"allow_browser": True},
+                       {"toolsets": "file,browser"}, {"toolsets": ["browser"]}):
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp) / "repo"
+                _git_init_with_file(root, "src/a.py", "alpha\n")
+                store, job = self._store_job(tmp)
+                source_task = Task(
+                    job_id=job.id,
+                    role="explore",
+                    instruction=INSTRUCTION,
+                    status=TaskStatus.COMPLETE,
+                    payload=_analysis_payload(root),
+                )
+                store.save_task(source_task)
+                finding = _finding(job.id, source_task.id, "retry is missing")
+                store.save_artifact(stamp_fresh_validation(source_task, [finding])[0])
+
+                queued = Task(
+                    job_id=job.id,
+                    role="explore",
+                    instruction=INSTRUCTION,
+                    status=TaskStatus.QUEUED,
+                    adapter="local",
+                    payload=_analysis_payload(root, extra=signal),
+                )
+                self.assertTrue(store.lookup_artifacts_by_validation_fingerprint(
+                    reuse_fingerprint(queued), job_ids=[job.id]))
+                store.save_task(queued)
+                called = {"n": 0}
+
+                class _FakeWorker:
+                    def __init__(self, role, worker_id=None):
+                        self.role = role
+                        self.worker_id = worker_id or "w"
+
+                    def run(self, t, goal):
+                        called["n"] += 1
+                        run = AgentRun(
+                            job_id=t.job_id,
+                            task_id=t.id,
+                            role=t.role,
+                            worker_id=self.worker_id,
+                            status=TaskStatus.COMPLETE,
+                        )
+                        art = _finding(t.job_id, t.id, "adapter ran")
+                        return run, [art]
+
+                runtime = WorkerRuntime(
+                    store=store, job_id=job.id, role="explore", worker_id="w"
+                )
+                with mock.patch(
+                    "puppetmaster.worker_runtime.LocalWorker", _FakeWorker
+                ):
+                    self.assertTrue(runtime.run_once())
+                self.assertEqual(called["n"], 1)
+                self.assertEqual(store.get_task_by_id(queued.id).status, TaskStatus.COMPLETE)
 
     def test_real_run_stamps_fresh_and_rebuilds_index(self) -> None:
         from puppetmaster.worker_runtime import WorkerRuntime

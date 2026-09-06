@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Union
 
+from puppetmaster.budget import BudgetPolicy
 from puppetmaster.models import (
     AgentRun,
     Artifact,
@@ -28,6 +30,9 @@ from puppetmaster.models import (
     now_iso,
     task_from_dict,
     to_jsonable,
+)
+from puppetmaster.attempts import (
+    ExecutionAttempt, UsageObservation, LedgerConflictError, canonical_record,
 )
 from puppetmaster.cost import maybe_stamp_terminal_cost_receipt
 from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
@@ -90,7 +95,7 @@ class SQLiteSwarmStore(SwarmStore):
     """SQLite-backed coordination store for multi-process worker coordination."""
 
     backend_name = "sqlite"
-    schema_version = 2
+    schema_version = 4
     busy_timeout_ms = _SQLITE_BUSY_TIMEOUT_MS
     synchronous_policy = _SQLITE_SYNCHRONOUS
 
@@ -103,6 +108,7 @@ class SQLiteSwarmStore(SwarmStore):
         self._attached = False
         self._open_mode = "deferred"
         self.lock_error_count = 0
+        self._completion_connection = threading.local()
 
     def init(self) -> None:
         """Supervisor ensure: directories, DDL, schema_version, migrate."""
@@ -142,6 +148,11 @@ class SQLiteSwarmStore(SwarmStore):
                   id TEXT PRIMARY KEY,
                   job_id TEXT NOT NULL,
                   task_id TEXT NOT NULL,
+                  data TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS completions (
+                  id TEXT PRIMARY KEY,
+                  job_id TEXT NOT NULL,
                   data TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS artifacts (
@@ -191,15 +202,15 @@ class SQLiteSwarmStore(SwarmStore):
                   ON graph_edges(job_id, to_id, type);
                 """
             )
-            # Fresh DBs get the current schema_version. Existing DBs keep their
-            # recorded version so _migrate_schema can detect v1 and backfill.
+            # Fresh DBs start at v2 and use the same v3/v4 migrations as existing
+            # databases. Existing versions are preserved for graph backfill.
             connection.execute(
                 """
                 INSERT INTO metadata(key, value)
                 VALUES('schema_version', ?)
                 ON CONFLICT(key) DO NOTHING
                 """,
-                (str(self.schema_version),),
+                ("2",),
             )
             self._migrate_schema(connection)
         chmod_private_file(self.db_path)
@@ -248,6 +259,12 @@ class SQLiteSwarmStore(SwarmStore):
                 f"SQLite store has no schema_version at {self.db_path}; "
                 "the supervisor must call ensure_schema() before workers attach"
             )
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'completions'"
+        ).fetchone() is None:
+            raise SqliteSchemaError(
+                "SQLite completion journal is missing; the supervisor must call ensure_schema()"
+            )
         raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
         try:
             current = int(raw)
@@ -255,6 +272,11 @@ class SQLiteSwarmStore(SwarmStore):
             raise SqliteSchemaError(
                 f"SQLite store schema_version is invalid at {self.db_path}: {raw!r}"
             ) from exc
+        for table in ("execution_attempts", "usage_observations", "budget_reservations"):
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+            ).fetchone() is None:
+                raise SqliteSchemaError(f"SQLite {table} missing; supervisor must migrate")
         if current != self.schema_version:
             raise SqliteSchemaError(
                 f"SQLite store schema_version {current} does not match "
@@ -293,12 +315,48 @@ class SQLiteSwarmStore(SwarmStore):
                 """
             )
             self._backfill_graph_edges(connection)
+        if current < 3:
+            if not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            # No backfill: selected artifacts/runs cannot establish historical
+            # invocation consumption. DDL and version update commit together.
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS execution_attempts (
+                  job_id TEXT NOT NULL,
+                  attempt_id TEXT NOT NULL,
+                  task_id TEXT NOT NULL,
+                  data TEXT NOT NULL,
+                  PRIMARY KEY(job_id, attempt_id)
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS usage_observations (
+                  job_id TEXT NOT NULL,
+                  attempt_id TEXT NOT NULL,
+                  observation_id TEXT NOT NULL,
+                  data TEXT NOT NULL,
+                  PRIMARY KEY(job_id, attempt_id, observation_id),
+                  FOREIGN KEY(job_id, attempt_id)
+                    REFERENCES execution_attempts(job_id, attempt_id)
+                )
+            """)
+        if current < 4:
+            if not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS budget_reservations (
+                  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                  attempt_id TEXT NOT NULL,
+                  state TEXT NOT NULL CHECK(state IN
+                    ('reserved','dispatching','settled','pending_reconciliation','released')),
+                  data TEXT NOT NULL,
+                  PRIMARY KEY(job_id, attempt_id)
+                )
+            """)
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_budget_job_state "
+                               "ON budget_reservations(job_id, state)")
             connection.execute(
-                """
-                INSERT INTO metadata(key, value)
-                VALUES('schema_version', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                 (str(self.schema_version),),
             )
 
@@ -493,6 +551,10 @@ class SQLiteSwarmStore(SwarmStore):
         backoff and jitter. This is a safety net after busy_timeout, not a
         replacement for supervisor-only schema init.
         """
+        active = getattr(self._completion_connection, "connection", None)
+        if active is not None:
+            yield active
+            return
         connection = self._connect_with_lock_retry()
         try:
             with connection:
@@ -516,12 +578,14 @@ class SQLiteSwarmStore(SwarmStore):
         goal: str,
         *,
         label: Optional[str] = None,
+        budget_policy: Optional[BudgetPolicy] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> Job:
         return self.create_or_get_job(
             goal,
             label=label,
+            budget_policy=budget_policy,
             launch_key=launch_key,
             launch_fingerprint=launch_fingerprint,
         )[0]
@@ -531,6 +595,7 @@ class SQLiteSwarmStore(SwarmStore):
         goal: str,
         *,
         label: Optional[str] = None,
+        budget_policy: Optional[BudgetPolicy] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> tuple[Job, bool]:
@@ -539,6 +604,7 @@ class SQLiteSwarmStore(SwarmStore):
         job = Job(
             goal=goal,
             label=label,
+            budget_policy=budget_policy,
             launch_key=launch_key,
             launch_fingerprint=fingerprint if launch_key else None,
         )
@@ -553,7 +619,8 @@ class SQLiteSwarmStore(SwarmStore):
                     existing = job_from_dict(json.loads(row["data"]))
                     if existing.launch_key != launch_key:
                         continue
-                    if existing.launch_fingerprint != fingerprint:
+                    if (existing.launch_fingerprint != fingerprint or
+                            existing.budget_policy != budget_policy):
                         raise LaunchConflictError(
                             "launch_key already belongs to a different request"
                         )
@@ -959,13 +1026,17 @@ class SQLiteSwarmStore(SwarmStore):
         lease_seconds: int = 60,
         task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
-        task = self.get_task_by_id(task_id)
-        if self._claim_precheck(task, task_map=task_map, worker_id=worker_id):
-            return None
-        claimed = self._build_claimed_task(task, worker_id, lease_seconds)
-        if not self._atomic_claim(task_id, task, claimed, worker_id=worker_id):
-            return None
-        return claimed
+        # Precheck can fail or block a task, invalidating its completion lease.
+        # Serialize from the authoritative task read through every mutation
+        # with intent publication, not just the final claim CAS.
+        with self._writer_scope():
+            task = self.get_task_by_id(task_id)
+            if self._claim_precheck(task, task_map=task_map, worker_id=worker_id):
+                return None
+            claimed = self._build_claimed_task(task, worker_id, lease_seconds)
+            if not self._atomic_claim(task_id, task, claimed, worker_id=worker_id):
+                return None
+            return claimed
 
     def _atomic_claim(
         self,
@@ -990,6 +1061,16 @@ class SQLiteSwarmStore(SwarmStore):
                   status = ?
                   OR status = ?
                   OR (status = ? AND json_extract(data, '$.lease_expires_at') <= ?)
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM completions
+                    WHERE completions.job_id = tasks.job_id
+                      AND json_extract(completions.data, '$.done') = 0
+                      AND json_extract(completions.data, '$.task.id') = tasks.id
+                      AND json_extract(completions.data, '$.task.lease_id')
+                          IS json_extract(tasks.data, '$.lease_id')
+                      AND json_extract(completions.data, '$.run.worker_id')
+                          = json_extract(tasks.data, '$.lease_owner')
                 )
                 """,
                 (
@@ -1016,6 +1097,7 @@ class SQLiteSwarmStore(SwarmStore):
         return True
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
+        self.reconcile_completions(job_id)
         self._ensure_attached()
         now = now_iso()
         stale = [task for task in self.list_tasks(job_id) if self.is_task_stale(task)]
@@ -1058,6 +1140,16 @@ class SQLiteSwarmStore(SwarmStore):
                 """
                 UPDATE tasks SET status = ?, data = ?
                 WHERE id = ? AND status = ? AND json_extract(data, '$.lease_expires_at') <= ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM completions
+                    WHERE completions.job_id = tasks.job_id
+                      AND json_extract(completions.data, '$.done') = 0
+                      AND json_extract(completions.data, '$.task.id') = tasks.id
+                      AND json_extract(completions.data, '$.task.lease_id')
+                          IS json_extract(tasks.data, '$.lease_id')
+                      AND json_extract(completions.data, '$.run.worker_id')
+                          = json_extract(tasks.data, '$.lease_owner')
+                )
                 """,
                 (
                     str(TaskStatus.QUEUED),
@@ -1069,6 +1161,119 @@ class SQLiteSwarmStore(SwarmStore):
             )
             return cursor.rowcount == 1
         return super()._atomic_recover_stale(task, queued)
+
+    @contextmanager
+    def _writer_scope(self):
+        self._ensure_attached()
+        with self._session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._completion_connection.connection = connection
+            try:
+                yield True
+            finally:
+                self._completion_connection.connection = None
+
+    def _completion_scope(self, job_id: str):
+        return self._writer_scope()
+
+    def _completion_intent_scope(self, job_id: str):
+        return self._completion_scope(job_id)
+
+    def _save_completion(self, job_id: str, record: dict[str, Any]) -> None:
+        with self._session() as connection:
+            connection.execute(
+                "INSERT INTO completions(id, job_id, data) VALUES (?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                (record["run"]["id"], job_id, json.dumps(record, sort_keys=True)),
+            )
+
+    def _completion_records(self, job_id: str) -> list[dict[str, Any]]:
+        return [json.loads(row["data"]) for row in self._all(
+            "SELECT data FROM completions WHERE job_id = ? ORDER BY id", (job_id,)
+        )]
+
+    def _record_ledger_sql(self, record: Union[ExecutionAttempt, UsageObservation]) -> bool:
+        self._ensure_attached()
+        self._assert_safe_job_dir(record.job_id)
+        data = canonical_record(record)
+        with self._budget_scope(record.job_id):
+            self._check_ledger_reservation(record)
+            with self._session() as connection:
+                # Reuse an enclosing completion transaction without BEGIN/commit.
+                if not connection.in_transaction:
+                    connection.execute("BEGIN IMMEDIATE")
+                if isinstance(record, ExecutionAttempt):
+                    table = "execution_attempts"
+                    where = "job_id = ? AND attempt_id = ?"
+                    key = (record.job_id, record.attempt_id)
+                    statement = ("INSERT INTO execution_attempts(job_id, attempt_id, task_id, data) "
+                                 "VALUES (?, ?, ?, ?)")
+                    values = (*key, record.task_id, data)
+                else:
+                    if connection.execute(
+                        "SELECT 1 FROM execution_attempts WHERE job_id = ? AND attempt_id = ?",
+                        (record.job_id, record.attempt_id),
+                    ).fetchone() is None:
+                        raise ValueError("usage observation requires a recorded attempt")
+                    table = "usage_observations"
+                    where = "job_id = ? AND attempt_id = ? AND observation_id = ?"
+                    key = (record.job_id, record.attempt_id, record.observation_id)
+                    statement = ("INSERT INTO usage_observations(job_id, attempt_id, observation_id, data) "
+                                 "VALUES (?, ?, ?, ?)")
+                    values = (*key, data)
+                row = connection.execute(f"SELECT data FROM {table} WHERE {where}", key).fetchone()
+                if row is not None:
+                    if canonical_record(type(record)(**json.loads(row["data"]))) != data:
+                        raise LedgerConflictError("ledger key already has different content")
+                    return False
+                connection.execute(statement, values)
+                return True
+
+    @contextmanager
+    def _budget_scope(self, job_id: str):
+        self._ensure_attached()
+        self._assert_safe_job_dir(job_id)
+        # Reuse an enclosing completion writer transaction, including its rollback.
+        if getattr(self._completion_connection, "connection", None) is not None:
+            yield
+        else:
+            with self._writer_scope():
+                yield
+
+    def _budget_records(self, job_id: str) -> list[dict[str, Any]]:
+        with self._session() as connection:
+            return [json.loads(row["data"]) for row in connection.execute(
+                "SELECT data FROM budget_reservations WHERE job_id = ? ORDER BY attempt_id",
+                (job_id,)).fetchall()]
+
+    def _save_budget_record(self, record: dict[str, Any]) -> None:
+        with self._session() as connection:
+            connection.execute(
+                "INSERT INTO budget_reservations(job_id, attempt_id, state, data) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(job_id, attempt_id) DO UPDATE SET "
+                "state = excluded.state, data = excluded.data",
+                (record["attempt"]["job_id"], record["attempt"]["attempt_id"],
+                 record["state"], json.dumps(record, sort_keys=True, allow_nan=False)))
+
+    def record_attempt(self, attempt: ExecutionAttempt) -> bool:
+        return self._record_ledger_sql(attempt)
+
+    def record_usage_observation(self, observation: UsageObservation) -> bool:
+        return self._record_ledger_sql(observation)
+
+    def list_attempts(self, job_id: str, *, task_id: Optional[str] = None) -> list[ExecutionAttempt]:
+        rows = self._all("SELECT data FROM execution_attempts WHERE job_id = ?" +
+                         (" AND task_id = ?" if task_id is not None else ""),
+                         (job_id, task_id) if task_id is not None else (job_id,))
+        return sorted((ExecutionAttempt(**json.loads(r["data"])) for r in rows),
+                      key=lambda r: (r.started_at, r.attempt_id))
+
+    def list_usage_observations(self, job_id: str, *, attempt_id: Optional[str] = None) -> list[UsageObservation]:
+        rows = self._all("SELECT data FROM usage_observations WHERE job_id = ?" +
+                         (" AND attempt_id = ?" if attempt_id is not None else ""),
+                         (job_id, attempt_id) if attempt_id is not None else (job_id,))
+        return sorted((UsageObservation(**json.loads(r["data"])) for r in rows),
+                      key=lambda r: (r.attempt_id, r.observation_id))
 
     def save_run(self, run: AgentRun) -> None:
         self._ensure_attached()
@@ -1249,6 +1454,24 @@ class SQLiteSwarmStore(SwarmStore):
         ``superseded_artifact_ids``) commit together so a busy/crash mid-reset
         cannot leave a partial subgraph.
         """
+        self._ensure_attached()
+        with self._session() as connection:
+            # Reserve the writer before any reset reads, including closure and
+            # lease checks. Existing read helpers use separate connections, but
+            # no writer can change their committed view while this lock is held.
+            connection.execute("BEGIN IMMEDIATE")
+            return self._reset_subgraph_locked(
+                connection, job_id, task_ids, include_descendants=include_descendants
+            )
+
+    def _reset_subgraph_locked(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        task_ids: Iterable[str],
+        *,
+        include_descendants: bool,
+    ) -> ResetSubgraphResult:
         selected = (
             self.consumer_closure(job_id, task_ids)
             if include_descendants
@@ -1295,15 +1518,13 @@ class SQLiteSwarmStore(SwarmStore):
             else:
                 finalized.append(current)
 
-        # Prepare superseded copies before the write session so labeling lands
-        # in the same transaction as task reset (no post-commit gap).
+        # Prepare all copies before mutation while the writer lock is held.
         superseded_artifacts = [
             self._prepare_artifact_for_save(artifact)
             for artifact in self.prepare_superseded_artifacts(job_id, selected)
         ]
         superseded_ids = [artifact.id for artifact in superseded_artifacts]
 
-        self._ensure_attached()
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
         reconcile_rows: list[tuple[Task, set[str], list[GraphEdge]]] = []
@@ -1355,60 +1576,59 @@ class SQLiteSwarmStore(SwarmStore):
                 )
             )
 
-        with self._session() as connection:
+        connection.executemany(
+            """
+            INSERT INTO tasks(id, job_id, role, status, data)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              job_id = excluded.job_id,
+              role = excluded.role,
+              status = excluded.status,
+              data = excluded.data
+            """,
+            rows,
+        )
+        for event_job_id, payload in event_rows:
+            self._emit(connection, event_job_id, "task.saved", payload)
+        for task, desired_ids, depends_edges in reconcile_rows:
+            self._reconcile_depends_on_edges_connection(
+                connection, task, desired_ids, depends_edges
+            )
+        if artifact_rows:
             connection.executemany(
                 """
-                INSERT INTO tasks(id, job_id, role, status, data)
+                INSERT INTO artifacts(id, job_id, task_id, type, data)
                 VALUES(?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   job_id = excluded.job_id,
-                  role = excluded.role,
-                  status = excluded.status,
+                  task_id = excluded.task_id,
+                  type = excluded.type,
                   data = excluded.data
                 """,
-                rows,
+                artifact_rows,
             )
-            for event_job_id, payload in event_rows:
-                self._emit(connection, event_job_id, "task.saved", payload)
-            for task, desired_ids, depends_edges in reconcile_rows:
-                self._reconcile_depends_on_edges_connection(
-                    connection, task, desired_ids, depends_edges
-                )
-            if artifact_rows:
-                connection.executemany(
-                    """
-                    INSERT INTO artifacts(id, job_id, task_id, type, data)
-                    VALUES(?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                      job_id = excluded.job_id,
-                      task_id = excluded.task_id,
-                      type = excluded.type,
-                      data = excluded.data
-                    """,
-                    artifact_rows,
-                )
-                for event_job_id, payload in artifact_event_rows:
-                    self._emit(connection, event_job_id, "artifact.saved", payload)
-            self._emit(
-                connection,
-                job_id,
-                "subgraph.reset",
-                {
-                    "task_ids": sorted(selected),
-                    "reset_count": len(finalized),
-                    "superseded_artifact_ids": superseded_ids,
-                },
+            for event_job_id, payload in artifact_event_rows:
+                self._emit(connection, event_job_id, "artifact.saved", payload)
+        self._emit(
+            connection,
+            job_id,
+            "subgraph.reset",
+            {
+                "task_ids": sorted(selected),
+                "reset_count": len(finalized),
+                "superseded_artifact_ids": superseded_ids,
+            },
+        )
+        row = connection.execute(
+            "SELECT data FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is not None:
+            job = job_from_dict(json.loads(row["data"]))
+            connection.execute(
+                "UPDATE jobs SET data = ? WHERE id = ?",
+                (self._dumps(self._reopened_job_after_reset(job)), job_id),
             )
-            row = connection.execute(
-                "SELECT data FROM jobs WHERE id = ?",
-                (job_id,),
-            ).fetchone()
-            if row is not None:
-                job = job_from_dict(json.loads(row["data"]))
-                connection.execute(
-                    "UPDATE jobs SET data = ? WHERE id = ?",
-                    (self._dumps(self._reopened_job_after_reset(job)), job_id),
-                )
         return ResetSubgraphResult(finalized, superseded_ids)
 
     def delete_edge(self, job_id: str, edge_id: str) -> bool:
@@ -1799,7 +2019,7 @@ class SQLiteSwarmStore(SwarmStore):
         # absolute) can neither wipe rows nor rglob-unlink outside the jobs tree.
         job_dir = self._assert_safe_job_dir(job_id)
         with self._session() as connection:
-            for table in ["events", "artifacts", "runs", "tasks", "graph_edges"]:
+            for table in ["budget_reservations", "completions", "usage_observations", "execution_attempts", "events", "artifacts", "runs", "tasks", "graph_edges"]:
                 connection.execute(f"DELETE FROM {table} WHERE job_id = ?", (job_id,))
             connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         if job_dir.exists():
@@ -2056,4 +2276,3 @@ class SQLiteSwarmStore(SwarmStore):
         from puppetmaster.store import _prepare_for_persistence
 
         return json.dumps(to_jsonable(_prepare_for_persistence(value)), indent=2, sort_keys=True)
-
