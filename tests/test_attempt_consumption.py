@@ -75,6 +75,7 @@ class ConsumptionContract(LedgerFixture):
         report = self.report()
         self.assertEqual(report.attempt_count, 1)
         self.assertEqual(report.attempts[0].observation_ids, ())
+        self.assertEqual(report.attempts[0].process_outcomes, ())
         self.assertEqual(report.totals.tokens_in.unknown_attempts, 1)
         self.assertIsNone(report.totals.tokens_in.total)
 

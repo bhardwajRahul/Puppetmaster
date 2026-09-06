@@ -61,6 +61,10 @@ class WorkerRuntime:
         if task is None:
             return False
 
+        # Lease loss belongs to the previous claim, not this new execution.
+        # Its heartbeat has been joined before run_once can return.
+        self._lease_lost.clear()
+
         if self.crash_after_claim:
             self.store.emit(
                 self.job_id,
@@ -134,6 +138,7 @@ class WorkerRuntime:
             daemon=True,
         )
         heartbeat.start()
+        execution_error = None
         try:
             reused: list = []
             try:
@@ -250,10 +255,21 @@ class WorkerRuntime:
                 except Exception:
                     pass
         except Exception as exc:
-            if self._lease_lost.is_set():
-                # A successor owns task completion. Invocation liability remains
-                # durable, but this worker must not overwrite the successor.
-                return True
+            execution_error = exc
+        finally:
+            stop_heartbeats.set()
+            # SQLite's bounded busy wait/retries can outlast one second. Drain
+            # the in-flight renewal before publishing completion or claiming
+            # again: a late renewal can otherwise flag the next lease as lost
+            # and keep a connection alive into process/temporary-state cleanup.
+            heartbeat.join()
+
+        # The final renewal can discover lease loss while execution unwinds.
+        # Check ownership only after it has drained on both success and error.
+        if self._lease_lost.is_set():
+            return True
+
+        if execution_error is not None:
             failed_run = replace(
                 run,
                 status=TaskStatus.FAILED,
@@ -269,13 +285,10 @@ class WorkerRuntime:
                     "worker_id": self.worker_id,
                     "task_id": task.id,
                     "role": self.role,
-                    "error": str(exc),
+                    "error": str(execution_error),
                 },
             )
             return True
-        finally:
-            stop_heartbeats.set()
-            heartbeat.join(timeout=1)
 
         # Honor a FAILED verdict from the worker (e.g. a preflight block), and
         # also convert an adapter-detected auth/billing/quota rejection that

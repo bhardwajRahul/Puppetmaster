@@ -50,3 +50,11 @@ because the client successfully observed the durable terminal state.
 
 A job that finishes as **failed** resolves normally (the await succeeded); the
 promise only rejects when the CLI can't run or returns no parseable JSON.
+
+## Embedded store contracts
+
+`puppetmaster.ts` also exports wire types for `JobRef`, scoped metadata pages,
+completion receipts, cancellation, and effects. These declarations describe the
+Python embedding API; they do not add CLI or HTTP wrappers for those operations.
+See [store contracts](../../docs/STORE_CONTRACTS.md) for method names, cursor
+bounds, scope filters, replay rules, and SQLite v5 migration requirements.

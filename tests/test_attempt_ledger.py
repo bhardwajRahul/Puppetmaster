@@ -49,7 +49,7 @@ class LedgerContract(LedgerFixture):
     def test_attempt_identity_retry_reset_and_reopen(self):
         self.assertTrue(self.store.record_attempt(self.attempt))
         self.assertFalse(self.store.record_attempt(self.attempt))
-        original_usage = self.observation()
+        original_usage = self.observation(returncode=-9, timed_out=True)
         self.store.record_usage_observation(original_usage)
         failed = replace(self.run, status=TaskStatus.FAILED)
         self.store.save_run(failed)
@@ -195,7 +195,7 @@ class SQLiteLedgerTests(LedgerContract, unittest.TestCase):
             SQLiteSwarmStore(self.root).attach()
         migrated = SQLiteSwarmStore(self.root)
         migrated.init()
-        self.assertEqual(migrated.schema_status()["schema_version"], "4")
+        self.assertEqual(migrated.schema_status()["schema_version"], "5")
         self.assertEqual(migrated.get_job(self.job.id).goal, self.job.goal)
         self.assertEqual(migrated.get_task_by_id(self.task.id), self.task)
         self.assertEqual(migrated.list_attempts(self.job.id), [])
@@ -206,6 +206,13 @@ class SQLiteLedgerTests(LedgerContract, unittest.TestCase):
 
 
 class RecordValidationTests(unittest.TestCase):
+    def test_legacy_observation_does_not_imply_process_success(self):
+        legacy = {"job_id": "job", "attempt_id": "run", "observation_id": "event",
+                  "source": "codex", "observed_at": "stamp"}
+        observation = UsageObservation(**legacy)
+        self.assertIsNone(observation.returncode)
+        self.assertIsNone(observation.timed_out)
+
     def test_validation_and_canonicalization(self):
         obs = UsageObservation("job", "run", "event", "sdk", "stamp")
         self.assertIsNone(json.loads(canonical_record(obs))["tokens_in"])
@@ -216,7 +223,9 @@ class RecordValidationTests(unittest.TestCase):
                         {"usage_state": "measured", "tokens_in": -1},
                         {"cost_state": "measured", "cost_usd": float("nan")},
                         {"cost_state": "measured", "cost_usd": 0},
-                        {"cost_usd": 0}, {"observation_id": ""}):
+                        {"cost_usd": 0}, {"observation_id": ""},
+                        {"returncode": True}, {"returncode": 1.5},
+                        {"timed_out": 1}, {"timed_out": "false"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(obs, **changes)
         integer = replace(obs, cost_state="measured", cost_usd=0, cost_basis="api")

@@ -4345,6 +4345,12 @@ def launcher_environment(args: JsonObject) -> dict[str, str]:
     # Detached launchers must flush the early ``job_id:`` line promptly so
     # wait_for_job_id cannot time out on a healthy but slow Windows import.
     env["PYTHONUNBUFFERED"] = "1"
+    for name in ("origin", "project_id", "session_id"):
+        if args.get(name) is not None:
+            value = args[name]
+            if not isinstance(value, str) or not value or len(value) > 256:
+                raise ValueError(f"invalid {name}")
+            env["PUPPETMASTER_JOB_" + name.upper()] = value
     if args.get("launch_key"):
         env["PUPPETMASTER_LAUNCH_KEY"] = str(args["launch_key"])
     if args.get("max_output_bytes"):
@@ -4390,24 +4396,9 @@ def cwd(args: JsonObject) -> str:
 
 
 def mcp_state_dir(args: JsonObject) -> Path:
-    value = args.get("state_dir")
-    if value:
-        return resolve_state_dir(str(value), cwd=Path(cwd(args)))
-    resolved = resolve_state_dir(None, cwd=Path(cwd(args)))
-    ref = args.get("job_ref")
-    job_id = args.get("job_id")
-    if not job_id and isinstance(ref, dict):
-        job_id = ref.get("job_id")
-    if job_id:
-        from puppetmaster.state import find_state_dir_for_job
-
-        owner = find_state_dir_for_job(str(job_id))
-        if owner is not None:
-            expected_state = ref.get("state_id") if isinstance(ref, dict) else None
-            if expected_state and state_identity(owner) != str(expected_state):
-                raise ValueError("job_ref.state_id does not match the owning project")
-            return owner
-    return resolved
+    from puppetmaster.state import resolve_job_state
+    return resolve_job_state(job_id=args.get("job_id"), job_ref=args.get("job_ref"),
+                             state_dir=args.get("state_dir"), cwd=Path(cwd(args)))
 
 
 def require_string(args: JsonObject, name: str) -> str:
@@ -4419,6 +4410,9 @@ def require_string(args: JsonObject, name: str) -> str:
 
 def require_job_id(args: JsonObject) -> str:
     value = args.get("job_id")
+    ref = args.get("job_ref")
+    if isinstance(ref, dict) and value is not None and value != ref.get("job_id"):
+        raise ValueError("job_id conflicts with job_ref.job_id")
     if not value and isinstance(args.get("job_ref"), dict):
         value = args["job_ref"].get("job_id")
     if not isinstance(value, str) or not value.strip():
@@ -4427,10 +4421,7 @@ def require_job_id(args: JsonObject) -> str:
 
 
 def optional_job(args: JsonObject) -> list[str]:
-    job_id = args.get("job_id")
-    if not job_id and isinstance(args.get("job_ref"), dict):
-        job_id = args["job_ref"].get("job_id")
-    return [str(job_id)] if job_id else []
+    return [require_job_id(args)] if args.get("job_id") or args.get("job_ref") else []
 
 
 def base_schema() -> JsonObject:
@@ -4844,11 +4835,18 @@ def _auto_route_schema_properties(*, include_required_tags: bool = True) -> Json
     return props
 
 
+def job_scope_schema_properties() -> JsonObject:
+    return {name: {"type": "string", "minLength": 1, "maxLength": 256,
+                   "description": "Explicit job scope metadata; omitted means unknown."}
+            for name in ("origin", "project_id", "session_id")}
+
+
 def goal_schema(default_goal: str) -> JsonObject:
     from puppetmaster.playbooks import PLAYBOOK_IDS
 
     schema = base_schema()
     schema["properties"].update(budget_schema_properties())
+    schema["properties"].update(job_scope_schema_properties())
     schema["properties"].update(
         {
             "goal": {
@@ -5458,6 +5456,7 @@ def browser_swarm_schema() -> JsonObject:
         "type": "object",
         "properties": {
             **budget_schema_properties(),
+            **job_scope_schema_properties(),
             "tasks": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -5529,6 +5528,7 @@ def prewalk_schema() -> JsonObject:
         "type": "object",
         "properties": {
             **budget_schema_properties(),
+            **job_scope_schema_properties(),
             "goal": {
                 "type": "string",
                 "description": (

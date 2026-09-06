@@ -350,6 +350,9 @@ def detach_analysis_swarm(
     backend: str = "sqlite",
     budget_policy: Optional[BudgetPolicy] = None,
     job_id_timeout_seconds: float = EARLY_JOB_ID_TIMEOUT_SECONDS,
+    origin: Optional[str] = None,
+    project_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     launch_key: Optional[str] = None,
     playbook: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -404,6 +407,9 @@ def detach_analysis_swarm(
         full_command.append("--enable-memory")
     if label:
         full_command.extend(["--label", label])
+    for name, value in (("origin", origin), ("project_id", project_id), ("session_id", session_id)):
+        if value is not None:
+            full_command.extend(["--" + name.replace("_", "-"), value])
     if launch_key:
         full_command.extend(["--launch-key", str(launch_key)])
 

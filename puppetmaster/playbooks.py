@@ -238,7 +238,11 @@ def stamp_payload(
     out = dict(payload or {})
     for key, value in recipe.payload.items():
         if key == "gates":
-            out["gates"] = merge_gates(out.get("gates"), value)
+            non_edit = (out.get("read_only") or out.get("no_edit") or out.get("dry_run")
+                        or out.get("swarm_mode") == "analysis"
+                        or out.get("edit_mode") in {"none", "read-only", "no-edit", "dry-run"})
+            if not non_edit:
+                out["gates"] = merge_gates(out.get("gates"), value)
         elif key == "playbook":
             out["playbook"] = value
         elif key not in out:

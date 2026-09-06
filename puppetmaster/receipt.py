@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Any, Optional
 
 from puppetmaster.models import Artifact, ArtifactType, parse_iso
+from puppetmaster.consumption import build_attempt_consumption_report
 from puppetmaster.usage import aggregate_token_usage
 from puppetmaster.scm_observe import derive_attention
 
@@ -60,6 +61,7 @@ def build_job_receipt(store: Any, job_id: str) -> dict[str, Any]:
             "stdout_salvage": stdout_salvage,
         },
         "tokens": token_usage,
+        "attempt_consumption": build_attempt_consumption_report(store, job_id).to_dict(),
         "estimate_drift": drift,
         "delivery": _delivery(store, job_id, tasks, artifacts),
         "host_observations": _host_observations(store, job_id, artifacts),

@@ -180,29 +180,13 @@ def _resolve_store_for_job(
     backend: str,
     explicit_state_dir: Optional[str],
 ):
-    """Auto-pivot to the project that owns ``job_id`` when needed.
-
-    Pre-fix, ``puppetmaster show job_X`` from a directory whose state
-    dir didn't contain the job would emit a confusing "job not found"
-    error, even though the job was alive in a sibling project's state
-    dir. Users compensated by exporting
-    ``PUPPETMASTER_STATE_DIR=~/Library/Application Support/...`` —
-    which means they had to know the workspace hash. Now we scan
-    every known project state dir for the job and pivot silently
-    (with a single stderr note) when we find it elsewhere.
-
-    Respects an explicit ``--state-dir`` or ``$PUPPETMASTER_STATE_DIR``
-    override: if the user named a dir explicitly, we trust them and
-    don't pivot.
-    """
+    """Resolve explicit ownership and reject unscoped duplicate IDs."""
+    from puppetmaster.state import resolve_job_state
     if not job_id:
         return state_dir, store
-    if explicit_state_dir or os.environ.get("PUPPETMASTER_STATE_DIR"):
-        return state_dir, store
-    if (state_dir / "jobs" / job_id).is_dir():
-        return state_dir, store
-    found = find_state_dir_for_job(job_id)
-    if found is None or found.resolve() == state_dir.resolve():
+    explicit = explicit_state_dir or os.environ.get("PUPPETMASTER_STATE_DIR")
+    found = resolve_job_state(job_id=job_id, state_dir=explicit, default_dir=state_dir)
+    if found.resolve() == state_dir.resolve():
         return state_dir, store
     sys.stderr.write(
         f"note: job {job_id} not in current workspace state dir; using {found}\n"
@@ -845,6 +829,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -913,6 +900,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -951,6 +941,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -995,6 +988,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -1039,6 +1035,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -1083,6 +1082,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -1121,6 +1123,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -1175,6 +1180,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -1221,6 +1229,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -1284,6 +1295,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
@@ -1374,6 +1388,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 on_job_created=on_job_created or early_job_printer,
                 label=args.label,
                 budget_policy=budget_policy,
+                origin=getattr(args, "origin", None),
+                project_id=getattr(args, "project_id", None),
+                session_id=getattr(args, "session_id", None),
                 launch_key=getattr(args, "launch_key", None),
             )
             return cli.finalize_cli_run(result)
@@ -1395,6 +1412,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 budget_policy=budget_policy,
                 worker_mode=args.worker_mode,
                 backend=args.backend,
+                origin=getattr(args, "origin", None),
+                project_id=getattr(args, "project_id", None),
+                session_id=getattr(args, "session_id", None),
                 launch_key=getattr(args, "launch_key", None),
                 playbook=playbook_id,
             )
@@ -1457,12 +1477,20 @@ def _main(argv: Optional[list[str]] = None) -> int:
             on_job_created=on_job_created,
             label=args.label,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
             launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
     if args.command == "demo":
-        result = cli.Orchestrator(store).run(args.goal, budget_policy=budget_policy)
+        result = cli.Orchestrator(store).run(
+            args.goal, budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
+        )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         print("\n" + result.summary)
         return 0
@@ -1472,6 +1500,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             args.goal,
             crash_role=args.crash_role,
             budget_policy=budget_policy,
+            origin=getattr(args, "origin", None),
+            project_id=getattr(args, "project_id", None),
+            session_id=getattr(args, "session_id", None),
         )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         print(f"recovered_tasks: {result.recovered_tasks}")
@@ -1869,10 +1900,16 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 lease_seconds=config.lease_seconds,
                 label=source_job.label,
                 budget_policy=budget_policy,
+                origin=getattr(args, "origin", None),
+                project_id=getattr(args, "project_id", None),
+                session_id=getattr(args, "session_id", None),
             )
         else:
             result = cli.Orchestrator(store).run(
-                source_job.goal, label=source_job.label, budget_policy=budget_policy
+                source_job.goal, label=source_job.label, budget_policy=budget_policy,
+                origin=getattr(args, "origin", None),
+                project_id=getattr(args, "project_id", None),
+                session_id=getattr(args, "session_id", None),
             )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0

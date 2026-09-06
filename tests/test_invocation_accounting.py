@@ -221,18 +221,76 @@ class RuntimeAccountingContract:
             self.run_adapter(CliAdapter(lambda task: StreamedProcess(0, json.dumps(event), "")))
         attempts, observations = self.records()
         self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(observations), 6)  # usage and exit per invocation
+        observations = [o for o in observations if o.observation_id != "process:exit"]
         self.assertEqual(len(observations), 3)  # no shared-return duplicate
         self.assertEqual(sorted(o.tokens_in for o in observations if o.tokens_in is not None), [0, 17])
         partial = next(o for o in observations if o.tokens_in == 17)
         self.assertIsNone(partial.tokens_out)
         self.assertEqual(sum(o.usage_state == "unknown" for o in observations), 1)
 
+    def test_cli_process_outcome_survives_successful_delivery(self):
+        from puppetmaster.models import JobStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.quality import assess_run_quality
+        from puppetmaster.receipt import build_job_receipt
+
+        for rc, timed_out in ((-9, True), (7, False), (0, False)):
+            with self.subTest(returncode=rc, timed_out=timed_out):
+                if self.records()[0]:
+                    self.store.reset_subgraph(self.job.id, [self.task.id])
+                previous = {a.attempt_id for a in self.records()[0]}
+                event = {"type": "turn.completed", "usage": {
+                    "input_tokens": 17, "output_tokens": 5}}
+                adapter = CliAdapter(lambda task: StreamedProcess(
+                    rc, json.dumps(event), "", timed_out=timed_out,
+                    elapsed_seconds=1804))
+                patch = Artifact(job_id=self.job.id, task_id=self.task.id,
+                                 type=ArtifactType.PATCH, created_by="test",
+                                 confidence=1.0, evidence=["test:retained-patch"],
+                                 payload={"change": "Retained consumer patch", "files": ["example"], "diff": "--- a/example\n+++ b/example\n"})
+                with mock.patch.object(adapter, "_finalize_cli_run", return_value=[
+                        patch, verification(self.task, tokens_in=17, tokens_out=5)]):
+                    self.run_adapter(adapter)
+                reopened = self.store_type(self.root)
+                self.assertEqual(reopened.get_task_by_id(self.task.id).status,
+                                 TaskStatus.COMPLETE)
+                final_status = Orchestrator(reopened)._final_job_status(self.job)
+                self.assertEqual(final_status, JobStatus.COMPLETE)
+                reopened.update_job_status(self.job.id, final_status)
+                artifacts = reopened.list_artifacts(self.job.id)
+                self.assertIn(patch.id, [a.id for a in artifacts])
+                quality = assess_run_quality(artifacts)
+                self.assertEqual(quality["quality"], "ok")
+                self.assertTrue(quality["trustworthy"])
+                receipt = json.loads(json.dumps(build_job_receipt(reopened, self.job.id)))
+                self.assertEqual(receipt["status"], "complete")
+                self.assertTrue(receipt["delivery"]["successful"])
+                rows = [r for r in receipt["attempt_consumption"]["attempts"]
+                        if r["attempt"]["attempt_id"] not in previous]
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                outcomes = row["process_outcomes"]
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0]["returncode"], rc)
+                self.assertEqual(outcomes[0]["timed_out"], timed_out)
+                observations = reopened.list_usage_observations(
+                    self.job.id, attempt_id=row["attempt"]["attempt_id"])
+                outcome = next(o for o in observations if o.observation_id == "process:exit")
+                self.assertEqual((outcome.returncode, outcome.timed_out), (rc, timed_out))
+                self.assertFalse(reopened.record_usage_observation(outcome))
+                self.assertEqual(row["totals"]["tokens_in"]["total"], 17)
+                self.assertEqual(row["totals"]["tokens_out"]["total"], 5)
+
     def test_cli_finalizer_exception_keeps_raw_usage(self):
         event = {"usage": {"input_tokens": 12}}
         adapter = CliAdapter(lambda task: StreamedProcess(0, json.dumps(event), ""))
         with mock.patch.object(adapter, "_finalize_cli_run", side_effect=RuntimeError("finalize")):
             self.run_adapter(adapter)
-        self.assertEqual(self.records()[1][0].tokens_in, 12)
+        raw = next(o for o in self.records()[1] if o.observation_id == "stdout:0")
+        self.assertEqual(raw.tokens_in, 12)
+        outcome = next(o for o in self.records()[1] if o.observation_id == "process:exit")
+        self.assertEqual((outcome.returncode, outcome.timed_out), (0, False))
         self.assertEqual(self.store.get_task_by_id(self.task.id).status, TaskStatus.FAILED)
 
     def test_provider_retry_keeps_unknown_and_raw_usage(self):
@@ -281,9 +339,10 @@ class RuntimeAccountingContract:
                 fresh = [a for a in attempts if a.attempt_id not in before]
                 self.assertEqual(len(fresh), 1)
                 current = [o for o in observations if o.attempt_id == fresh[0].attempt_id]
-                self.assertEqual(len(current), 1)
-                self.assertEqual((current[0].cost_basis, current[0].cost_usd), (basis, cost))
-                self.assertEqual(current[0].tokens_in, 5)
+                self.assertEqual(len(current), 2)
+                raw = next(o for o in current if o.observation_id == "stdout:0")
+                self.assertEqual((raw.cost_basis, raw.cost_usd), (basis, cost))
+                self.assertEqual(raw.tokens_in, 5)
 
     def test_provider_failover_uses_actual_billing(self):
         for provider, basis, cost in (("openai", "api", 0.25),

@@ -723,6 +723,7 @@ class DurableCompletionTests(unittest.TestCase):
             store.save_task(task)
             publisher = SQLiteSwarmStore(Path(tmp))
             publisher.attach()
+            publisher.busy_timeout_ms = 0
             original = store._atomic_recover_stale
 
             def interleaved(*args, **kwargs):
@@ -732,6 +733,8 @@ class DurableCompletionTests(unittest.TestCase):
 
             with mock.patch.object(store, "_atomic_recover_stale", side_effect=interleaved):
                 self.assertEqual(store.recover_stale_tasks(job.id), [])
+            self.assertFalse(any(event["event"] == "task.recovered"
+                                 for event in store.read_events(job.id)))
             self.assertIsNone(store.claim_task(task.id, "other"))
             store.reconcile_completions(job.id)
             self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)

@@ -37,6 +37,22 @@ source event IDs. These are immutable snapshots, not deltas. Multiple providers
 or cumulative snapshots can overlap: summing every observation is invalid.
 The reporting API below reconciles these snapshots before summing attempts.
 
+## Process outcome and artifact delivery
+
+CLI invocations record a `process:exit` observation in the same ledger before
+artifact finalization. Its nullable `returncode` and `timed_out` fields preserve
+the process result independently of artifact acceptance. The public job receipt
+exposes these observations under
+`attempt_consumption.attempts[].process_outcomes`, including their source and
+attempt identity. Legacy observations leave both fields unknown; an empty
+`process_outcomes` list does not establish process success.
+
+A consumer can receive `status=complete`, delivery `quality=ok`, and useful
+artifacts while the invocation records `returncode=-9`, `timed_out=true`.
+Artifact quality and process success answer different questions. Exit observations
+contain no token or cost measurements and do not change the existing consumption
+reconciliation. Both file and SQLite stores retain them across task resets.
+
 ## Values and canonical form
 
 Every token field is a nonnegative integer or `None`. Unknown fields remain
@@ -67,9 +83,14 @@ immutable launch facts. The model module imports only `models`, avoiding the
 store/cost/usage import cycle. No automatic `save_run` hook fabricates attempts.
 
 SQLite schema v3 introduced `execution_attempts` and `usage_observations`;
-the current schema v4 also adds budget reservations. Supervisor
+v4 added budget reservations, and the current schema v5 adds the
+[store contracts](STORE_CONTRACTS.md) projections and receipt tables. Supervisor
 migration creates empty tables and updates the version transactionally; v1
 still receives the existing graph backfill. Worker attach refuses older schemas.
+Stop long-lived Puppetmaster processes before the v5 schema cutover and restart
+all supervisors, workers, MCP servers, and dashboards on the new version.
+Supervisor initialization also repairs stale v5 projection triggers; worker
+attachment does not migrate or repair them.
 No historical attempt totals are inferred. SQLite writes serialize through a
 writer transaction and reuse an enclosing completion transaction when present;
 they neither emit events nor independently commit that transaction.

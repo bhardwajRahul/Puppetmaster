@@ -219,7 +219,10 @@ def _prepare_for_persistence(value: Any) -> Any:
     return value
 
 
-class SwarmStore:
+from puppetmaster.store_contracts import StoreContracts
+
+
+class SwarmStore(StoreContracts):
     """File-backed coordination store with Redis-like key spaces."""
 
     backend_name = "file"
@@ -239,6 +242,8 @@ class SwarmStore:
         # JSONL, so an unchanged size means an unchanged line count; this lets
         # event_cursor skip re-counting the whole file on every poll.
         self._event_cursor_cache: dict[str, tuple[int, int]] = {}
+        self._metadata_initialized = False
+        self._budget_locks = threading.local()
 
     def init(self) -> None:
         for directory in [
@@ -249,6 +254,10 @@ class SwarmStore:
             self.locks_dir,
         ]:
             mkdir_private(directory)
+        if self.backend_name == "file" and not self._metadata_initialized:
+            from puppetmaster.projections import initialize_file
+            initialize_file(self)
+            self._metadata_initialized = True
         from puppetmaster.host_lifecycle import record_host_start
 
         record_host_start(self)
@@ -277,12 +286,18 @@ class SwarmStore:
         *,
         label: Optional[str] = None,
         budget_policy: Optional[BudgetPolicy] = None,
+        origin: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> Job:
         return self.create_or_get_job(
             goal,
             label=label,
+            origin=origin,
+            project_id=project_id,
+            session_id=session_id,
             budget_policy=budget_policy,
             launch_key=launch_key,
             launch_fingerprint=launch_fingerprint,
@@ -294,11 +309,24 @@ class SwarmStore:
         *,
         label: Optional[str] = None,
         budget_policy: Optional[BudgetPolicy] = None,
+        origin: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> tuple[Job, bool]:
         self.init()
         fingerprint = launch_fingerprint or self.launch_fingerprint(goal, label)
+        job = Job(
+            goal=goal,
+            label=label,
+            origin=origin,
+            project_id=project_id,
+            session_id=session_id,
+            budget_policy=budget_policy,
+            launch_key=launch_key,
+            launch_fingerprint=fingerprint if launch_key else None,
+        )
         if launch_key:
             lock_name = f"launch:{launch_key}"
             owner = f"{os.getpid()}:{threading.get_ident()}"
@@ -323,7 +351,10 @@ class SwarmStore:
                 if acquired:
                     self.release_lock(lock_name, owner)
                 if (existing.launch_fingerprint != fingerprint or
-                        existing.budget_policy != budget_policy):
+                        existing.budget_policy != budget_policy or
+                        existing.origin != origin or
+                        existing.project_id != project_id or
+                        existing.session_id != session_id):
                     raise LaunchConflictError(
                         "launch_key already belongs to a different request"
                     )
@@ -332,13 +363,6 @@ class SwarmStore:
                 raise RuntimeError("launch_key is currently being created")
         else:
             owner = None
-        job = Job(
-            goal=goal,
-            label=label,
-            budget_policy=budget_policy,
-            launch_key=launch_key,
-            launch_fingerprint=fingerprint if launch_key else None,
-        )
         try:
             job_dir = self.job_dir(job.id)
             for directory in [
@@ -1229,6 +1253,11 @@ class SwarmStore:
             foreign_active_writer,
         )
 
+        from puppetmaster.models import JobRef
+        from puppetmaster.state import state_identity
+        from puppetmaster.store_contracts import task_binding
+        if self.cancellation_pending(JobRef(task.job_id, state_identity(self.root)), task_binding(task)):
+            return True
         if task.status == TaskStatus.RUNNING and self._has_pending_completion(task):
             return True
         if not self.dependencies_complete(task, task_map=task_map):
@@ -1321,6 +1350,7 @@ class SwarmStore:
             task,
             status=TaskStatus.RUNNING,
             attempts=task.attempts + 1,
+            generation=(task.generation or 0) + 1,
             lease_owner=worker_id,
             lease_expires_at=seconds_from_now(lease_seconds),
             lease_id=new_id("lease"),
@@ -1417,9 +1447,11 @@ class SwarmStore:
                 continue
             # claim_task acquires the per-task lock internally so direct callers
             # are race-safe without requiring claim_next_task's sweep wrapper.
-            return self.claim_task(
+            claimed = self.claim_task(
                 task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
             )
+            if claimed is not None:
+                return claimed
         return None
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
@@ -2204,6 +2236,7 @@ class SwarmStore:
                 task,
                 status=TaskStatus.BLOCKED,
                 attempts=0,
+                generation=(task.generation or 0) + 1,
                 lease_owner=None,
                 lease_expires_at=None,
                 lease_id=None,
@@ -2248,6 +2281,73 @@ class SwarmStore:
         )
         return updated
 
+    def validate_job_ref(self, job_ref):
+        from puppetmaster.models import JobRef
+        from puppetmaster.state import state_identity
+        if not isinstance(job_ref, JobRef) or job_ref.state_id != state_identity(self.root):
+            raise ValueError("job_ref.state_id does not match this store")
+        self._assert_safe_job_dir(job_ref.job_id)
+        if self.backend_name == "sqlite":
+            if not self._all("SELECT 1 FROM jobs WHERE id=?", (job_ref.job_id,)):
+                raise KeyError(job_ref.job_id)
+        elif not (self.job_dir(job_ref.job_id) / "job.json").exists():
+            raise KeyError(job_ref.job_id)
+        return job_ref
+
+    @staticmethod
+    def _summary_filters(filters, kwargs):
+        from dataclasses import fields
+        from puppetmaster.contracts import JobSummaryFilter
+        if filters is None:
+            return kwargs
+        if not isinstance(filters, JobSummaryFilter):
+            raise TypeError("filters must be a JobSummaryFilter")
+        values = {field.name: getattr(filters, field.name) for field in fields(filters)
+                  if getattr(filters, field.name) is not None}
+        if values.keys() & kwargs.keys():
+            raise ValueError("duplicate job summary filter")
+        return {**values, **kwargs}
+
+    def list_job_summaries(self, filters=None, **kwargs):
+        from puppetmaster.projections import page
+        return page(self, "job", **self._summary_filters(filters, kwargs))
+
+    def read_job_summary_changes(self, filters=None, **kwargs):
+        from puppetmaster.projections import page
+        return page(self, "job", changes=True, **self._summary_filters(filters, kwargs))
+
+    def list_task_refs(self, job_ref, **kwargs):
+        from puppetmaster.projections import page
+        return page(self, "task", job_ref, **kwargs)
+
+    def list_artifact_refs(self, job_ref, **kwargs):
+        from puppetmaster.projections import page
+        return page(self, "artifact", job_ref, **kwargs)
+
+    def repair_metadata_index(self):
+        """Explicit file-store repair; source scans never occur during a page read.
+
+        Call with writers stopped. Existing cursors expire when the index epoch advances.
+        """
+        if self.backend_name != "file":
+            raise ValueError("SQLite projections are transactional")
+        from puppetmaster.projections import connection, project_file
+        self.init()
+        with connection(self) as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("""INSERT INTO projection_changes(kind,job_id,id,status,sha256,stamp,deleted,
+                task_count,artifact_count,binding,task_id,artifact_type,scope)
+                SELECT kind,job_id,id,status,sha256,'legacy_unknown',1,
+                task_count,artifact_count,binding,task_id,artifact_type,scope FROM projection_current""")
+            c.execute("DELETE FROM projection_current")
+            c.execute("DELETE FROM projection_pending")
+            c.execute("UPDATE projection_meta SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'")
+            for path in self.jobs_dir.glob("*/job.json"):
+                project_file(c, path, self.read_json(path), legacy=True)
+                for directory in ("tasks", "artifacts"):
+                    for child in (path.parent / directory).glob("*.json"):
+                        project_file(c, child, self.read_json(child), legacy=True)
+
     @contextmanager
     def _completion_scope(self, job_id: str):
         # The file backend uses its existing crash-expiring lock and atomic
@@ -2262,10 +2362,16 @@ class SwarmStore:
         finally:
             self.release_lock(name, owner=owner)
 
+    @contextmanager
     def _completion_intent_scope(self, job_id: str):
-        # Each execution owns a distinct journal file. Publish by atomic rename
-        # even while another publisher holds the replay lock.
-        return nullcontext()
+        owner = new_id("intent")
+        name = f"completion-intent:{job_id}"
+        if not self.acquire_lock(name, owner, ttl_seconds=300):
+            raise RuntimeError("completion intent busy; retry")
+        try:
+            yield
+        finally:
+            self.release_lock(name, owner=owner)
 
     def _has_pending_completion(self, task: Task) -> bool:
         return any(
@@ -2284,6 +2390,21 @@ class SwarmStore:
             for path in sorted((self.job_dir(job_id) / "completions").glob("*.json"))
         ]
 
+    def _get_completion(self, job_id: str, run_id: str):
+        path = self._assert_safe_job_dir(job_id) / "completions" / f"{self._safe_key(run_id)}.json"
+        return self.read_json(path) if path.exists() else None
+
+    def get_completion_receipt(self, job_ref, run_id: str):
+        from puppetmaster.contracts import CompletionReceipt
+        self.validate_job_ref(job_ref)
+        if not run_id or self._safe_key(run_id) != run_id:
+            raise ValueError("invalid completion run id")
+        record = self._get_completion(job_ref.job_id, run_id)
+        if record is None:
+            return CompletionReceipt(job_ref, run_id, None, "legacy_unknown")
+        return CompletionReceipt(job_ref, run_id, record.get("intent_digest"),
+                                 record.get("publication", "legacy_unknown"))
+
     def complete_task(
         self, task: Task, run: AgentRun, artifacts: list[Artifact],
         event_payload: dict[str, Any],
@@ -2299,21 +2420,54 @@ class SwarmStore:
         defers replay to the next poll; intent publication does not take the lock.
         Concurrent file-backend claim/reset/lease writes retain weaker isolation.
         """
+        from puppetmaster.contracts import ContractConflict, immutable_digest
+        submission = {"task_id": task.id, "job_id": task.job_id,
+                      "lease_id": task.lease_id, "worker_id": run.worker_id,
+                      "run_id": run.id, "started_at": run.started_at,
+                      "completed_at": run.completed_at,
+                      "artifacts": to_jsonable(artifacts), "event_payload": event_payload}
+        if not run.id or self._safe_key(run.id) != run.id:
+            raise ValueError("invalid completion run id")
+        digest = immutable_digest(submission)
+        if run.job_id != task.job_id or run.task_id != task.id:
+            raise ValueError("completion run does not belong to task")
+        if any(a.job_id != task.job_id or a.task_id != task.id for a in artifacts):
+            raise ValueError("completion artifact does not belong to task")
         with self._completion_intent_scope(task.job_id):
-            current = self.get_task_by_id(task.id)
-            if current.status != TaskStatus.RUNNING or not self._lease_matches(
-                current, run.worker_id, task.lease_id
-            ):
-                return current
-            record = {
-                "task": to_jsonable(task), "run": to_jsonable(run),
-                "artifacts": to_jsonable(artifacts), "event_payload": event_payload,
-                "event_cursor": self.event_cursor(task.job_id), "done": False,
-            }
-            self._save_completion(task.job_id, record)
+            existing = self._get_completion(task.job_id, run.id)
+            if existing is not None:
+                if existing.get("intent_digest") != digest:
+                    raise ContractConflict("completion intent already has different or legacy content")
+            else:
+                current = self.get_task_by_id(task.id)
+                if current.job_id != task.job_id:
+                    raise ValueError("completion task belongs to a different job")
+                if (current.status != TaskStatus.RUNNING
+                        or current.lease_id != task.lease_id
+                        or current.generation != task.generation
+                        or not self._lease_matches(current, run.worker_id, task.lease_id)):
+                    return current
+                record = {
+                    "task": to_jsonable(task), "run": to_jsonable(run),
+                    "artifacts": to_jsonable(artifacts), "event_payload": event_payload,
+                    "event_cursor": self.event_cursor(task.job_id), "done": False,
+                    "intent_digest": digest, "publication": "pending_publication",
+                }
+                self._save_completion(task.job_id, record)
         # The intent must commit independently of the retryable publication.
         self.reconcile_completions(task.job_id)
         return self.get_task_by_id(task.id)
+
+    def submit_completion(self, task, run, artifacts, event_payload):
+        from puppetmaster.contracts import CompletionReceipt
+        from puppetmaster.models import JobRef
+        from puppetmaster.state import state_identity
+        self.complete_task(task, run, artifacts, event_payload)
+        ref = JobRef(task.job_id, state_identity(self.root))
+        receipt = self.get_completion_receipt(ref, run.id)
+        if receipt.outcome == "legacy_unknown" and self._get_completion(task.job_id, run.id) is None:
+            return CompletionReceipt(ref, run.id, None, "stale_lease")
+        return receipt
 
     def reconcile_completions(self, job_id: str) -> None:
         with self._completion_scope(job_id) as acquired:
@@ -2326,13 +2480,16 @@ class SwarmStore:
                 run = AgentRun(**{**record["run"], "status": TaskStatus.COMPLETE})
                 current = self.get_task_by_id(task.id)
                 already_complete = (current.status == TaskStatus.COMPLETE
-                                    and current.completed_at == run.completed_at)
+                                    and current.completed_at == run.completed_at
+                                    and current.generation == task.generation)
                 owns_lease = (current.status == TaskStatus.RUNNING
+                              and current.generation == task.generation
                               and current.lease_id == task.lease_id
                               and current.lease_owner == run.worker_id)
                 if not already_complete and not owns_lease:
                     # Reset/reclaim invalidates the old execution's intent.
                     record["done"] = True
+                    record["publication"] = "invalidated"
                     self._save_completion(job_id, record)
                     continue
                 for raw in record["artifacts"]:
@@ -2357,6 +2514,8 @@ class SwarmStore:
                            e["payload"] == record["event_payload"] for e in events):
                     self.emit(job_id, "worker.completed_task", record["event_payload"])
                 record["done"] = True
+                if record.get("intent_digest"):
+                    record["publication"] = "published"
                 self._save_completion(job_id, record)
 
     def _ledger_dir(self, job_id: str) -> Path:
@@ -2399,17 +2558,29 @@ class SwarmStore:
             finally:
                 self.release_lock(name, owner=owner)
 
+    def budget_dispatch_scope(self, job_id: str):
+        """Keep file admission stages together; SQLite stages commit separately."""
+        return self._budget_scope(job_id) if self.backend_name == "file" else nullcontext()
+
     @contextmanager
     def _budget_scope(self, job_id: str):
         """Job-wide admission lock; file backend has the existing 300s TTL limits."""
         self._assert_safe_job_dir(job_id)
+        held = getattr(self._budget_locks, "held", None)
+        if held is None:
+            held = self._budget_locks.held = set()
+        if job_id in held:
+            yield
+            return
         owner = new_id("budget")
         name = f"budget:{job_id}"
         if not self.acquire_lock(name, owner, ttl_seconds=300):
             raise RuntimeError("budget busy; retry")
+        held.add(job_id)
         try:
             yield
         finally:
+            held.remove(job_id)
             self.release_lock(name, owner=owner)
 
     def _budget_records(self, job_id: str) -> list[dict[str, Any]]:
@@ -3072,6 +3243,10 @@ class SwarmStore:
 
     def delete_job(self, job_id: str) -> None:
         job_dir = self._assert_safe_job_dir(job_id)
+        from puppetmaster.projections import connection
+        self.init()
+        with connection(self) as c:
+            c.execute("INSERT OR IGNORE INTO projection_pending VALUES(?)", (str(job_dir),))
         if job_dir.exists():
             for path in sorted(job_dir.rglob("*"), reverse=True):
                 if path.is_file():
@@ -3079,6 +3254,13 @@ class SwarmStore:
                 elif path.is_dir():
                     path.rmdir()
             job_dir.rmdir()
+        with connection(self) as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("""INSERT INTO projection_changes(kind,job_id,id,status,sha256,stamp,deleted,task_count,artifact_count)
+                SELECT kind,job_id,id,status,sha256,'known',1,task_count,artifact_count
+                FROM projection_current WHERE job_id=?""", (job_id,))
+            c.execute("DELETE FROM projection_current WHERE job_id=?", (job_id,))
+            c.execute("DELETE FROM projection_pending WHERE path=?", (str(job_dir),))
 
     def acquire_lock(
         self,
@@ -3293,8 +3475,25 @@ class SwarmStore:
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id
 
+    def write_json(self, path: Path, value: Any) -> None:
+        from puppetmaster.projections import connection, file_kind, project_file
+        projected = self.backend_name == "file" and file_kind(path) is not None
+        if projected:
+            self.init()
+            marker = str(path) + ":" + new_id("write")
+            with connection(self) as c:
+                c.execute("INSERT INTO projection_pending VALUES(?)", (marker,))
+        self._write_json_file(path, value)
+        if projected:
+            with connection(self) as c:
+                # Read back under the index writer lock: a competing rename may
+                # have won, so indexing our caller's value would be stale.
+                c.execute("BEGIN IMMEDIATE")
+                project_file(c, path, self.read_json(path))
+                c.execute("DELETE FROM projection_pending WHERE path=?", (marker,))
+
     @staticmethod
-    def write_json(path: Path, value: Any) -> None:
+    def _write_json_file(path: Path, value: Any) -> None:
         mkdir_private(path.parent)
         # The temp name must be unique per concurrent writer, not just per
         # process: two threads writing the same file share a pid, so a

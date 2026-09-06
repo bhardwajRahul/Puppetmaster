@@ -430,11 +430,12 @@ class WindowsOwnershipTests(unittest.TestCase):
         process = SimpleNamespace(pid=4321, wait=lambda timeout: 0)
         with patch.object(verification.os, 'name', 'nt'), \
                 patch.object(verification.subprocess, 'Popen', return_value=process) as spawn, \
-                patch.object(verification, 'stop_owned_process') as stop:
+                patch.object(verification, 'stop_owned_process') as stop, \
+                patch('puppetmaster.win_process.WindowsJob'):
             deadline = time.monotonic() + 120
             self.assertEqual(verification._run_owned(['probe'], '.', {}, deadline), 0)
         options = spawn.call_args.kwargs
-        self.assertEqual(options['creationflags'], 0x08000000)
+        self.assertEqual(options['creationflags'], 0x08000004)
         self.assertNotIn('start_new_session', options)
         self.assertEqual(stop.call_args.args[:2], (process, options['env']['PUPPETMASTER_PROCESS_OWNER']))
         self.assertLessEqual(stop.call_args.args[2], deadline)
@@ -442,7 +443,7 @@ class WindowsOwnershipTests(unittest.TestCase):
     def test_windows_cleanup_failures_preserve_timeout_and_fallbacks(self):
         from puppetmaster import win_process
         from unittest.mock import Mock
-        for boundary in ('toolhelp', 'taskkill', 'leader', 'wait'):
+        for boundary in ('job', 'leader', 'wait'):
             with self.subTest(boundary=boundary):
                 process = Mock(pid=4321)
                 primary = subprocess.TimeoutExpired(['probe'], 7)
@@ -452,17 +453,18 @@ class WindowsOwnershipTests(unittest.TestCase):
                     process.kill.side_effect = error
                 with patch.object(win_process.os, 'name', 'nt'), \
                         patch.object(verification.subprocess, 'Popen', return_value=process), \
+                        patch.object(win_process, 'WindowsJob') as job_type, \
                         patch.object(win_process, '_toolhelp_kill_process_tree',
                                      side_effect=error if boundary == 'toolhelp' else None) as tree, \
                         patch.object(win_process, '_taskkill_process_tree',
                                      side_effect=error if boundary == 'taskkill' else None) as taskkill:
+                    job_type.return_value.terminate.side_effect = error if boundary == 'job' else None
                     with self.assertRaises(subprocess.TimeoutExpired) as raised:
                         verification._run_owned(['probe'], '.', {}, time.monotonic() + 10)
                 self.assertIs(raised.exception, primary)
-                tree.assert_called_once()
-                taskkill.assert_called_once()
-                self.assertGreater(taskkill.call_args.kwargs['timeout'], 0)
-                self.assertLessEqual(taskkill.call_args.kwargs['timeout'], 3)
+                tree.assert_not_called()
+                taskkill.assert_not_called()
+                self.assertGreaterEqual(job_type.return_value.terminate.call_count, 1)
                 process.kill.assert_called_once()
                 self.assertEqual(process.wait.call_count, 2)
                 self.assertLessEqual(process.wait.call_args.kwargs['timeout'], 3)
@@ -486,9 +488,9 @@ class WindowsOwnershipTests(unittest.TestCase):
                 patch.object(win_process, '_taskkill_process_tree', return_value=True) as taskkill:
             for _ in range(2):
                 win_process.stop_owned_process(process, 'owner', time.monotonic() + .5)
-        self.assertEqual(tree.call_count, 2)
-        self.assertEqual(taskkill.call_count, 2)
-        self.assertLessEqual(taskkill.call_args.kwargs['timeout'], .5)
+        tree.assert_not_called()
+        taskkill.assert_not_called()
+        self.assertEqual(process._puppetmaster_job.terminate.call_count, 2)
 
 
 @unittest.skipUnless(os.name == 'posix', 'POSIX first-run verification')
@@ -500,7 +502,7 @@ class InstalledModuleTests(unittest.TestCase):
         from puppetmaster.model_registry import ModelSpec, save_registry
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
-            venv.EnvBuilder(with_pip=False).create(root / 'venv')
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(root / 'venv')
             python = root / 'venv/bin/python'
             site = subprocess.check_output([str(python), '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'], text=True).strip()
             shutil.copytree(Path(verification.__file__).parent, Path(site) / 'puppetmaster', ignore=shutil.ignore_patterns('__pycache__'))

@@ -28,6 +28,8 @@ def check_external_dispatch():
     The context-local callback follows synchronous provider/CLI helper calls
     without changing legacy adapter signatures. Unbound calls remain unchanged.
     """
+    from puppetmaster.cancellation import check_cancellation
+    check_cancellation()
     guard = _dispatch_guard.get()
     if guard is not None:
         guard()
@@ -36,8 +38,10 @@ def check_external_dispatch():
 @contextmanager
 def execution_scope(store, run, task, *, lease_lost=None):
     token = _scope.set((store, run, task, lease_lost))
+    from puppetmaster.cancellation import cancellation_scope
     try:
-        yield
+        with cancellation_scope(store, task):
+            yield
     finally:
         _scope.reset(token)
 
@@ -102,24 +106,25 @@ class Invocation:
             values.setdefault("plan_marginal_usd", 0)
             values.setdefault("cost_state", "known")
         allowance = BudgetLiability(**values)
-        self.store.reserve_dispatch(self.attempt, allowance)
-        if self.lease_lost is not None and self.lease_lost():
-            self.store.release_undispatched(
+        with self.store.budget_dispatch_scope(self.attempt.job_id):
+            self.store.reserve_dispatch(self.attempt, allowance)
+            if self.lease_lost is not None and self.lease_lost():
+                self.store.release_undispatched(
+                    self.attempt.job_id, self.attempt.attempt_id,
+                    non_dispatch_proof="lease lost before adoption and external call")
+                raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
+            self.store.adopt_dispatch(self.attempt.job_id, self.attempt.attempt_id,
+                                      adoption_id=self.attempt.attempt_id)
+            lost_after_adoption = self.lease_lost is not None and self.lease_lost()
+            # Persist uncertainty before dispatch, so a killed process cannot leave
+            # its original allowance masquerading as complete consumption forever.
+            self.store.reconcile_reservation(
                 self.attempt.job_id, self.attempt.attempt_id,
-                non_dispatch_proof="lease lost before adoption and external call")
-            raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
-        self.store.adopt_dispatch(self.attempt.job_id, self.attempt.attempt_id,
-                                  adoption_id=self.attempt.attempt_id)
-        lost_after_adoption = self.lease_lost is not None and self.lease_lost()
-        # Persist uncertainty before dispatch, so a killed process cannot leave
-        # its original allowance masquerading as complete consumption forever.
-        self.store.reconcile_reservation(
-            self.attempt.job_id, self.attempt.attempt_id,
-            reconciliation_id="dispatch:pending", liability=BudgetLiability(),
-            final=False, evidence="dispatch owned; outcome not yet available")
-        if lost_after_adoption:
-            raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
-        self.check_dispatch_lease()
+                reconciliation_id="dispatch:pending", liability=BudgetLiability(),
+                final=False, evidence="dispatch owned; outcome not yet available")
+            if lost_after_adoption:
+                raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
+            self.check_dispatch_lease()
 
     def check_dispatch_lease(self):
         if self.budgeted and self.lease_lost is not None and self.lease_lost():
@@ -221,6 +226,18 @@ class Invocation:
         if self.recorded:
             self._write("record_usage_observation", observation)
 
+    def process_exit(self, result):
+        observation = UsageObservation(
+            self.attempt.job_id, self.attempt.attempt_id, "process:exit",
+            self.attempt.adapter, now_iso(),
+            returncode=getattr(result, "returncode", None),
+            timed_out=getattr(result, "timed_out", None),
+        )
+        if not self.recorded:
+            self.recorded = self._write("record_attempt", self.attempt)
+        if self.recorded:
+            self._write("record_usage_observation", observation)
+
     def stdout(self, stdout):
         if not isinstance(stdout, str):
             return
@@ -306,6 +323,11 @@ def invocation(*, adapter=None, model=None, billing=None, source=None):
 def invoke_cli(call, *, accounting_adapter=None, accounting_model=None, **kwargs):
     with invocation(adapter=accounting_adapter, model=accounting_model) as capture:
         result = call(**kwargs)
+        if isinstance(capture, Invocation):
+            try:
+                capture.process_exit(result)
+            except Exception as exc:
+                capture._error("consumption.capture_failed", "process_exit", type(exc).__name__)
         if isinstance(capture, Invocation) and (
                 getattr(result, "timed_out", False) is True or
                 getattr(result, "output_limit_hit", False) is True or

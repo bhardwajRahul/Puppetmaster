@@ -165,9 +165,9 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 
 ## Status
 
-Puppetmaster is a daily-driver beta at **v1.23.0**, suitable for supervised local engineering. This release adds durable completion recovery, immutable invocation accounting, cumulative job budgets, billing provenance and route revisions, explicit first-run verification, and a dashboard UI overhaul.
+Puppetmaster is a daily-driver beta at **v1.24.0**, suitable for supervised local engineering. This release adds immutable completion receipts, bounded metadata projections, explicit job scope, durable scoped cancellation, and opt-in effect replay fences. Job receipts report invocation process outcomes separately from artifact delivery quality.
 
-[Attempt accounting](docs/ATTEMPT_LEDGER.md) preserves retries and unknown usage. [Budget reservations](docs/BUDGET_RESERVATIONS.md) enforce cumulative admission through CLI `--budget-max-*` flags and MCP inputs; opaque provider overruns can still exceed allowances. Existing SQLite state migrates to schema v4. Restart running Puppetmaster processes after upgrading. See the [feature matrix](docs/FEATURES.md) and [changelog](docs/CHANGELOG.md) for coverage and limits.
+[Store contracts](docs/STORE_CONTRACTS.md) describe the embedding APIs and their limits. [Attempt accounting](docs/ATTEMPT_LEDGER.md) preserves retries and unknown usage; selected-result economics remain separate. [Budget reservations](docs/BUDGET_RESERVATIONS.md) enforce cumulative admission, though opaque provider overruns can exceed allowances. SQLite state migrates to schema v5, with stale projection triggers repaired at supervisor initialization. Stop long-lived Puppetmaster processes before the schema cutover and restart supervisors, workers, MCP servers, and dashboards on the new version. See the [feature matrix](docs/FEATURES.md) and [changelog](docs/CHANGELOG.md).
 
 PyPI uses the package name [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); the import name, CLI, and repository use `puppetmaster`.
 
