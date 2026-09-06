@@ -318,7 +318,12 @@ class CursorAdapter(CliWorkerAdapter):
             sort_keys=True,
         )
         timeout_seconds = int(task.payload.get("timeout_seconds", 300))
-        completed = facade("run_streamed_subprocess")(
+        from puppetmaster.invocation import invoke_cli
+
+        completed = invoke_cli(
+            facade("run_streamed_subprocess"),
+            accounting_adapter="cursor",
+            accounting_model=model,
             command=["node", str(runner)],
             env=environment,
             task=task,

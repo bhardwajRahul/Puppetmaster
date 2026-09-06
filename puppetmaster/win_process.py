@@ -1,8 +1,9 @@
-"""Best-effort Windows process-tree teardown.
+"""Process-tree teardown and bounded subprocess ownership cleanup.
 
-On POSIX, ``os.killpg`` reaps a ``start_new_session`` child and its
-descendants. Windows has no process-group SIGKILL equivalent, so timeout
-paths that only call ``Popen.kill()`` leave agent-CLI grandchildren alive.
+POSIX process groups cover descendants that remain in the original session;
+inherited ownership markers also identify descendants that escape it.
+Windows has no process-group SIGKILL equivalent, so timeout paths that only
+call ``Popen.kill()`` leave agent-CLI grandchildren alive.
 
 This module prefers ``taskkill /F /T`` (tree kill) and falls back to a
 ``CreateToolhelp32Snapshot`` walk + ``TerminateProcess``. Every step is
@@ -13,7 +14,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
+import time
 from typing import Iterable, Optional
 
 
@@ -43,7 +46,7 @@ def _taskkill_creationflags() -> int:
         return getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0
 
 
-def _taskkill_process_tree(pid: int) -> bool:
+def _taskkill_process_tree(pid: int, timeout: float = 15) -> bool:
     """Invoke ``taskkill /F /T /PID`` when the binary is on PATH."""
     taskkill = shutil.which("taskkill")
     if not taskkill:
@@ -54,7 +57,7 @@ def _taskkill_process_tree(pid: int) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
-            timeout=15,
+            timeout=timeout,
             creationflags=_taskkill_creationflags(),
         )
     except (OSError, subprocess.SubprocessError):
@@ -63,7 +66,7 @@ def _taskkill_process_tree(pid: int) -> bool:
     return completed.returncode in (0, 128)
 
 
-def _toolhelp_kill_process_tree(pid: int) -> bool:
+def _toolhelp_kill_process_tree(pid: int, *, deadline: Optional[float] = None) -> bool:
     """Enumerate descendants via Toolhelp and TerminateProcess each one."""
     try:
         targets = _toolhelp_tree_pids(pid)
@@ -73,8 +76,13 @@ def _toolhelp_kill_process_tree(pid: int) -> bool:
         return False
     killed_any = False
     for target in targets:
-        if _terminate_pid(target):
-            killed_any = True
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        try:
+            if _terminate_pid(target):
+                killed_any = True
+        except Exception:
+            continue
     return killed_any
 
 
@@ -163,3 +171,75 @@ def _descendant_pids_from_map(
     descendants.reverse()
     descendants.append(root)
     return descendants
+
+
+def _owned_posix_pids(owner: str, timeout: float) -> list[int]:
+    """Find inherited ownership even after setsid and parent reparenting.
+
+    Both macOS and Linux ps expose the initial environment with eww. Keep
+    output private: it contains environments of other processes as well.
+    """
+    result = subprocess.run(["ps", "eww", "-ax", "-o", "pid=", "-o", "command="],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, timeout=timeout, check=True)
+    marker = "PUPPETMASTER_PROCESS_OWNER=" + owner
+    return [int(fields[0]) for line in result.stdout.splitlines()
+            if (fields := line.split()) and fields[0].isdigit() and marker in fields[1:]]
+
+
+def stop_owned_process(process: subprocess.Popen, owner: str, deadline: float) -> None:
+    """Bound teardown by an absolute deadline, including after leader exit.
+
+    POSIX ownership is inherited through the environment, independently of
+    session and parent IDs. Windows Toolhelp retains descendant parent IDs
+    after leader exit; use it before taskkill's already-gone fast path.
+    """
+    if os.name == "nt":
+        try:
+            _toolhelp_kill_process_tree(process.pid, deadline=deadline)
+        except Exception:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                _taskkill_process_tree(process.pid, timeout=remaining)
+            except Exception:
+                pass
+    else:
+        # Freeze the original group while enumerating escaped descendants.
+        try:
+            os.killpg(process.pid, signal.SIGSTOP)
+        except Exception:
+            pass
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                targets = _owned_posix_pids(owner, remaining)
+            except Exception:
+                # Discovery is strict before launch, but best-effort at teardown.
+                break
+            if not targets:
+                break
+            for pid in targets:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    continue
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            pass
+    try:
+        process.kill()
+    except Exception:
+        pass
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        try:
+            process.wait(timeout=remaining)
+        except Exception:
+            pass

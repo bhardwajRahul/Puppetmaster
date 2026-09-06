@@ -1461,7 +1461,41 @@ def resolve_model_pin(
     )
 
 
-def stamp_resolved_model_pin(payload: dict, pin: ResolvedModelPin) -> dict:
+def stamp_model_billing(
+    payload: dict,
+    spec: Optional[ModelSpec] = None,
+    *,
+    registry: Optional[Iterable[ModelSpec]] = None,
+    previous_adapter: Optional[str] = None,
+) -> dict:
+    """Carry explicit billing only across the same resolved model identity."""
+    merged = dict(payload or {})
+    billing = merged.get("billing")
+    previous_model = merged.get("router_model_id") or merged.get("model")
+    if spec is not None:
+        adapter = DISCOVERY_SOURCE_TO_ADAPTER.get(previous_adapter, previous_adapter)
+        needle = str(previous_model or "").strip()
+        eligible = [entry for entry in enabled_specs(
+            registry if registry is not None else [spec]
+        ) if adapter is None or entry.adapter == adapter]
+        # Billing authority requires a complete registered identity. Friendly
+        # selection's normalized suffix fallback cannot prove continuity.
+        matches = [entry for entry in eligible if entry.id == needle]
+        if not matches:
+            matches = [entry for entry in eligible
+                       if entry.adapter_model_name == needle]
+        if len(matches) != 1 or matches[0].id != spec.id:
+            billing = None
+    if billing not in ("plan", "api"):
+        billing = getattr(spec, "billing", "unknown")
+    merged["billing"] = billing if billing in ("plan", "api") else "unknown"
+    return merged
+
+
+def stamp_resolved_model_pin(
+    payload: dict, pin: ResolvedModelPin,
+    *, registry: Optional[Iterable[ModelSpec]] = None,
+) -> dict:
     """Persist both the canonical registry id and adapter model name.
 
     Registry ``payload_defaults`` (e.g. agentic ``provider=openrouter``) merge
@@ -1473,7 +1507,8 @@ def stamp_resolved_model_pin(payload: dict, pin: ResolvedModelPin) -> dict:
     defaults = dict(pin.spec.payload_defaults or {})
     return {
         **defaults,
-        **(payload or {}),
+        **stamp_model_billing(payload, pin.spec, registry=registry,
+                              previous_adapter=pin.adapter),
         "model": pin.adapter_model_name,
         "router_model_id": pin.registry_id,
         "pinned_model": pin.registry_id,
@@ -1495,14 +1530,15 @@ def apply_model_pin(
     cost and audit. Ambiguous pins raise :class:`AmbiguousModelPinError`
     (fail closed) rather than being forwarded as a raw model string.
     """
+    registry = list(registry if registry is not None else load_registry())
     pin = resolve_model_pin(
         model,
-        registry if registry is not None else load_registry(),
+        registry,
         adapter=adapter,
     )
     if pin is None:
         return {**(payload or {}), "model": model}
-    return stamp_resolved_model_pin(payload, pin)
+    return stamp_resolved_model_pin(payload, pin, registry=registry)
 
 
 def apply_cursor_model_pin(

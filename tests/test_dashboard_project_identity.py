@@ -49,81 +49,47 @@ def _store_dir(root) -> Path:
 
 
 def _mobile_block() -> str:
-    """The @media (max-width: 640px) body with /* comments */ stripped, so the
+    """The narrowest viewport rules with comments stripped, so the
     narrow-viewport rules can be asserted on without matching the desktop rules
     of the same name -- or a prose mention of a selector inside a comment."""
-    start = _PAGE_HEAD.index("@media (max-width: 640px)")
+    start = _PAGE_HEAD.index("@media (max-width: 700px)")
     block = _PAGE_HEAD[start : _PAGE_HEAD.index("</style>", start)]
     return re.sub(r"/\*.*?\*/", "", block, flags=re.DOTALL)
 
 
 class HeaderSlotTests(unittest.TestCase):
-    def test_project_slot_sits_before_the_right_edge_spacer(self) -> None:
-        """#updated carries the inline ``margin-left:auto`` that pushes it to
-        the right edge, so anything after it lands on the far side of the gap.
-        The project tag belongs in the left cluster, next to the brand."""
+    def test_project_slot_lives_in_the_persistent_workspace_rail(self) -> None:
         self.assertIn('id="project"', _PAGE_HEAD)
-        self.assertLess(
-            _PAGE_HEAD.index('id="project"'),
-            _PAGE_HEAD.index('id="updated"'),
-        )
-        self.assertGreater(
-            _PAGE_HEAD.index('id="project"'),
-            _PAGE_HEAD.index("<h1>Puppetmaster</h1>"),
-        )
+        rail = _PAGE_HEAD[_PAGE_HEAD.index('<aside class="rail"') : _PAGE_HEAD.index("</aside>")]
+        self.assertIn('class="workspace-block"', rail)
+        self.assertIn('id="project"', rail)
+        self.assertIn("Workspace", rail)
 
-    def test_project_slot_is_a_sibling_of_status_not_nested_in_it(self) -> None:
-        """loadIndex()/loadJob() replace #status wholesale via ``outerHTML``
-        every 1.5s. A tag nested inside it would be wiped on the first poll."""
-        header = _PAGE_HEAD[
-            _PAGE_HEAD.index("<header>") : _PAGE_HEAD.index("</header>")
-        ]
-        project_tag = re.search(r'<span[^>]*id="project"[^>]*>\s*</span>', header)
-        self.assertIsNotNone(project_tag, header)
-        self.assertNotIn('id="status"', project_tag.group(0))
+    def test_project_slot_is_outside_poll_replaced_content(self) -> None:
+        project = _PAGE_HEAD.index('id="project"')
+        content = _PAGE_HEAD.index('id="content"')
+        self.assertLess(project, content)
 
-    def test_project_tag_has_its_own_pill_style(self) -> None:
-        self.assertIn(".project-tag", _PAGE_HEAD)
-        # Declared after .mono: equal specificity, so source order decides
-        # which font-size wins.
-        self.assertGreater(_PAGE_HEAD.index(".project-tag"), _PAGE_HEAD.index(".mono "))
+    def test_project_identity_has_workspace_specific_style(self) -> None:
+        self.assertIn(".workspace-name", _PAGE_HEAD)
+        self.assertIn("text-overflow: ellipsis", _PAGE_HEAD)
 
 
 class MobileHeaderTests(unittest.TestCase):
-    def test_mobile_shrinks_the_project_tag_instead_of_hiding_it(self) -> None:
-        """On a phone the project tag is the most useful thing in the header
-        (one tab per project over Tailscale), so it must not join #updated and
-        #jobid in the display:none rule -- it gets a smaller font instead."""
+    def test_mobile_keeps_workspace_identity_visible(self) -> None:
         block = _mobile_block()
-        hidden = [
-            line for line in block.splitlines() if re.search(r"display:\s*none", line)
-        ]
-        self.assertTrue(hidden, "mobile block no longer hides anything")
-        for line in hidden:
-            self.assertNotIn("#project", line)
-            self.assertNotIn(".project-tag", line)
-        self.assertIsNotNone(
-            re.search(r"\.project-tag\s*\{[^}]*font-size", block),
-            "mobile block must shrink .project-tag",
-        )
+        self.assertIn(".workspace-name", block)
+        workspace_rule = re.search(r"\.workspace-name\s*\{([^}]*)\}", block)
+        self.assertIsNotNone(workspace_rule)
+        self.assertNotIn("display: none", workspace_rule.group(1))
+        self.assertIn("max-width", workspace_rule.group(1))
 
-    def test_the_only_intentional_hide_is_the_empty_slot_guard(self) -> None:
-        """One hide IS intended, in the desktop rules: the slot ships empty, so
-        without `:empty` the pill's padding/background would show as a grey nub
-        whenever /api/meta is unreachable. Pin it, so a future "hide #project on
-        mobile" edit can't hide behind it."""
-        desktop = _PAGE_HEAD[: _PAGE_HEAD.index("@media (max-width: 640px)")]
-        self.assertIn(".project-tag:empty { display: none; }", desktop)
-        # ...and that guard is the only place any project selector is hidden.
-        stripped = re.sub(r"/\*.*?\*/", "", _PAGE_HEAD, flags=re.DOTALL)
-        hides = [
-            line
-            for line in stripped.splitlines()
-            if re.search(r"display:\s*none", line)
-            and ("#project" in line or ".project-tag" in line)
-        ]
-        self.assertEqual([line.strip() for line in hides],
-                         [".project-tag:empty { display: none; }"])
+    def test_mobile_rail_becomes_a_compact_top_strip(self) -> None:
+        block = _mobile_block()
+        rail_rule = re.search(r"\.rail\s*\{([^}]*)\}", block)
+        self.assertIsNotNone(rail_rule)
+        self.assertIn("position: static", rail_rule.group(1))
+        self.assertIn("flex-direction: row", rail_rule.group(1))
 
 
 class ClientWiringTests(unittest.TestCase):
@@ -131,7 +97,7 @@ class ClientWiringTests(unittest.TestCase):
         for needle in (
             "/api/meta",
             "function loadMeta",
-            "loadMeta();",
+            "loadMeta()",
             'getElementById("project")',
             "document.title",
         ):
@@ -139,11 +105,8 @@ class ClientWiringTests(unittest.TestCase):
         # The one-shot call sits in the bootstrap seam after tick()'s
         # definition -- if it had been folded INTO tick() it would re-fetch
         # immutable identity every 1.5s forever.
-        self.assertGreater(
-            _PAGE_APP_JS.index("loadMeta();"),
-            _PAGE_APP_JS.index("async function tick()"),
-        )
-        self.assertEqual(_PAGE_APP_JS.count("loadMeta();"), 1)
+        self.assertGreater(_PAGE_APP_JS.rindex("loadMeta()"), _PAGE_APP_JS.index("async function tick()"))
+        self.assertEqual(_PAGE_APP_JS.count("loadMeta()"), 2)
 
     def test_load_meta_owns_its_own_failure(self) -> None:
         """tick()'s bare catch is not an umbrella for a sibling called from the
@@ -152,16 +115,16 @@ class ClientWiringTests(unittest.TestCase):
         loadMeta's own body so this can never accidentally see tick()'s catch
         or applyMeta's guards."""
         start = _PAGE_APP_JS.index("async function loadMeta")
-        end = _PAGE_APP_JS.index("function applyMeta", start)
+        end = _PAGE_APP_JS.index("async function loadDiagnostics", start)
         body = _PAGE_APP_JS[start:end]
-        for needle in ("try {", "catch", "r.ok"):
+        for needle in ("try {", "catch", 'requestJson("/api/meta")'):
             self.assertIn(needle, body, f"{needle} missing from loadMeta body")
 
     def test_project_tag_is_set_as_text_not_markup(self) -> None:
         """With an explicit --state-dir the basename is filesystem-derived and
         /api/meta never sanitises it, so the tag must go in as text."""
-        start = _PAGE_APP_JS.index("function applyMeta")
-        body = _PAGE_APP_JS[start:]
+        start = _PAGE_APP_JS.index("async function loadMeta")
+        body = _PAGE_APP_JS[start:_PAGE_APP_JS.index("async function loadDiagnostics", start)]
         # // comments are stripped first: applyMeta deliberately NAMES innerHTML
         # in prose, to record why it is avoided, so a raw substring scan would
         # fire on the explanation. Strip the prose, then look for the thing that
@@ -172,7 +135,7 @@ class ClientWiringTests(unittest.TestCase):
             re.search(r"innerHTML\s*=", code),
             "applyMeta assigns to innerHTML",
         )
-        self.assertIn("if (el)", code)
+        self.assertIn("if (label)", code)
 
 
 class ServedHtmlTests(unittest.TestCase):
@@ -201,7 +164,7 @@ class ServedHtmlTests(unittest.TestCase):
                 body = resp.read().decode("utf-8")
         self.assertIn('id="project"', body)
         self.assertIn("projectLabel(", body)
-        self.assertIn(".project-tag", body)
+        self.assertIn(".workspace-name", body)
 
 
 class ProjectLabelSourceTests(unittest.TestCase):

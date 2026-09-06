@@ -312,6 +312,8 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
 
     default_timeout_seconds: int = 600
 
+    accounts_invocations = True
+
     def _run_cli_lifecycle(
         self,
         task: Task,
@@ -347,7 +349,14 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
         elif not before:
             before = facade("git_snapshot")(cwd)
 
-        completed = self._invoke_cli(task, prepared, cwd, timeout_seconds)
+        from puppetmaster.invocation import invoke_cli
+
+        completed = invoke_cli(
+            self._invoke_cli, task=task, prepared=prepared,
+            cwd=cwd, timeout_seconds=timeout_seconds,
+            accounting_adapter=self.name,
+            accounting_model=prepared.extras.get("model"),
+        )
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
         # Strict identity: unittest MagicMock is truthy, so a mock that never
         # set output_limit_hit must not look like a real budget stop. Timeouts
@@ -597,6 +606,8 @@ def command_parts(command: object) -> list[str]:
     if isinstance(command, list) and all(isinstance(part, str) for part in command):
         return command
     if isinstance(command, str):
+        if os.path.isfile(os.path.expanduser(command)):
+            return [command]
         # POSIX-mode shlex treats backslashes as escapes, which mangles Windows
         # paths like ``C:\Users\me\claude.exe`` into an unresolvable token. Split
         # in non-POSIX mode on Windows so native paths survive intact.
@@ -625,4 +636,3 @@ def _should_emit_patch_artifact(before: dict, after: dict) -> bool:
     if facade("snapshot_has_diff")(before):
         return False
     return bool(str(after.get("diff") or "").strip())
-

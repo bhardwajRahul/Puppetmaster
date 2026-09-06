@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from puppetmaster.budget import BudgetPolicy
 from puppetmaster.hermes_spawn_tree import emit_spawn_tree
 from puppetmaster.liveness import record_orchestrator_heartbeat
 from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus, now_iso
@@ -173,25 +174,25 @@ def _temporary_env_var(name: str, value: str):
             os.environ[name] = previous
 
 
-def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] = None) -> dict:
+def merge_routing_payload(
+    payload: dict, decision, extra_fields: Optional[dict] = None,
+    *, registry=None, previous_adapter: Optional[str] = None,
+) -> dict:
     """Stamp a routing decision while letting explicit task payload keys win."""
+    from puppetmaster.model_registry import stamp_model_billing
+
     caller = dict(payload or {})
     merged = {
         **(decision.model.payload_defaults or {}),
-        **caller,
+        **stamp_model_billing(caller, decision.model, registry=registry,
+                              previous_adapter=previous_adapter),
         "model": decision.model.adapter_model_name,
         "router_model_id": decision.model.id,
+        "route_revision": int(caller.get("route_revision", 0)) + 1,
         "router_policy": decision.policy,
         "router_capability_needed": decision.capability_needed,
         "router_estimated_cost_usd": decision.estimated_cost_usd,
     }
-    # Billing is needed for truthful per-artifact cost provenance (plan →
-    # known $0 marginal; metered without a price stays unpriced/unknown).
-    billing = getattr(decision.model, "billing", None) or (payload or {}).get(
-        "billing"
-    )
-    if billing:
-        merged["billing"] = billing
     # Snapshot the effective allowlist at selection time so reroutes cannot
     # drift if ~/.pmharness/routing.json changes mid-job.
     if decision.allowed_model_ids is not None:
@@ -344,6 +345,7 @@ class Orchestrator:
         on_job_created: Optional[Callable[[Job], None]] = None,
         label: Optional[str] = None,
         launch_key: Optional[str] = None,
+        budget_policy: Optional[BudgetPolicy] = None,
     ) -> RunResult:
         if launch_key is None:
             launch_key = os.environ.get("PUPPETMASTER_LAUNCH_KEY")
@@ -380,6 +382,7 @@ class Orchestrator:
             label=label,
             launch_key=launch_key,
             launch_fingerprint=fingerprint,
+            budget_policy=budget_policy,
         )
         if on_job_created is not None:
             on_job_created(job)
@@ -510,8 +513,9 @@ class Orchestrator:
         goal: str,
         crash_role: str = "implement",
         roles: Optional[list[str]] = None,
+        budget_policy: Optional[BudgetPolicy] = None,
     ) -> RunResult:
-        job = self.store.create_job(goal)
+        job = self.store.create_job(goal, budget_policy=budget_policy)
         _tag_job_effort(self.store, job.id)
         _snapshot_evaluator_epoch(self.store, job)
         self._begin_trace()
@@ -942,6 +946,7 @@ class Orchestrator:
                 payload,
                 decision,
                 fallback_extra,
+                registry=registry, previous_adapter=task.adapter,
             )
             requeued = replace(
                 task,
@@ -956,7 +961,10 @@ class Orchestrator:
             )
             self.store.save_task(requeued)
 
-            artifact_payload = decision.to_artifact_payload()
+            artifact_payload = decision.to_artifact_payload(
+                effective_billing=new_payload["billing"],
+            )
+            artifact_payload["route_revision"] = new_payload["route_revision"]
             artifact_payload["role"] = task.role
             artifact_payload["fallback_from_adapter"] = failed_adapter
             if current_model_id:
@@ -1146,6 +1154,7 @@ class Orchestrator:
                     "escalated_from_model": current_model_id,
                     "escalated_from_confidence": confidence,
                 },
+                registry=registry, previous_adapter=task.adapter,
             )
             requeued = replace(
                 task,
@@ -1160,7 +1169,10 @@ class Orchestrator:
             )
             self.store.save_task(requeued)
 
-            artifact_payload = decision.to_artifact_payload()
+            artifact_payload = decision.to_artifact_payload(
+                effective_billing=new_payload["billing"],
+            )
+            artifact_payload["route_revision"] = new_payload["route_revision"]
             artifact_payload["role"] = task.role
             artifact_payload["escalated_from_model"] = current_model_id
             artifact_payload["escalated_from_confidence"] = round(confidence, 3)
@@ -1382,6 +1394,7 @@ class Orchestrator:
                     "review_escalation_attempts": attempts,
                     "review_escalated_from_model": current_model_id,
                 },
+                registry=registry, previous_adapter=task.adapter,
             )
             requeued = replace(
                 task,
@@ -1396,7 +1409,10 @@ class Orchestrator:
             )
             self.store.save_task(requeued)
 
-            artifact_payload = decision.to_artifact_payload()
+            artifact_payload = decision.to_artifact_payload(
+                effective_billing=new_payload["billing"],
+            )
+            artifact_payload["route_revision"] = new_payload["route_revision"]
             artifact_payload["role"] = task.role
             artifact_payload["review_escalated_from_model"] = current_model_id
             artifact_payload["review_escalation_attempt"] = attempts
@@ -1603,6 +1619,17 @@ class Orchestrator:
         tasks_by_role: dict[str, Task] = {}
         for spec in specs:
             payload = dict(spec.payload or {})
+            # Every model-backed task must carry an executable reasoning
+            # dialect before it is persisted. Auto-routed tasks already pass
+            # through ``merge_routing_payload``; explicit model pins and
+            # generated configs do not. Without this central stamp, a Codex
+            # worker silently inherits the host config (for example xhigh)
+            # instead of the Puppetmaster swarm default (medium).
+            if spec.adapter in _MODEL_BACKED_ADAPTERS:
+                from puppetmaster.model_registry import stamp_model_billing
+
+                payload = stamp_model_billing(payload)
+                apply_swarm_reasoning(payload, payload, adapter=spec.adapter)
             # Optional acceptance_criteria: structured field wins; else parse an
             # explicit "Acceptance criteria:" block. Instruction text is unchanged.
             if "acceptance_criteria" not in payload:
@@ -1658,6 +1685,19 @@ class Orchestrator:
         self._validate_task_graph(tasks)
         self.store.save_tasks(tasks)
         self._emit_routing_artifacts(job, tasks_by_role, routing_decisions)
+        routed_roles = {role for role, _ in routing_decisions}
+        for task in tasks:
+            if task.role not in routed_roles and task.payload.get("router_model_id"):
+                self.store.save_artifact(Artifact(
+                    job_id=job.id, task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="orchestrator", confidence=1.0,
+                    evidence=["persisted task billing"],
+                    payload={"check": "execution_billing", "result": "recorded",
+                             "model_id": task.payload["router_model_id"],
+                             "billing": task.payload["billing"],
+                             "registry_digest": task.payload.get("registry_digest")},
+                ))
         self._emit_predicted_conflicts(job, tasks)
         return tasks
 
@@ -1909,6 +1949,9 @@ class Orchestrator:
             # auto_route is authoritative. Clear every stale explicit-pin and
             # prior-route identity before classification so an old pin cannot
             # suppress later fallback/escalation or override the fresh pick.
+            prior_identity = {
+                key: payload[key] for key in ("model", "router_model_id") if key in payload
+            }
             for stale_key in (
                 "model",
                 "router_model_id",
@@ -2023,11 +2066,12 @@ class Orchestrator:
                 if prefer:
                     payload["prefer_model_id"] = prefer
                     spec = replace(spec, payload=payload)
-            signals = signals_from_worker_spec(spec)
+            signals = signals_from_worker_spec(replace(spec, payload={**payload, **prior_identity}))
             try:
                 decision = route_task(
                     signals,
                     registry_cache,
+                    generation_presence=registry_authority_cache,
                     policy=policy,
                     shadow_policy=payload.get("shadow_policy"),
                     local_receipts=self._host_local_receipts(),
@@ -2073,7 +2117,10 @@ class Orchestrator:
                     f"the bound registry snapshot: {decision.model.id}"
                 )
             new_payload = bind_registry_authority(
-                merge_routing_payload(payload, decision),
+                merge_routing_payload(
+                    {**payload, **prior_identity}, decision,
+                    registry=authority_registry, previous_adapter=spec.adapter,
+                ),
                 registry_path,
                 authority_registry,
             )
@@ -2084,13 +2131,16 @@ class Orchestrator:
             )
             result.append(routed_spec)
 
-            artifact_payload = decision.to_artifact_payload()
+            artifact_payload = decision.to_artifact_payload(
+                effective_billing=new_payload["billing"],
+            )
             if registry_reconciliation and registry_reconciliation.dropped:
                 artifact_payload["rejected"] = list(artifact_payload.get("rejected") or [])
                 for entry in registry_reconciliation.dropped:
                     artifact_payload["rejected"].append(
                         {"id": entry["model_id"], "reason": entry["reason"]}
                     )
+            artifact_payload["route_revision"] = new_payload["route_revision"]
             artifact_payload["role"] = spec.role
             artifact_payload["registry_path"] = str(registry_path) if registry_path else None
             artifact_payload["registry_digest"] = new_payload["registry_digest"]

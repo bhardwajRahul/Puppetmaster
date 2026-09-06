@@ -495,6 +495,22 @@ def _combined_reuse_fingerprint(scope_fingerprint: str, instruction_digest: str)
     return hashlib.sha256(material).hexdigest()
 
 
+def _task_validation_inputs(task: Any) -> dict:
+    """Forward validation inputs; validation.py owns canonicalization/versioning.
+
+    Absent fields retain the validation API's default-validation semantics.
+    """
+    payload = _task_payload(task)
+    return {
+        name: payload[name]
+        for name in (
+            "rules_paths", "rules_version", "evaluator_version",
+            "evaluator_digest", "evaluator",
+        )
+        if name in payload
+    }
+
+
 def reuse_fingerprint(task: Any) -> Optional[str]:
     """Combined validation + instruction fingerprint, or None (fail closed)."""
     try:
@@ -502,7 +518,9 @@ def reuse_fingerprint(task: Any) -> Optional[str]:
         scope = _task_source_scope(task)
         if cwd is None or scope is None:
             return None
-        result = compute_validation_fingerprint(cwd, scope, strict=False)
+        result = compute_validation_fingerprint(
+            cwd, scope, strict=False, **_task_validation_inputs(task)
+        )
         if not result.complete or not result.fingerprint:
             return None
         return _combined_reuse_fingerprint(result.fingerprint, _instruction_digest(task))
@@ -517,7 +535,9 @@ def _fresh_validation_payload(task: Any) -> Optional[dict]:
         scope = _task_source_scope(task)
         if cwd is None or scope is None:
             return None
-        result = compute_validation_fingerprint(cwd, scope, strict=False)
+        result = compute_validation_fingerprint(
+            cwd, scope, strict=False, **_task_validation_inputs(task)
+        )
         if not result.complete:
             return None
         instruction_digest = _instruction_digest(task)
@@ -573,8 +593,11 @@ def _is_read_only_or_analysis(task: Any) -> bool:
     """True when warm-skip is allowed (analysis / read-only, not an edit)."""
     if _is_prewalk_implement(task):
         return False
-    from puppetmaster.workers import payload_forbids_writes
+    from puppetmaster.workers import payload_forbids_writes, spec_has_side_effects
 
+    # File-read-only does not imply absence of external actions.
+    if spec_has_side_effects(task):
+        return False
     payload = _task_payload(task)
     # ANALYSIS_NO_EDIT_PAYLOAD / read_only wins over a stray mode=implement.
     if payload_forbids_writes(payload):

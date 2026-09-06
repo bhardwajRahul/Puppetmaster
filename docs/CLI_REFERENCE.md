@@ -15,6 +15,31 @@ python -m puppetmaster init             # create the local state store
 python -m puppetmaster init-config --path puppetmaster.json
 ```
 
+### Verify a first run
+
+```bash
+puppetmaster setup --verify-first-run codex/<model>
+```
+
+This verification-only mode skips installation and makes one live Codex call on
+the exact canonical model ID in your registry. Ordinary setup and install
+commands never generate with a provider; their `first_run_verified` status stays
+`skipped`.
+
+The check runs the installed CLI with temporary SQLite state and a separate
+read-only fixture. It disables routing, reuse, memory, skills, and CodeGraph.
+A pass requires one fresh attempt, the requested persisted model identity,
+measured usage, delivered status, and a structured finding that proves the
+fixture contents. Empty, degraded, blocked, stale, and mismatched results fail.
+The command returns nonzero on failure and removes its temporary files.
+
+The outer deadline is 120 seconds, with up to three seconds for process cleanup.
+POSIX uses an inherited owner marker and process-group cleanup; Windows uses a
+hidden console with owned descendant discovery and termination.
+A pass verifies the requested route and end-to-end delivery,
+not independent provider-serving identity. After setup changes, restart your
+host or start a new Codex session to reload MCP configuration.
+
 ## MCP wiring (one-liner installers, v0.7.2+)
 
 ```bash
@@ -235,7 +260,7 @@ python -m puppetmaster memory
 ## Lifecycle
 
 ```bash
-python -m puppetmaster rerun [job_id]
+python -m puppetmaster rerun [job_id] [--config workflow.json]
 python -m puppetmaster approve <job_id-or-artifact-id>
 python -m puppetmaster reject <job_id-or-artifact-id> --reason "why"
 python -m puppetmaster clean --completed
@@ -351,3 +376,32 @@ worker process startup cost is amortized.
 git worktree add /tmp/puppetmaster-work -b puppetmaster-work
 python -m puppetmaster claude "Implement the approved fix" --cwd /tmp/puppetmaster-work --permission-mode acceptEdits
 ```
+
+### Rerun budgets
+
+`rerun`, including `rerun --config`, preserves the source job's stored cumulative
+budget policy exactly. Limits apply to the new job's totals; source spending is
+not carried over. The five flags `--budget-max-usd`, `--budget-max-tokens-in`,
+`--budget-max-tokens-out`, `--budget-max-attempts`, and
+`--budget-max-elapsed-seconds` may set limits on an unbudgeted source. For a
+budgeted source, supplied fields must match its policy; omitted fields remain
+inherited. To choose different limits, explicitly launch an independent `run`.
+Legacy unbudgeted reruns remain unbudgeted when no flags are supplied. Worker
+routing `max_cost_usd` remains a separate per-call estimate cap. Reusing a launch
+key still requires the same policy and fails on conflicts.
+
+### Eval budgets
+
+`eval` accepts `--budget-max-usd`, `--budget-max-tokens-in`,
+`--budget-max-tokens-out`, `--budget-max-attempts`, and
+`--budget-max-elapsed-seconds`. Each supplied limit must be positive and finite;
+token and attempt limits must be integers. Each case runs as a separate job
+with its own temporary store: limits apply independently to each case's total
+worker consumption, including retries, rather than to the whole suite.
+Omitting all five flags passes no policy and preserves legacy execution.
+These limits do not change worker routing or its separate `max_cost_usd`
+per-call estimate cap.
+
+`demo` and `crash-demo` also accept these five flags because their default
+workers can auto-route to external adapters. Each demo run has one job budget.
+The `daemon` command consumes existing jobs and uses their stored policies.

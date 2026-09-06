@@ -378,7 +378,7 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
                 ).fetchone()
             finally:
                 verify.close()
-            self.assertEqual(int(row[0]), 2)
+            self.assertEqual(int(row[0]), 4)
 
 
 if __name__ == "__main__":

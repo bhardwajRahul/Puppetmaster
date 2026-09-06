@@ -1,3 +1,17 @@
+## v1.23.0 — 2026-09-06
+
+**Durable completion, invocation accounting, and cumulative job budgets.**
+
+- Persist completion intents and reconcile interrupted completion on recovery, with lease fencing and completion gates before accepting results.
+- Record immutable attempts and usage observations at each runtime-owned CLI/provider invocation, including retries and fallbacks. Preserve consumption across task resets; keep unknown usage distinct from measured zero and selected-result totals. See [Attempt ledger](ATTEMPT_LEDGER.md).
+- Admit budgeted calls through durable reservations, adoption, and reconciliation. CLI `--budget-max-usd`, `--budget-max-tokens-in`, `--budget-max-tokens-out`, `--budget-max-attempts`, and `--budget-max-elapsed-seconds` have matching MCP `budget_max_*` inputs. Limits accumulate per job; elapsed seconds sum invocation lifetimes. `rerun` inherits the source policy and rejects conflicting overrides. `--max-cost-usd` remains a routing estimate filter.
+- Fail closed when a capped metric lacks a bounded allowance or has pending liability. Opaque CLI internal calls cannot be admitted separately; caller allowances are not provider limits. Record provider overruns and block subsequent admission. These controls cannot guarantee an absolute billed-dollar or token ceiling. See [Budget reservations](BUDGET_RESERVATIONS.md).
+- Retain billing provenance and monotonic route revisions so actual reroutes supersede pin provenance. Keep API charges, plan marginal cost, API-equivalent estimates, and unknown costs distinct.
+- Report static setup readiness separately from execution proof. Explicit `setup --verify-first-run codex/<model>` verifies a fresh read-only Codex invocation, exact model identity, measured usage, and a fixture-backed finding without installing anything.
+- Overhaul the dashboard UI with packaged HTML/CSS/JavaScript assets, attempt-consumption and budget detail, and economics provenance. No frontend build or new runtime dependency is required.
+
+Upgrade: SQLite migrates existing state compatibly to schema **v4**, adding attempt, observation, and reservation tables without inventing historical consumption or reservations. Jobs without a budget policy retain legacy dispatch behavior. Restart long-running supervisors, workers, MCP servers, and dashboards after upgrading so all processes use the new code and schema; the supervisor performs migration before workers attach. Pending reservations survive restart and require authoritative reconciliation, not an automatic refund. The file backend retains its weaker concurrency and power-loss guarantees.
+
 ## v1.22.48 — 2026-09-04
 
 **Every swarm adapter defaults to medium reasoning. Caller pins still win.**

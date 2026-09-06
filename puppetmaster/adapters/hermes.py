@@ -694,7 +694,12 @@ class HermesAdapter(CliWorkerAdapter):
             with hermes_reasoning_effort_env(
                 worker_env, task.payload.get("reasoning_effort")
             ) as run_env:
-                return facade("run_streamed_subprocess")(
+                from puppetmaster.invocation import invoke_cli
+
+                return invoke_cli(
+                    facade("run_streamed_subprocess"),
+                    accounting_adapter="hermes",
+                    accounting_model=task.payload.get("model"),
                     command=command,
                     env=run_env,
                     task=task,

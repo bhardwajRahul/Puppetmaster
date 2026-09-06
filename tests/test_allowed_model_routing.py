@@ -275,6 +275,12 @@ class RunStatusErrorRerouteTests(unittest.TestCase):
         from puppetmaster.platform_billing import clear_billing_cache
 
         clear_billing_cache()
+        eligibility = mock.patch(
+            "puppetmaster.platform_lock.is_adapter_enabled",
+            side_effect=lambda adapter: adapter == "cursor",
+        )
+        eligibility.start()
+        self.addCleanup(eligibility.stop)
 
     def tearDown(self) -> None:
         from puppetmaster.platform_billing import clear_billing_cache

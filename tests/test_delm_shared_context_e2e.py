@@ -173,6 +173,7 @@ class DelmSharedContextE2ETests(unittest.TestCase):
                 ) as response:
                     body = json.loads(response.read().decode("utf-8"))
                 self.assertIsInstance(body.get("frontier"), dict)
+                self.assertEqual(body["frontier"], frontier)
                 self.assertGreaterEqual(
                     (body.get("frontier") or {})
                     .get("gists", {})
@@ -183,8 +184,8 @@ class DelmSharedContextE2ETests(unittest.TestCase):
                     f"http://127.0.0.1:{port}/", timeout=5
                 ) as response:
                     html = response.read().decode("utf-8")
-                self.assertIn("renderFrontierSidecar", html)
-                self.assertIn("frontier-sidecar", html)
+                self.assertIn('class="frontier"', html)
+                self.assertIn('>Frontier</span>', html)
             finally:
                 server.shutdown()
                 server.server_close()

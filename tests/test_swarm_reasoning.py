@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 _HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +166,60 @@ class MergeRoutingPayloadTests(unittest.TestCase):
                 {"id": "fast", "value": "true"},
             ],
         )
+
+
+class ExplicitTaskReasoningTests(unittest.TestCase):
+    def test_explicit_codex_pin_is_persisted_as_medium_cli_dialect(self) -> None:
+        from puppetmaster.adapters.codex import build_codex_exec_command
+        from puppetmaster.model_registry import save_registry
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store_factory import create_store
+        from puppetmaster.workers import WorkerSpec
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry_path = root / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="codex/gpt-6-astra",
+                        adapter="codex",
+                        adapter_model_name="gpt-6-astra",
+                        capability_score=100,
+                        billing="plan",
+                    )
+                ],
+                registry_path,
+            )
+            store = create_store("file", root / ".puppetmaster")
+            store.init()
+            job = store.create_job("explicit codex reasoning")
+            task = Orchestrator(store)._create_tasks(
+                job,
+                [
+                    WorkerSpec(
+                        role="audit",
+                        instruction="audit the worker path",
+                        adapter="codex",
+                        payload={
+                            "model": "gpt-6-astra",
+                            "registry_path": str(registry_path),
+                        },
+                    )
+                ],
+            )[0]
+
+            self.assertEqual(task.payload["reasoning_effort"], "medium")
+            self.assertEqual(
+                task.payload["extra_args"],
+                ["-c", "model_reasoning_effort=medium"],
+            )
+            command = build_codex_exec_command(
+                executable=["codex"],
+                model=task.payload["model"],
+                extra_args=task.payload["extra_args"],
+            )
+            self.assertIn("model_reasoning_effort=medium", command)
 
 
 if __name__ == "__main__":

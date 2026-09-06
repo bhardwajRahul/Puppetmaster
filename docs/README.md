@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.36](CHANGELOG.md#v12236) — headed Chrome auth handoff with a durable profile and shared CDP attach; see [CHANGELOG.md](CHANGELOG.md), [WHY.md](WHY.md), and [CLAIMS.md](CLAIMS.md). Grok Bot remote MCP (streamable HTTP pilot) is first-class — start at [GROK_BOT.md](GROK_BOT.md).
+**Current release:** [v1.23.0](CHANGELOG.md#v1230--2026-09-06) — durable completion recovery, invocation accounting, cumulative budgets, setup verification, and a dashboard UI overhaul. See [CHANGELOG.md](CHANGELOG.md) for migration and restart guidance.
 
 ## Start here
 
@@ -35,6 +35,8 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | Doc | What's in it |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
+| [ATTEMPT_LEDGER.md](ATTEMPT_LEDGER.md) | Immutable invocation facts, usage observations, and consumption reports |
+| [BUDGET_RESERVATIONS.md](BUDGET_RESERVATIONS.md) | Cumulative limits, CLI/MCP inputs, reservation lifecycle, and enforcement limits |
 | [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md) | #88 inventory: confidence vs execution/grounding/claim-support/criterion status |
 | [CELL.md](CELL.md) | Named cells: inspectable sqlite, serial inbox, hibernate/alarm (celld slice) |
 | [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, the starter tiers |

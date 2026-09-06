@@ -6,11 +6,15 @@ import json
 import os
 import threading
 import time
-from dataclasses import replace
+from contextlib import contextmanager, nullcontext
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
+from puppetmaster.budget import (
+    BudgetPolicy, BudgetLiability, BudgetConflictError, budget_totals, check_admission,
+)
 from puppetmaster.models import (
     AgentRun,
     Artifact,
@@ -34,6 +38,9 @@ from puppetmaster.models import (
     seconds_from_now,
     task_from_dict,
     to_jsonable,
+)
+from puppetmaster.attempts import (
+    ExecutionAttempt, UsageObservation, LedgerConflictError, canonical_record,
 )
 from puppetmaster.cost import maybe_stamp_terminal_cost_receipt
 from puppetmaster.redaction import redact_payload_for_storage
@@ -269,12 +276,14 @@ class SwarmStore:
         goal: str,
         *,
         label: Optional[str] = None,
+        budget_policy: Optional[BudgetPolicy] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> Job:
         return self.create_or_get_job(
             goal,
             label=label,
+            budget_policy=budget_policy,
             launch_key=launch_key,
             launch_fingerprint=launch_fingerprint,
         )[0]
@@ -284,6 +293,7 @@ class SwarmStore:
         goal: str,
         *,
         label: Optional[str] = None,
+        budget_policy: Optional[BudgetPolicy] = None,
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> tuple[Job, bool]:
@@ -312,7 +322,8 @@ class SwarmStore:
                     continue
                 if acquired:
                     self.release_lock(lock_name, owner)
-                if existing.launch_fingerprint != fingerprint:
+                if (existing.launch_fingerprint != fingerprint or
+                        existing.budget_policy != budget_policy):
                     raise LaunchConflictError(
                         "launch_key already belongs to a different request"
                     )
@@ -324,6 +335,7 @@ class SwarmStore:
         job = Job(
             goal=goal,
             label=label,
+            budget_policy=budget_policy,
             launch_key=launch_key,
             launch_fingerprint=fingerprint if launch_key else None,
         )
@@ -821,6 +833,28 @@ class SwarmStore:
         task_map = {task.id: task for task in tasks}
         if parent.id not in task_map:
             task_map[parent.id] = parent
+        existing_children = [
+            task
+            for task in tasks
+            if parent_task_id in (task.depends_on or [])
+            and bool((task.payload or {}).get("enqueued_from_parent"))
+        ]
+        fingerprint_src = f"{parent_task_id}\n{role_text}\n{instruction_text}"
+        fingerprint = hashlib.sha256(fingerprint_src.encode("utf-8")).hexdigest()[:16]
+        for task in existing_children:
+            if (task.payload or {}).get("enqueue_fingerprint") == fingerprint:
+                self._materialize_depends_on_edges(task)
+                self.emit(
+                    job_id,
+                    "task.enqueue_deduped",
+                    {
+                        "parent_task_id": parent_task_id,
+                        "task_id": task.id,
+                        "enqueue_fingerprint": fingerprint,
+                    },
+                )
+                return task
+
         parent_depth = self._task_ancestry_depth(parent, task_map)
         child_depth = parent_depth + 1
         if child_depth > depth_limit:
@@ -847,12 +881,6 @@ class SwarmStore:
                 },
             )
             return None
-        existing_children = [
-            task
-            for task in tasks
-            if parent_task_id in (task.depends_on or [])
-            and bool((task.payload or {}).get("enqueued_from_parent"))
-        ]
         if len(existing_children) >= child_limit:
             self.emit(
                 job_id,
@@ -865,21 +893,6 @@ class SwarmStore:
                 },
             )
             return None
-
-        fingerprint_src = f"{parent_task_id}\n{role_text}\n{instruction_text}"
-        fingerprint = hashlib.sha256(fingerprint_src.encode("utf-8")).hexdigest()[:16]
-        for task in existing_children:
-            if (task.payload or {}).get("enqueue_fingerprint") == fingerprint:
-                self.emit(
-                    job_id,
-                    "task.enqueue_deduped",
-                    {
-                        "parent_task_id": parent_task_id,
-                        "task_id": task.id,
-                        "enqueue_fingerprint": fingerprint,
-                    },
-                )
-                return task
 
         child_payload = dict(payload or {})
         child_payload["enqueued_from_parent"] = True
@@ -921,12 +934,14 @@ class SwarmStore:
         created_by: Optional[str] = None,
         limit: int = 4,
         cwd: Optional[Union[str, Path]] = None,
+        retry_failures: bool = False,
     ) -> list[Task]:
         """Enqueue follow-ups declared on ``artifact.payload['enqueue_subtasks']``.
 
         Each entry is ``{"role": "...", "instruction": "..."}`` (optional
         ``adapter``). Best-effort: refusals/dedupes are skipped; never raises
-        into the worker hot path. Worker protocol (recruit/HOLD/VETO/mailbox),
+        into the worker hot path unless retry_failures is requested. Worker
+        protocol (recruit/HOLD/VETO/mailbox),
         foreign job_id, a new job, a parent that is not the producing task,
         and merge/ship after a failed GATE are refused.
         """
@@ -1068,6 +1083,8 @@ class SwarmStore:
                     actor="worker",
                 )
             except Exception:
+                if retry_failures:
+                    raise
                 continue
             if child is not None:
                 created.append(child)
@@ -1212,6 +1229,8 @@ class SwarmStore:
             foreign_active_writer,
         )
 
+        if task.status == TaskStatus.RUNNING and self._has_pending_completion(task):
+            return True
         if not self.dependencies_complete(task, task_map=task_map):
             blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
@@ -1404,9 +1423,10 @@ class SwarmStore:
         return None
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
+        self.reconcile_completions(job_id)
         recovered: list[Task] = []
         for task in self.list_tasks(job_id):
-            if not self.is_task_stale(task):
+            if not self.is_task_stale(task) or self._has_pending_completion(task):
                 continue
             queued = self._build_recovered_task(task)
             if not self._atomic_recover_stale(task, queued):
@@ -2228,6 +2248,336 @@ class SwarmStore:
         )
         return updated
 
+    @contextmanager
+    def _completion_scope(self, job_id: str):
+        # The file backend uses its existing crash-expiring lock and atomic
+        # rename journal. SQLite overrides this with a writer transaction.
+        owner = f"completion-{os.getpid()}-{threading.get_ident()}"
+        name = f"completion:{job_id}"
+        if not self.acquire_lock(name, owner, ttl_seconds=300):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            self.release_lock(name, owner=owner)
+
+    def _completion_intent_scope(self, job_id: str):
+        # Each execution owns a distinct journal file. Publish by atomic rename
+        # even while another publisher holds the replay lock.
+        return nullcontext()
+
+    def _has_pending_completion(self, task: Task) -> bool:
+        return any(
+            not record["done"] and record["task"]["id"] == task.id
+            and record["task"].get("lease_id") == task.lease_id
+            and record["run"]["worker_id"] == task.lease_owner
+            for record in self._completion_records(task.job_id)
+        )
+
+    def _save_completion(self, job_id: str, record: dict[str, Any]) -> None:
+        self.write_json(self.job_dir(job_id) / "completions" / f"{record['run']['id']}.json", record)
+
+    def _completion_records(self, job_id: str) -> list[dict[str, Any]]:
+        return [
+            self.read_json(path)
+            for path in sorted((self.job_dir(job_id) / "completions").glob("*.json"))
+        ]
+
+    def complete_task(
+        self, task: Task, run: AgentRun, artifacts: list[Artifact],
+        event_payload: dict[str, Any],
+    ) -> Task:
+        """Journal accepted output before publishing children or terminal state.
+
+        SQLite commits each replay in one writer transaction. File storage uses
+        atomic rename for the intent, existing child fingerprints, and stream
+        readback for event deduplication. It is process-crash recoverable, not a
+        multi-file transaction or a power-loss/fsync guarantee. Its existing
+        expiring lock requires publication to finish within 300 seconds; a
+        killed publisher can delay recovery until that lock expires. Contention
+        defers replay to the next poll; intent publication does not take the lock.
+        Concurrent file-backend claim/reset/lease writes retain weaker isolation.
+        """
+        with self._completion_intent_scope(task.job_id):
+            current = self.get_task_by_id(task.id)
+            if current.status != TaskStatus.RUNNING or not self._lease_matches(
+                current, run.worker_id, task.lease_id
+            ):
+                return current
+            record = {
+                "task": to_jsonable(task), "run": to_jsonable(run),
+                "artifacts": to_jsonable(artifacts), "event_payload": event_payload,
+                "event_cursor": self.event_cursor(task.job_id), "done": False,
+            }
+            self._save_completion(task.job_id, record)
+        # The intent must commit independently of the retryable publication.
+        self.reconcile_completions(task.job_id)
+        return self.get_task_by_id(task.id)
+
+    def reconcile_completions(self, job_id: str) -> None:
+        with self._completion_scope(job_id) as acquired:
+            if not acquired:
+                return
+            for record in self._completion_records(job_id):
+                if record["done"]:
+                    continue
+                task = task_from_dict(record["task"])
+                run = AgentRun(**{**record["run"], "status": TaskStatus.COMPLETE})
+                current = self.get_task_by_id(task.id)
+                already_complete = (current.status == TaskStatus.COMPLETE
+                                    and current.completed_at == run.completed_at)
+                owns_lease = (current.status == TaskStatus.RUNNING
+                              and current.lease_id == task.lease_id
+                              and current.lease_owner == run.worker_id)
+                if not already_complete and not owns_lease:
+                    # Reset/reclaim invalidates the old execution's intent.
+                    record["done"] = True
+                    self._save_completion(job_id, record)
+                    continue
+                for raw in record["artifacts"]:
+                    self.maybe_enqueue_follow_ups_from_artifact(
+                        artifact_from_dict(raw), parent_task_id=task.id,
+                        created_by=run.worker_id, cwd=(task.payload or {}).get("cwd"),
+                        retry_failures=True,
+                    )
+                if not already_complete:
+                    self.save_run(run)
+                    updated = replace(self._build_status_update(current, TaskStatus.COMPLETE),
+                                      completed_at=run.completed_at)
+                    published = self._atomic_status_update(
+                        task.id, updated, terminal=True, worker_id=run.worker_id,
+                        expected_lease=task.lease_id,
+                    )
+                    if (published.status != TaskStatus.COMPLETE or
+                            published.completed_at != run.completed_at):
+                        continue
+                events = self.read_events_since(job_id, record["event_cursor"])
+                if not any(e["event"] == "worker.completed_task" and
+                           e["payload"] == record["event_payload"] for e in events):
+                    self.emit(job_id, "worker.completed_task", record["event_payload"])
+                record["done"] = True
+                self._save_completion(job_id, record)
+
+    def _ledger_dir(self, job_id: str) -> Path:
+        return self._assert_safe_job_dir(job_id) / "consumption"
+
+    @staticmethod
+    def _ledger_key(*parts: str) -> str:
+        return hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()
+
+    def _record_ledger_file(self, record: Union[ExecutionAttempt, UsageObservation]) -> bool:
+        """Atomic rename under the existing crash-expiring lock.
+
+        Contention raises (caller may retry). This is not a multi-record
+        transaction or fsync durability guarantee; a writer paused beyond the
+        300s lock TTL can race a reclaimer, as with other file-store locks.
+        """
+        with self._budget_scope(record.job_id):
+            self._check_ledger_reservation(record)
+            directory = self._ledger_dir(record.job_id)
+            key = self._ledger_key(record.attempt_id)
+            name = f"consumption:{record.job_id}:{key}"
+            owner = new_id("ledger")
+            if not self.acquire_lock(name, owner, ttl_seconds=300):
+                raise RuntimeError("consumption ledger busy; retry the write")
+            try:
+                if isinstance(record, ExecutionAttempt):
+                    path = directory / "attempts" / f"{key}.json"
+                else:
+                    if not (directory / "attempts" / f"{key}.json").exists():
+                        raise ValueError("usage observation requires a recorded attempt")
+                    path = directory / "observations" / (
+                        self._ledger_key(record.attempt_id, record.observation_id) + ".json")
+                if path.exists():
+                    existing = type(record)(**self.read_json(path))
+                    if canonical_record(existing) != canonical_record(record):
+                        raise LedgerConflictError("ledger key already has different content")
+                    return False
+                self.write_json(path, record)
+                return True
+            finally:
+                self.release_lock(name, owner=owner)
+
+    @contextmanager
+    def _budget_scope(self, job_id: str):
+        """Job-wide admission lock; file backend has the existing 300s TTL limits."""
+        self._assert_safe_job_dir(job_id)
+        owner = new_id("budget")
+        name = f"budget:{job_id}"
+        if not self.acquire_lock(name, owner, ttl_seconds=300):
+            raise RuntimeError("budget busy; retry")
+        try:
+            yield
+        finally:
+            self.release_lock(name, owner=owner)
+
+    def _budget_records(self, job_id: str) -> list[dict[str, Any]]:
+        directory = self._assert_safe_job_dir(job_id) / "budget"
+        return sorted((self.read_json(path) for path in directory.glob("*.json")),
+                      key=lambda record: record["attempt"]["attempt_id"])
+
+    def _save_budget_record(self, record: dict[str, Any]) -> None:
+        path = (self._assert_safe_job_dir(record["attempt"]["job_id"]) / "budget" /
+                (self._ledger_key(record["attempt"]["attempt_id"]) + ".json"))
+        self.write_json(path, record)
+
+    @staticmethod
+    def _check_invocation_identity(expected: ExecutionAttempt,
+                                   actual: ExecutionAttempt) -> None:
+        if canonical_record(expected) != canonical_record(actual):
+            raise BudgetConflictError("invocation identity conflict")
+
+    def _check_reserved_identity(self, record: dict[str, Any],
+                                 job_id: str, attempt_id: str) -> None:
+        expected = ExecutionAttempt(**record["attempt"])
+        if (expected.job_id, expected.attempt_id) != (job_id, attempt_id):
+            raise BudgetConflictError("invocation identity conflict")
+        for actual in self.list_attempts(job_id):
+            if actual.attempt_id == attempt_id:
+                self._check_invocation_identity(expected, actual)
+
+    def _check_ledger_reservation(self, record: Union[ExecutionAttempt, UsageObservation]) -> None:
+        # Caller holds the same job lock/transaction as reservation transitions.
+        try:
+            reservation = self._get_budget_record(record.job_id, record.attempt_id)
+        except KeyError:
+            return
+        if isinstance(record, ExecutionAttempt):
+            self._check_invocation_identity(ExecutionAttempt(**reservation["attempt"]), record)
+        if reservation["state"] == "released":
+            raise BudgetConflictError("recorded invocation contradicts non-dispatch")
+
+    def _get_budget_record(self, job_id: str, attempt_id: str) -> dict[str, Any]:
+        for record in self._budget_records(job_id):
+            if record["attempt"]["attempt_id"] == attempt_id:
+                self._check_reserved_identity(record, job_id, attempt_id)
+                return record
+        raise KeyError(attempt_id)
+
+    def reserve_dispatch(self, attempt: ExecutionAttempt,
+                         allowance: BudgetLiability) -> dict[str, Any]:
+        """Reserve one immutable invocation identity, without recording a dispatch.
+
+        Allowance is a caller-supplied bound, not the router's marginal estimate.
+        Exact replay returns the current record, including terminal states.
+        """
+        record = {"attempt": asdict(attempt), "allowance": asdict(allowance),
+                  "state": "reserved", "adoption_id": None, "liability": None,
+                  "reconciliations": {}, "release_proof": None}
+        with self._budget_scope(attempt.job_id):
+            job = self.get_job(attempt.job_id)
+            records = self._budget_records(attempt.job_id)
+            for existing in records:
+                if existing["attempt"]["attempt_id"] == attempt.attempt_id:
+                    self._check_reserved_identity(existing, attempt.job_id, attempt.attempt_id)
+                    self._check_invocation_identity(ExecutionAttempt(**existing["attempt"]), attempt)
+                    if existing["allowance"] != record["allowance"]:
+                        raise BudgetConflictError("reservation identity has different facts")
+                    return existing
+            for item in self.list_attempts(attempt.job_id):
+                if item.attempt_id == attempt.attempt_id:
+                    self._check_invocation_identity(item, attempt)
+                    raise BudgetConflictError("cannot reserve an already recorded invocation")
+            check_admission(job.budget_policy, records + [record])
+            self._save_budget_record(record)
+            return record
+
+    def adopt_dispatch(self, job_id: str, attempt_id: str,
+                       *, adoption_id: str) -> dict[str, Any]:
+        """Durably mark dispatch ownership BEFORE crossing an invocation boundary.
+
+        A repeated adoption is a recovery read, never permission to invoke twice.
+        """
+        if not isinstance(adoption_id, str) or not adoption_id.strip():
+            raise ValueError("adoption_id is required")
+        with self._budget_scope(job_id):
+            record = self._get_budget_record(job_id, attempt_id)
+            if record["adoption_id"] is not None:
+                if record["adoption_id"] != adoption_id:
+                    raise BudgetConflictError("dispatch already adopted by another identity")
+                return record
+            if record["state"] != "reserved":
+                raise BudgetConflictError("only a reserved invocation can be adopted")
+            record.update(state="dispatching", adoption_id=adoption_id)
+            self._save_budget_record(record)
+            return record
+
+    def reconcile_reservation(self, job_id: str, attempt_id: str, *,
+                              reconciliation_id: str, liability: BudgetLiability,
+                              final: bool, evidence: str) -> dict[str, Any]:
+        """Replace cumulative liability once per source identity; never add deltas.
+
+        final asserts complete invocation coverage (not that all prices are known).
+        Unknown/partial final cost stays pending. New source IDs can resolve pending
+        records; a settled result is immutable. Evidence identifies source authority.
+        """
+        if (not isinstance(reconciliation_id, str) or not reconciliation_id.strip() or
+                not isinstance(evidence, str) or not evidence.strip() or type(final) is not bool):
+            raise ValueError("reconciliation identity, evidence and boolean final required")
+        event = {"liability": asdict(liability), "final": final, "evidence": evidence}
+        with self._budget_scope(job_id):
+            record = self._get_budget_record(job_id, attempt_id)
+            previous = record["reconciliations"].get(reconciliation_id)
+            if previous is not None:
+                if previous != event:
+                    raise BudgetConflictError("reconciliation identity has different facts")
+                return record
+            if record["state"] not in ("dispatching", "pending_reconciliation"):
+                raise BudgetConflictError("reconciliation requires an unsettled dispatch")
+            record["reconciliations"][reconciliation_id] = event
+            record["liability"] = asdict(liability)
+            record["state"] = ("settled" if final and liability.cost_state == "known"
+                               else "pending_reconciliation")
+            self._save_budget_record(record)
+            return record
+
+    def release_undispatched(self, job_id: str, attempt_id: str, *,
+                            non_dispatch_proof: str) -> dict[str, Any]:
+        """Release only before adoption, with caller evidence of non-dispatch."""
+        if not isinstance(non_dispatch_proof, str) or not non_dispatch_proof.strip():
+            raise ValueError("non-dispatch proof is required")
+        with self._budget_scope(job_id):
+            record = self._get_budget_record(job_id, attempt_id)
+            if record["state"] == "released" and record["release_proof"] == non_dispatch_proof:
+                return record
+            if record["state"] != "reserved":
+                raise BudgetConflictError("cannot release an adopted or released dispatch")
+            if any(item.attempt_id == attempt_id for item in self.list_attempts(job_id)):
+                raise BudgetConflictError("recorded invocation contradicts non-dispatch")
+            record.update(state="released", release_proof=non_dispatch_proof)
+            self._save_budget_record(record)
+            return record
+
+    def budget_snapshot(self, job_id: str) -> dict[str, Any]:
+        """Consistent reservation liability only; does not sum telemetry observations."""
+        with self._budget_scope(job_id):
+            job = self.get_job(job_id)
+            records = self._budget_records(job_id)
+            return {"policy": asdict(job.budget_policy) if job.budget_policy else None,
+                    "totals": budget_totals(records), "reservations": records}
+
+    def record_attempt(self, attempt: ExecutionAttempt) -> bool:
+        """Insert immutable launch facts; True if new, False on exact replay."""
+        return self._record_ledger_file(attempt)
+
+    def record_usage_observation(self, observation: UsageObservation) -> bool:
+        """Insert a source snapshot; does not update usage reports or events."""
+        return self._record_ledger_file(observation)
+
+    def list_attempts(self, job_id: str, *, task_id: Optional[str] = None) -> list[ExecutionAttempt]:
+        """Legacy jobs return []; reset_subgraph never removes these records."""
+        records = [ExecutionAttempt(**self.read_json(path)) for path in
+                   (self._ledger_dir(job_id) / "attempts").glob("*.json")]
+        return sorted((r for r in records if task_id is None or r.task_id == task_id),
+                      key=lambda r: (r.started_at, r.attempt_id))
+
+    def list_usage_observations(self, job_id: str, *, attempt_id: Optional[str] = None) -> list[UsageObservation]:
+        records = [UsageObservation(**self.read_json(path)) for path in
+                   (self._ledger_dir(job_id) / "observations").glob("*.json")]
+        return sorted((r for r in records if attempt_id is None or r.attempt_id == attempt_id),
+                      key=lambda r: (r.attempt_id, r.observation_id))
+
     def save_run(self, run: AgentRun) -> None:
         self.write_json(self.job_dir(run.job_id) / "runs" / f"{run.id}.json", run)
         self.emit(run.job_id, "run.saved", {"run_id": run.id, "role": run.role})
@@ -2850,7 +3200,10 @@ class SwarmStore:
         stream = self.stream_dir / f"{job_id}.jsonl"
         record = {"at": now_iso(), "event": event, "payload": payload}
         with stream.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            # Separate a retry from any torn completion append. Readers already
+            # skip blank/malformed lines and retain their line-based cursors.
+            prefix = "\n" if event == "worker.completed_task" else ""
+            handle.write(prefix + json.dumps(record, sort_keys=True) + "\n")
 
     def read_events(self, job_id: str) -> list[dict[str, Any]]:
         return self.read_events_since(job_id, since=0)

@@ -403,6 +403,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
     """Provider-agnostic direct-API worker with an in-process tool loop."""
 
     name = "agentic"
+    accounts_invocations = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -1081,10 +1082,27 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 kwargs["api_key"] = api_key
             try:
                 try:
-                    if on_delta is not None:
-                        turn = provider_chat_streaming(on_delta=on_delta, **kwargs)
-                    else:
-                        turn = provider_chat(**kwargs)
+                    from puppetmaster.invocation import invocation
+
+                    descriptor = get_provider(provider)
+                    provider_slug = descriptor.slug if descriptor is not None else provider
+                    plan_billed = provider_slug == "opencode-go"
+                    billing = "plan" if plan_billed else (
+                        "api" if descriptor is not None else "unknown"
+                    )
+                    with invocation(adapter="agentic", model=model, billing=billing,
+                                    source=f"provider:{provider_slug}") as capture:
+                        if on_delta is not None:
+                            turn = provider_chat_streaming(on_delta=on_delta, **kwargs)
+                        else:
+                            turn = provider_chat(**kwargs)
+                        capture.observe(
+                            turn.accounting_usage if turn.accounting_usage is not None else turn.usage,
+                            source=f"provider:{provider_slug}",
+                            cost_basis="api_equivalent" if capture.billing == "plan"
+                            else capture.billing or "unknown",
+                            final=turn.accounting_complete,
+                        )
                     breaker.record_success(admission_key)
                     recorded = True
                     return turn

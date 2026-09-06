@@ -892,11 +892,21 @@ def _run_setup(args) -> int:
     that Python or sqlite is missing (in which case nothing else will
     work). The user can re-run after fixing whatever was reported.
     """
+    if isinstance(getattr(args, "verify_first_run", None), str):
+        from puppetmaster.setup_verification import FirstRunRequest, verify_first_run
+
+        result = verify_first_run(FirstRunRequest(args.verify_first_run))
+        print(f"first_run_verified: {'pass' if result.passed else 'fail'} — {result.reason}")
+        print(result.scope)
+        print("After changing setup, restart the host or start a new `codex` session to reload MCP configuration.")
+        return 0 if result.passed else 1
+
     import puppetmaster.cli as cli
 
     cwd = Path.cwd()
     state_dir = resolve_state_dir(args.state_dir, cwd)
     overall_rc = 0
+    installation_results: dict[str, str] = {}
 
     if not getattr(args, "skip_doctor", False):
         print("=== step 1/9: doctor ===")
@@ -993,6 +1003,7 @@ def _run_setup(args) -> int:
             dry_run=False,
             skip_handshake=False,
         )
+        installation_results["cursor"] = cursor_result.status
         for line in cursor_result.messages:
             print(f"  {line}")
         if cursor_result.status not in {"installed", "unchanged", "would_install"}:
@@ -1011,6 +1022,7 @@ def _run_setup(args) -> int:
             dry_run=False,
             skip_handshake=False,
         )
+        installation_results["codex"] = codex_result.status
         for line in codex_result.messages:
             print(f"  {line}")
         if codex_result.status not in {"installed", "unchanged", "would_install"}:
@@ -1032,6 +1044,7 @@ def _run_setup(args) -> int:
             dry_run=False,
             skip_handshake=False,
         )
+        installation_results["claude-code"] = claude_result.status
         for line in claude_result.messages:
             print(f"  {line}")
         if claude_result.status not in {"installed", "unchanged", "would_install"}:
@@ -1052,6 +1065,7 @@ def _run_setup(args) -> int:
             dry_run=False,
             skip_handshake=False,
         )
+        installation_results["hermes"] = hermes_result.status
         for line in hermes_result.messages:
             print(f"  {line}")
         if hermes_result.status not in {"installed", "unchanged", "would_install"}:
@@ -1131,6 +1145,7 @@ def _run_setup(args) -> int:
             dry_run=getattr(args, "dry_run", False),
             skip_handshake=getattr(args, "skip_handshake", False),
         )
+        installation_results["pi"] = pi_result.status
         for line in pi_result.messages:
             print(f"  {line}")
         if pi_result.status not in {"installed", "unchanged", "would_install"}:
@@ -1153,6 +1168,7 @@ def _run_setup(args) -> int:
             dry_run=getattr(args, "dry_run", False),
             skip_handshake=getattr(args, "skip_handshake", False),
         )
+        installation_results["omp"] = omp_result.status
         for line in omp_result.messages:
             print(f"  {line}")
         if omp_result.status not in {"installed", "unchanged", "would_install"}:
@@ -1211,12 +1227,33 @@ def _run_setup(args) -> int:
         print("=== step 9/9: install-hooks SKIPPED (--skip-hooks) ===")
     print()
 
+    from puppetmaster.setup_readiness import collect_setup_readiness, check
+
+    try:
+        readiness = collect_setup_readiness(
+            enabled_adapters, installation_results=installation_results,
+            installation_rc=overall_rc, host_pilots=host_pilots,
+        )
+    except Exception as exc:
+        # Readiness is diagnostic: preserve the install dispatch's return code.
+        readiness = {
+            "schema_version": 1, "installation_rc": overall_rc,
+            "readiness": check("unknown", f"Readiness inspection failed ({type(exc).__name__}).",
+                               "Run `puppetmaster doctor` and re-run setup."),
+            "first_run_verified": check("skipped", "No worker executed.", "Verify a first run explicitly."),
+            "targets": [],
+        }
+    args.setup_readiness = readiness
+    print("=== setup readiness (static evidence; first run skipped) ===")
+    print(json.dumps(readiness, sort_keys=True))
     if overall_rc == 0:
-        print("Setup complete.")
+        print("Setup installation steps finished. Worker readiness is reported above; first run was not verified.")
         for line in _setup_next_steps(enabled_adapters, host_pilots=host_pilots):
             print(f"  {line}")
     else:
         print("Setup completed with errors — see above. Individual `puppetmaster install-*` commands can be re-run after fixing.")
+        for line in _setup_next_steps(enabled_adapters, host_pilots=host_pilots):
+            print(f"  {line}")
     return overall_rc
 
 def _setup_next_steps(enabled_adapters: set[str], host_pilots: Optional[set[str]] = None) -> list[str]:

@@ -30,7 +30,7 @@ from puppetmaster.eval_harness import (
 
 def _case() -> EvalCase:
     verify = (
-        f'{sys.executable} -c "import calc; assert calc.add(2, 3) == 5; '
+        f'"{sys.executable}" -c "import calc; assert calc.add(2, 3) == 5; '
         'assert calc.add(-1, 1) == 0"'
     )
     return EvalCase(

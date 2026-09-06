@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -56,6 +57,31 @@ class BedrockInvokeHealthTests(unittest.TestCase):
         from puppetmaster.provider_health import ProviderHealthStore
 
         return ProviderHealthStore(self.db)
+
+    def test_initialization_closes_connection_on_success_and_schema_error(self) -> None:
+        from puppetmaster import provider_health
+
+        for schema_fails in (False, True):
+            with self.subTest(schema_fails=schema_fails):
+                store = self._store()
+                connection = store._connect()
+                schema = "INVALID SQL;" if schema_fails else provider_health._SCHEMA
+                try:
+                    with mock.patch.object(store, "_connect", return_value=connection), mock.patch.object(
+                        provider_health, "_SCHEMA", schema
+                    ):
+                        if schema_fails:
+                            with self.assertRaises(sqlite3.OperationalError):
+                                store._ensure()
+                        else:
+                            store._ensure()
+                    self.assertEqual(store._initialized, not schema_fails)
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        connection.execute("SELECT 1")
+                finally:
+                    connection.close()
+                # A failed initialization remains retryable; the schema stays usable.
+                self.assertEqual(store.dump_rows(), [])
 
     def test_stale_default_profile_presence_alone_not_auto_routable(self) -> None:
         from puppetmaster import providers

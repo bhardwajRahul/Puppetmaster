@@ -697,5 +697,418 @@ class SameTurnGateFollowUpTests(unittest.TestCase):
             self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.FAILED)
 
 
+
+class DurableCompletionTests(unittest.TestCase):
+    def _completion_fixture(self, backend, root):
+        from puppetmaster.models import AgentRun, Task, TaskStatus, now_iso
+        store = backend(root)
+        job = store.create_job("durability regression")
+        task = Task(job_id=job.id, role="explore", instruction="inspect",
+                    status=TaskStatus.QUEUED)
+        store.save_task(task)
+        task = store.claim_task(task.id, "worker-test")
+        run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
+                       worker_id="worker-test", status=TaskStatus.COMPLETE,
+                       completed_at=now_iso())
+        return store, job, task, run
+
+    def test_sqlite_intent_commits_after_recovery_scan(self):
+        from dataclasses import replace
+        from puppetmaster.models import TaskStatus
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store, job, task, run = self._completion_fixture(SQLiteSwarmStore, Path(tmp))
+            task = replace(task, lease_expires_at="2000-01-01T00:00:00+00:00")
+            store.save_task(task)
+            publisher = SQLiteSwarmStore(Path(tmp))
+            publisher.attach()
+            original = store._atomic_recover_stale
+
+            def interleaved(*args, **kwargs):
+                with mock.patch.object(publisher, "reconcile_completions"):
+                    publisher.complete_task(task, run, [], {"task_id": task.id})
+                return original(*args, **kwargs)
+
+            with mock.patch.object(store, "_atomic_recover_stale", side_effect=interleaved):
+                self.assertEqual(store.recover_stale_tasks(job.id), [])
+            self.assertIsNone(store.claim_task(task.id, "other"))
+            store.reconcile_completions(job.id)
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+            self.assertEqual(store.get_task_by_id(task.id).attempts, 1)
+
+    def test_sqlite_intent_commits_before_claim_precheck(self):
+        from dataclasses import replace
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        for boundary in ("reclaim", "max_attempts", "dependency"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as tmp:
+                store, job, task, run = self._completion_fixture(SQLiteSwarmStore, Path(tmp))
+                task = replace(task, lease_expires_at="2000-01-01T00:00:00+00:00")
+                if boundary == "max_attempts":
+                    task = replace(task, attempts=store.max_task_attempts)
+                elif boundary == "dependency":
+                    dependency = Task(job_id=job.id, role="explore", instruction="dependency",
+                                      status=TaskStatus.QUEUED)
+                    store.save_task(dependency)
+                    task = replace(task, depends_on=[dependency.id])
+                store.save_task(task)
+                publisher = SQLiteSwarmStore(Path(tmp))
+                publisher.attach()
+                with mock.patch.object(publisher, "reconcile_completions"):
+                    publisher.complete_task(task, run, [], {"task_id": task.id})
+                self.assertIsNone(store.claim_task(task.id, "other"))
+                self.assertEqual(store.get_task_by_id(task.id), task)
+                store.reconcile_completions(job.id)
+                store.reconcile_completions(job.id)
+                completed = store.get_task_by_id(task.id)
+                self.assertEqual(completed.status, TaskStatus.COMPLETE)
+                self.assertEqual(completed.attempts, task.attempts)
+                self.assertTrue(store._completion_records(job.id)[0]["done"])
+                events = store.read_events_since(job.id, 0)
+                self.assertEqual(sum(e["event"] == "worker.completed_task" for e in events), 1)
+
+    def test_sqlite_precheck_serializes_publication_before_first_mutation(self):
+        import sqlite3
+        from dataclasses import replace
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        for boundary in ("reclaim", "max_attempts", "dependency"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as tmp:
+                store, job, task, run = self._completion_fixture(SQLiteSwarmStore, Path(tmp))
+                task = replace(task, lease_expires_at="2000-01-01T00:00:00+00:00")
+                expected_status = TaskStatus.RUNNING
+                if boundary == "max_attempts":
+                    task = replace(task, attempts=store.max_task_attempts)
+                    expected_status = TaskStatus.FAILED
+                elif boundary == "dependency":
+                    dependency = Task(job_id=job.id, role="explore", instruction="dependency",
+                                      status=TaskStatus.QUEUED)
+                    store.save_task(dependency)
+                    task = replace(task, depends_on=[dependency.id])
+                    expected_status = TaskStatus.BLOCKED
+                store.save_task(task)
+                publisher = SQLiteSwarmStore(Path(tmp))
+                publisher.attach()
+                connect = publisher.connect
+
+                def no_wait_connect():
+                    connection = connect()
+                    connection.execute("PRAGMA busy_timeout = 0")
+                    return connection
+
+                pending = store._has_pending_completion
+
+                def publish_after_observation(current):
+                    observed = pending(current)
+                    self.assertFalse(observed)
+                    # Real second connection at the earliest precheck mutation
+                    # boundary. Zero busy timeout makes the lock test deterministic.
+                    with mock.patch.object(publisher, "connect", side_effect=no_wait_connect):
+                        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                            publisher.complete_task(task, run, [], {"task_id": task.id})
+                    return observed
+
+                with mock.patch.object(store, "_has_pending_completion",
+                                       side_effect=publish_after_observation) as observation:
+                    claimed = store.claim_task(task.id, "other")
+                observation.assert_called_once()
+                current = store.get_task_by_id(task.id)
+                self.assertEqual(current.status, expected_status)
+                self.assertEqual(current.attempts, task.attempts + (boundary == "reclaim"))
+                self.assertEqual(claimed is not None, boundary == "reclaim")
+                # Once the claim commits, the old execution cannot publish an
+                # accepted intent against a changed status or lease identity.
+                publisher.complete_task(task, run, [], {"task_id": task.id})
+                self.assertEqual(store._completion_records(job.id), [])
+                self.assertEqual(store.get_task_by_id(task.id), current)
+                if boundary == "max_attempts":
+                    self.assertIsNone(current.lease_owner)
+                    events = store.read_events_since(job.id, 0)
+                    self.assertEqual(sum(e["event"] == "task.max_attempts_exceeded"
+                                         for e in events), 1)
+                elif boundary == "dependency":
+                    store.save_task(replace(dependency, status=TaskStatus.COMPLETE))
+                    resumed = store.claim_task(task.id, "other")
+                    self.assertIsNotNone(resumed)
+                    self.assertEqual(resumed.attempts, task.attempts + 1)
+
+    def test_sqlite_precheck_failure_rolls_back_before_publication(self):
+        from dataclasses import replace
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store, job, task, run = self._completion_fixture(SQLiteSwarmStore, Path(tmp))
+            task = replace(task, attempts=store.max_task_attempts)
+            store.save_task(task)
+            emit = store.emit
+
+            def crash_after_save(job_id, event, payload):
+                if event == "task.max_attempts_exceeded":
+                    raise RuntimeError("precheck interrupted after save")
+                return emit(job_id, event, payload)
+
+            with mock.patch.object(store, "emit", side_effect=crash_after_save):
+                with self.assertRaisesRegex(RuntimeError, "precheck interrupted"):
+                    store.claim_task(task.id, "other")
+            self.assertEqual(store.get_task_by_id(task.id), task)
+            publisher = SQLiteSwarmStore(Path(tmp))
+            publisher.attach()
+            publisher.complete_task(task, run, [], {"task_id": task.id})
+            store.reconcile_completions(job.id)
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+            events = store.read_events_since(job.id, 0)
+            self.assertEqual(sum(e["event"] == "worker.completed_task" for e in events), 1)
+            self.assertFalse(any(e["event"] == "task.max_attempts_exceeded" for e in events))
+
+    def test_file_busy_publisher_preserves_intent_until_lock_expires(self):
+        from dataclasses import replace
+        from puppetmaster.models import TaskStatus
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        with TemporaryDirectory() as tmp:
+            store, job, task, run = self._completion_fixture(SwarmStore, Path(tmp))
+            task = replace(task, attempts=store.max_task_attempts)
+            store.save_task(task)
+            name = f"completion:{job.id}"
+            self.assertTrue(store.acquire_lock(name, "killed-publisher", ttl_seconds=300))
+            store.complete_task(task, run, [], {"task_id": task.id})
+            reopened = SwarmStore(Path(tmp))
+            reopened.save_task(replace(task, lease_expires_at="2000-01-01T00:00:00+00:00"))
+            with mock.patch("puppetmaster.worker_runtime.LocalWorker.run") as adapter:
+                self.assertEqual(reopened.recover_stale_tasks(job.id), [])
+                WorkerRuntime(reopened, job.id, task.role, "other").run_once()
+                adapter.assert_not_called()
+            self.assertFalse(reopened._completion_records(job.id)[0]["done"])
+            # Model a killed lock holder: nobody releases it; only its TTL expires.
+            lock = reopened.locks_dir / f"{reopened._safe_key(name)}.lock"
+            reopened.write_json(lock, {"owner": "killed-publisher", "at": 0})
+            reopened.recover_stale_tasks(job.id)
+            self.assertEqual(reopened.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+            self.assertTrue(reopened._completion_records(job.id)[0]["done"])
+
+    def test_file_replay_repairs_edge_after_child_file_crash(self):
+        from puppetmaster.models import GraphEdgeType, TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store, job, task, run = self._completion_fixture(SwarmStore, Path(tmp))
+            store.ensure_graph_edges(job.id)
+            artifact = Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.FINDING,
+                created_by="worker-test", confidence=0.9, evidence=["test"],
+                payload={"claim": "review", "enqueue_subtasks": [
+                    {"role": "review", "instruction": "review result"}]})
+            original = store._materialize_depends_on_edges
+
+            def crash(child):
+                if child.id != task.id:
+                    raise SystemExit("child file persisted; edge not persisted")
+                return original(child)
+
+            with mock.patch.object(store, "_materialize_depends_on_edges", side_effect=crash):
+                with self.assertRaises(SystemExit):
+                    store.complete_task(task, run, [artifact], {"task_id": task.id})
+            reopened = SwarmStore(Path(tmp))
+            reopened.max_enqueue_children_per_parent = 1
+            reopened.max_enqueue_job_tasks = 2
+            reopened.reconcile_completions(job.id)
+            children = [t for t in reopened.list_tasks(job.id) if t.id != task.id]
+            self.assertEqual(len(children), 1)
+            edges = reopened._list_edges_from_disk(job.id, edge_type=GraphEdgeType.DEPENDS_ON)
+            self.assertTrue(any(e.from_id == children[0].id and e.to_id == task.id
+                                for e in edges))
+            self.assertEqual(reopened.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+            self.assertTrue(reopened._completion_records(job.id)[0]["done"])
+
+    def test_follow_up_save_failure_is_retried_without_adapter_rerun(self):
+        from puppetmaster.models import AgentRun, Task, TaskStatus
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=backend.__name__), TemporaryDirectory() as tmp:
+                store = backend(Path(tmp) / "state")
+                job = store.create_job("durable completion")
+                task = Task(job_id=job.id, role="explore", instruction="inspect",
+                            status=TaskStatus.QUEUED)
+                store.save_task(task)
+                artifact = Artifact(
+                    job_id=job.id, task_id=task.id, type=ArtifactType.FINDING,
+                    created_by="worker-test", confidence=0.9, evidence=["test"],
+                    payload={"claim": "follow up", "enqueue_subtasks": [
+                        {"role": "review", "instruction": "review result"}]})
+                run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
+                               worker_id="worker-test", status=TaskStatus.COMPLETE)
+                runtime = WorkerRuntime(store, job.id, task.role, "worker-test")
+                with mock.patch("puppetmaster.worker_runtime.LocalWorker.run",
+                                return_value=(run, [artifact])) as adapter:
+                    with mock.patch.object(store, "enqueue_subtask", side_effect=OSError("disk")):
+                        try:
+                            runtime.run_once()
+                        except OSError:
+                            pass
+                    store.recover_stale_tasks(job.id)
+                    runtime.run_once()
+                    self.assertEqual(adapter.call_count, 1)
+                children = [t for t in store.list_tasks(job.id) if t.id != task.id]
+                self.assertEqual(len(children), 1)
+                self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+                events = [e for e in store.read_events(job.id)
+                          if e["event"] == "worker.completed_task"]
+                self.assertEqual(len(events), 1)
+
+    def test_intent_save_failure_does_not_complete_parent(self):
+        from puppetmaster.models import AgentRun, Task, TaskStatus, now_iso
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=backend.__name__), TemporaryDirectory() as tmp:
+                store = backend(Path(tmp) / "state")
+                job = store.create_job("intent failure")
+                task = Task(job_id=job.id, role="explore", instruction="inspect",
+                            status=TaskStatus.QUEUED)
+                store.save_task(task)
+                task = store.claim_task(task.id, "worker-test")
+                run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
+                               worker_id="worker-test", status=TaskStatus.COMPLETE,
+                               completed_at=now_iso())
+                with mock.patch.object(store, "_save_completion", side_effect=OSError("disk")):
+                    with self.assertRaises(OSError):
+                        store.complete_task(task, run, [], {"task_id": task.id})
+                self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.RUNNING)
+                self.assertFalse(any(e["event"] == "worker.completed_task"
+                                     for e in store.read_events(job.id)))
+                store.complete_task(task, run, [], {"task_id": task.id})
+                self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+
+    def test_completion_publication_crash_boundaries(self):
+        from dataclasses import replace
+        from puppetmaster.models import AgentRun, Task, TaskStatus, now_iso
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            for boundary in ("enqueue_subtask", "save_run", "_atomic_status_update",
+                             "emit", "_save_completion"):
+                for after in (False, True):
+                    with self.subTest(backend=backend.__name__, boundary=boundary,
+                                      after=after), TemporaryDirectory() as tmp:
+                        root = Path(tmp) / "state"
+                        store = backend(root)
+                        job = store.create_job("completion crash")
+                        task = Task(job_id=job.id, role="explore", instruction="inspect",
+                                    status=TaskStatus.QUEUED)
+                        store.save_task(task)
+                        task = store.claim_task(task.id, "worker-test")
+                        run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
+                                       worker_id="worker-test", status=TaskStatus.COMPLETE,
+                                       completed_at=now_iso())
+                        artifact = Artifact(
+                            job_id=job.id, task_id=task.id, type=ArtifactType.FINDING,
+                            created_by="worker-test", confidence=0.9, evidence=["test"],
+                            payload={"claim": "review", "enqueue_subtasks": [
+                                {"role": "review", "instruction": "review result"}]})
+                        store.save_artifact(artifact)
+                        event = {"worker_id": "worker-test", "task_id": task.id,
+                                 "role": task.role}
+                        original = getattr(store, boundary)
+
+                        def crash(*args, **kwargs):
+                            selected = True
+                            if boundary == "emit":
+                                selected = args[1] == "worker.completed_task"
+                            elif boundary == "_save_completion":
+                                selected = args[1]["done"]
+                            if selected and not after:
+                                raise SystemExit("crash")
+                            result = original(*args, **kwargs)
+                            if selected:
+                                raise SystemExit("crash")
+                            return result
+
+                        with mock.patch.object(store, boundary, side_effect=crash):
+                            with self.assertRaises(SystemExit):
+                                store.complete_task(task, run, [artifact], event)
+                        reopened = backend(root)
+                        reopened.init()
+                        # Recovery must consume durable output even with an expired lease.
+                        current = reopened.get_task_by_id(task.id)
+                        if current.status == TaskStatus.RUNNING:
+                            reopened.save_task(replace(current, lease_expires_at="2000-01-01T00:00:00+00:00"))
+                        with mock.patch("puppetmaster.worker_runtime.LocalWorker.run") as adapter:
+                            for _ in range(2):
+                                reopened.recover_stale_tasks(job.id)
+                                WorkerRuntime(reopened, job.id, task.role, "other").run_once()
+                            adapter.assert_not_called()
+                        self.assertEqual(reopened.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+                        self.assertEqual(len(reopened.list_tasks(job.id)), 2)
+                        events = [e for e in reopened.read_events(job.id)
+                                  if e["event"] == "worker.completed_task"]
+                        self.assertEqual([e["payload"] for e in events], [event])
+
+    def test_reset_invalidates_pending_completion(self):
+        from puppetmaster.models import AgentRun, Task, TaskStatus, now_iso
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=backend.__name__), TemporaryDirectory() as tmp:
+                store = backend(Path(tmp) / "state")
+                job = store.create_job("reset completion")
+                task = Task(job_id=job.id, role="explore", instruction="inspect",
+                            status=TaskStatus.QUEUED)
+                store.save_task(task)
+                claimed = store.claim_task(task.id, "worker-test")
+                run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
+                               worker_id="worker-test", status=TaskStatus.COMPLETE,
+                               completed_at=now_iso())
+                with mock.patch.object(store, "reconcile_completions", side_effect=OSError("crash")):
+                    with self.assertRaises(OSError):
+                        store.complete_task(claimed, run, [], {"task_id": task.id})
+                # Expire the lease so the ordinary reset fence permits a reset.
+                from dataclasses import replace
+                store.save_task(replace(claimed, lease_expires_at="2000-01-01T00:00:00+00:00"))
+                store.reset_subgraph(job.id, [task.id])
+                store.reconcile_completions(job.id)
+                self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.QUEUED)
+                self.assertFalse(any(e["event"] == "worker.completed_task"
+                                     for e in store.read_events(job.id)))
+
+    def test_concurrent_replay_publishes_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from puppetmaster.models import AgentRun, Task, TaskStatus, now_iso
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp) / "state"
+                store = backend(root)
+                job = store.create_job("concurrent completion")
+                task = Task(job_id=job.id, role="explore", instruction="inspect",
+                            status=TaskStatus.QUEUED)
+                store.save_task(task)
+                task = store.claim_task(task.id, "worker-test")
+                run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
+                               worker_id="worker-test", status=TaskStatus.COMPLETE,
+                               completed_at=now_iso())
+                artifact = Artifact(
+                    job_id=job.id, task_id=task.id, type=ArtifactType.FINDING,
+                    created_by="worker-test", confidence=0.9, evidence=["test"],
+                    payload={"claim": "review", "enqueue_subtasks": [
+                        {"role": "review", "instruction": "review result"}]})
+                with mock.patch.object(store, "reconcile_completions", side_effect=OSError("crash")):
+                    with self.assertRaises(OSError):
+                        store.complete_task(task, run, [artifact], {"task_id": task.id})
+
+                def recover(_):
+                    reader = backend(root)
+                    reader.init()
+                    reader.reconcile_completions(job.id)
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    list(pool.map(recover, range(2)))
+                self.assertEqual(len(store.list_tasks(job.id)), 2)
+                self.assertEqual(len([e for e in store.read_events(job.id)
+                                      if e["event"] == "worker.completed_task"]), 1)
+
 if __name__ == "__main__":
     unittest.main()

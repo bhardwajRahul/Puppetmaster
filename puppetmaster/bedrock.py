@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional
 
+from puppetmaster.invocation import check_external_dispatch
+
 
 _MISSING_CREDS_MSG = (
     "AWS Bedrock credentials not found — set AWS_PROFILE (or use the default "
@@ -632,6 +634,7 @@ def _post_bedrock(
         method="POST",
     )
     try:
+        check_external_dispatch()
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
@@ -668,6 +671,7 @@ def _get_bedrock(
 
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
+        check_external_dispatch()
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
@@ -866,6 +870,7 @@ def _assistant_turn_from_anthropic(data: dict):
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=str(data.get("stop_reason") or ""),
+        accounting_usage=usage,
         usage={
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -919,6 +924,7 @@ def _assistant_turn_from_converse(data: dict):
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=str(data.get("stopReason") or data.get("stop_reason") or ""),
+        accounting_usage=usage,
         usage={
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -1118,6 +1124,7 @@ def _open_bedrock_event_stream(
         method="POST",
     )
     try:
+        check_external_dispatch()
         return urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
         err_body = ""
@@ -1203,6 +1210,7 @@ def _assistant_turn_from_converse_stream(
 ):
     """Fold ConverseStream events into an ``AssistantTurn``, firing deltas live."""
     blocks: dict[int, dict] = {}
+    complete = False
     stop_reason = ""
     usage: dict = {}
     raw_events: list[dict] = []
@@ -1255,6 +1263,7 @@ def _assistant_turn_from_converse_stream(
                 )
             continue
         if "messageStop" in event:
+            complete = True
             stop_reason = str(
                 (event.get("messageStop") or {}).get("stopReason") or stop_reason
             )
@@ -1292,7 +1301,9 @@ def _assistant_turn_from_converse_stream(
         "usage": usage,
         "streamEvents": raw_events,
     }
-    return _assistant_turn_from_converse(data)
+    turn = _assistant_turn_from_converse(data)
+    turn.accounting_complete = complete
+    return turn
 
 
 def _note_bedrock_invoke_outcome(

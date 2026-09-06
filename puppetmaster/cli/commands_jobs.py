@@ -87,6 +87,7 @@ def read_job_state(store, job_id: str, *, timed_out: bool = False) -> dict:
         "terminal": is_terminal_job_status(job.status),
         "timed_out": bool(timed_out),
         "completed_at": job.completed_at,
+        "budget_policy": dataclasses.asdict(job.budget_policy) if job.budget_policy else None,
         "job_ref": {
             "job_id": job_id,
             "state_id": state_identity(getattr(store, "root", Path.cwd())),
@@ -291,6 +292,7 @@ def _run_wait_command(args, store) -> int:
         "terminal": terminal,
         "timed_out": timed_out,
         "completed_at": job.completed_at,
+        "budget_policy": dataclasses.asdict(job.budget_policy) if job.budget_policy else None,
         "delivery": store.status_snapshot(args.job_id, compact=True).get("delivery"),
     }
     if args.json:

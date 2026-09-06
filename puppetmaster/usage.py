@@ -47,30 +47,23 @@ def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, int]]:
     if not isinstance(sdk_usage, dict):
         return None
     # Accept the common key spellings across SDKs without inventing data.
-    tokens_in = (
-        _coerce_int(sdk_usage.get("inputTokens"))
-        or _coerce_int(sdk_usage.get("input_tokens"))
-        or _coerce_int(sdk_usage.get("promptTokens"))
-        or _coerce_int(sdk_usage.get("prompt_tokens"))
-    )
-    tokens_out = (
-        _coerce_int(sdk_usage.get("outputTokens"))
-        or _coerce_int(sdk_usage.get("output_tokens"))
-        or _coerce_int(sdk_usage.get("completionTokens"))
-        or _coerce_int(sdk_usage.get("completion_tokens"))
-    )
+    def first_count(*keys: str) -> Optional[int]:
+        for key in keys:
+            value = _coerce_int(sdk_usage.get(key))
+            if value is not None:
+                return value
+        return None
+
+    tokens_in = first_count("inputTokens", "input_tokens", "promptTokens", "prompt_tokens")
+    tokens_out = first_count("outputTokens", "output_tokens", "completionTokens", "completion_tokens")
     if tokens_in is None and tokens_out is None:
         return None
     result = {"tokens_in": tokens_in or 0, "tokens_out": tokens_out or 0}
     # Cursor's turn-ended usage also splits out cache read/write tokens. They're
     # priced differently from fresh input, so preserve them for the cost axis
     # instead of folding them into tokens_in (which would lie about pricing).
-    cache_read = _coerce_int(sdk_usage.get("cacheReadTokens")) or _coerce_int(
-        sdk_usage.get("cache_read_tokens")
-    )
-    cache_write = _coerce_int(sdk_usage.get("cacheWriteTokens")) or _coerce_int(
-        sdk_usage.get("cache_write_tokens")
-    )
+    cache_read = first_count("cacheReadTokens", "cache_read_tokens")
+    cache_write = first_count("cacheWriteTokens", "cache_write_tokens")
     if cache_read is not None:
         result["cache_read_tokens"] = cache_read
     if cache_write is not None:
@@ -169,6 +162,11 @@ def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
             "tokens_estimated": bool(payload.get("tokens_estimated")),
             "model": payload.get("model"),
         }
+        # Presence distinguishes SDK split (exclusive input) from legacy
+        # tokens_cached (a subset of input). Do not synthesize absent keys.
+        for key in ("cache_read_tokens", "cache_write_tokens"):
+            if key in payload:
+                records[task_id][key] = int(payload.get(key) or 0)
     return records
 
 
@@ -177,20 +175,28 @@ def aggregate_token_usage(artifacts: Iterable[Artifact]) -> dict[str, Any]:
 
     Splits measured from estimated so the surfaced number is honest. A task
     contributes once, preferring the successful fallback run over a failed
-    first attempt that also stamped tokens.
+    first attempt that also stamped tokens. total_tokens is input + output +
+    split cache reads + split cache writes across measured and estimated runs.
+    Input/output fields retain their original counts; legacy tokens_cached is
+    inclusive of input and is never added again.
     """
     measured_in = measured_out = 0
     estimated_in = estimated_out = 0
     measured_runs = estimated_runs = 0
+    measured_read = measured_write = estimated_read = estimated_write = 0
 
     for record in select_usage_records(artifacts).values():
         tin = record["tokens_in"]
         tout = record["tokens_out"]
         if record["tokens_estimated"]:
+            estimated_read += record.get("cache_read_tokens", 0)
+            estimated_write += record.get("cache_write_tokens", 0)
             estimated_in += tin
             estimated_out += tout
             estimated_runs += 1
         else:
+            measured_read += record.get("cache_read_tokens", 0)
+            measured_write += record.get("cache_write_tokens", 0)
             measured_in += tin
             measured_out += tout
             measured_runs += 1
@@ -202,5 +208,12 @@ def aggregate_token_usage(artifacts: Iterable[Artifact]) -> dict[str, Any]:
         "estimated_runs": estimated_runs,
         "estimated_tokens_in": estimated_in,
         "estimated_tokens_out": estimated_out,
-        "total_tokens": measured_in + measured_out + estimated_in + estimated_out,
+        "measured_cache_read_tokens": measured_read,
+        "measured_cache_write_tokens": measured_write,
+        "estimated_cache_read_tokens": estimated_read,
+        "estimated_cache_write_tokens": estimated_write,
+        "total_tokens": (
+            measured_in + measured_out + estimated_in + estimated_out
+            + measured_read + measured_write + estimated_read + estimated_write
+        ),
     }

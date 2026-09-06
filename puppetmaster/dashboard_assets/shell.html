@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Puppetmaster</title>
+<style>
+{{TOKENS_CSS}}
+{{DASHBOARD_CSS}}
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <aside class="rail" aria-label="Workspace navigation">
+    <a class="wordmark" href="?view=jobs" aria-label="Puppetmaster jobs">
+      <span class="wordmark-text"><span>Puppet</span><b>master</b></span>
+      <span class="wordmark-rule" aria-hidden="true"></span>
+    </a>
+    <nav class="rail-nav">
+      <a class="nav-item active" href="?view=jobs">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5.5h16v5H4zM4 13.5h16v5H4z"/></svg>
+        <span>Runs</span>
+      </a>
+    </nav>
+    <div class="workspace-block">
+      <span class="eyebrow">Workspace</span>
+      <span class="workspace-name" id="project">Local state</span>
+    </div>
+  </aside>
+  <div class="app-frame">
+    <header class="topbar">
+      <div class="breadcrumb" id="breadcrumb"><span>Runs</span></div>
+      <div class="connection" id="connection" data-state="connecting" aria-live="polite">
+        <span class="connection-dot" aria-hidden="true"></span><span id="connection-label">Connecting</span>
+      </div>
+      <button class="icon-button" id="refresh" type="button" aria-label="Refresh dashboard" title="Refresh">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M19 8V4l-2 2a8 8 0 1 0 2.3 8M19 4h-4"/></svg>
+      </button>
+    </header>
+    <main id="main">
+      <div id="notice"></div>
+      <div id="content" aria-live="off">
+        <section class="loading-state" aria-label="Loading runs">
+          <div class="skeleton wide"></div><div class="skeleton"></div><div class="skeleton"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+</div>
+<script>
+{{RENDERER_JS}}
+{{DASHBOARD_JS}}
+</script>
+</body>
+</html>

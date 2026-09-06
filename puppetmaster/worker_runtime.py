@@ -51,6 +51,7 @@ class WorkerRuntime:
         return max(0.01, min(configured, max(0.1, self.lease_seconds / 3)))
 
     def run_once(self) -> bool:
+        self.store.reconcile_completions(self.job_id)
         task = self.store.claim_next_task(
             self.job_id,
             self.worker_id,
@@ -189,12 +190,15 @@ class WorkerRuntime:
                     reused = []
 
             if not reused:
-                worker_run, artifacts = LocalWorker(
-                    task.role, worker_id=self.worker_id
-                ).run(
-                    task,
-                    self.store.get_job(self.job_id).goal,
-                )
+                from puppetmaster.invocation import execution_scope
+
+                with execution_scope(self.store, run, task, lease_lost=self._lease_lost.is_set):
+                    worker_run, artifacts = LocalWorker(
+                        task.role, worker_id=self.worker_id
+                    ).run(
+                        task,
+                        self.store.get_job(self.job_id).goal,
+                    )
                 if self._lease_lost.is_set():
                     self.store.emit(
                         self.job_id,
@@ -246,6 +250,10 @@ class WorkerRuntime:
                 except Exception:
                     pass
         except Exception as exc:
+            if self._lease_lost.is_set():
+                # A successor owns task completion. Invocation liability remains
+                # durable, but this worker must not overwrite the successor.
+                return True
             failed_run = replace(
                 run,
                 status=TaskStatus.FAILED,
@@ -332,30 +340,14 @@ class WorkerRuntime:
             self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
             return True
 
-        for artifact in artifacts:
-            try:
-                self.store.maybe_enqueue_follow_ups_from_artifact(
-                    artifact,
-                    parent_task_id=task.id,
-                    created_by=self.worker_id,
-                    cwd=(task.payload or {}).get("cwd"),
-                )
-            except Exception:
-                pass
-
         completed_run = replace(
             run,
             status=TaskStatus.COMPLETE,
             heartbeat_at=now_iso(),
             completed_at=now_iso(),
         )
-        self.store.save_run(completed_run)
-        updated = self.store.update_task_status(
-            task, TaskStatus.COMPLETE, worker_id=self.worker_id
-        )
-        self.store.emit(
-            self.job_id,
-            "worker.completed_task",
+        updated = self.store.complete_task(
+            task, completed_run, [] if reused else artifacts,
             {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
         )
         self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
