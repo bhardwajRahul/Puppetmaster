@@ -398,6 +398,26 @@ class IncarnationHistoryTests(unittest.TestCase):
             self.assertIn('store replaced', result.stderr)
             self.assertEqual(replacement.incarnation, identity)
 
+    def test_concurrent_prepare_launch_ensures_current_schema_once(self):
+        from puppetmaster.identity import prepare_launch
+
+        original = SQLiteSwarmStore._execute_schema_script
+        schema_ensures = []
+
+        def counted(connection, script):
+            schema_ensures.append(root)
+            return original(connection, script)
+
+        with TemporaryDirectory() as tmp, patch.object(
+            SQLiteSwarmStore, '_execute_schema_script', new=staticmethod(counted)
+        ):
+            root = Path(tmp) / 'state'
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                incarnations = list(pool.map(lambda _: prepare_launch(root, 'sqlite'), range(16)))
+
+        self.assertEqual(len(set(incarnations)), 1)
+        self.assertEqual(schema_ensures, [root])
+
     def test_completion_requires_explicit_incarnation(self):
         for store, job in self.stores():
             task = Task(job_id=job.id, role='explore', instruction='private')
