@@ -33,11 +33,12 @@ from puppetmaster.workers import LocalWorker
 
 
 def _attach_claim_complete_worker(
-    state_dir: str, job_id: str, worker_id: str, error_path: str
+    state_dir: str, job_id: str, worker_id: str, error_path: str, diagnostic_path: str
 ) -> None:
     """Spawn-safe worker body: attach only, then claim/complete local tasks."""
     error_file = Path(error_path).open("w", encoding="utf-8")
-    faulthandler.dump_traceback_later(45, file=error_file)
+    diagnostic_file = Path(diagnostic_path).open("w", encoding="utf-8")
+    faulthandler.dump_traceback_later(45, file=diagnostic_file)
     thread_errors: list[str] = []
     previous_hook = threading.excepthook
     threading.excepthook = lambda args: thread_errors.append(
@@ -64,8 +65,10 @@ def _attach_claim_complete_worker(
         if thread_errors:
             error_file.write("\n".join(thread_errors))
         error_file.close()
+        diagnostic_file.close()
         if Path(error_path).stat().st_size == 0:
             Path(error_path).unlink()
+        Path(diagnostic_path).unlink(missing_ok=True)
 
 
 class SqliteAttachEnsureTests(unittest.TestCase):
@@ -798,6 +801,7 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
             processes = []
             for index in range(worker_count):
                 error_path = error_dir / f"w-{index}.txt"
+                diagnostic_path = error_dir / f"w-{index}.dump.txt"
                 process = ctx.Process(
                     target=_attach_claim_complete_worker,
                     args=(
@@ -805,26 +809,30 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
                         job.id,
                         f"w-{index}",
                         str(error_path),
+                        str(diagnostic_path),
                     ),
                 )
-                processes.append((process, error_path))
+                processes.append((process, error_path, diagnostic_path))
                 process.start()
 
             errors: list[str] = []
             deadline = time.monotonic() + 60
-            for process, error_path in processes:
+            for process, error_path, _ in processes:
                 process.join(timeout=max(0, deadline - time.monotonic()))
-            timed_out = [(process, error_path) for process, error_path in processes
+            timed_out = [(process, error_path, diagnostic_path)
+                         for process, error_path, diagnostic_path in processes
                          if process.is_alive()]
-            for process, _ in timed_out:
+            for process, _, _ in timed_out:
                 process.terminate()
-            for process, error_path in timed_out:
+            for process, error_path, diagnostic_path in timed_out:
                 process.join(timeout=5)
                 errors.append(f"timeout:{error_path.name}")
+                if diagnostic_path.is_file():
+                    errors.append(diagnostic_path.read_text(encoding="utf-8"))
                 if process.is_alive():
                     process.kill()
                     process.join(timeout=5)
-            for process, error_path in processes:
+            for process, error_path, _ in processes:
                 if process.exitcode not in (0, None):
                     errors.append(f"exit:{error_path.name}={process.exitcode}")
                 if error_path.is_file():
