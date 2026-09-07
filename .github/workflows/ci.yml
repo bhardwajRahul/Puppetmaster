@@ -41,12 +41,7 @@ jobs:
       - name: Smoke check Cursor runner syntax
         run: npm run smoke:cursor-runner
       - name: Run Python tests
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            python -m unittest -v tests.test_sqlite_concurrency.SqliteMultiprocessAttachTests.test_supervisor_ensure_then_n_workers_attach_claim_complete
-          else
-            python -m unittest discover -s tests -v
-          fi
+        run: python -m unittest discover -s tests -v
       - name: Smoke check CLI metadata
         run: |
           python -m puppetmaster --help
