@@ -30,6 +30,14 @@ def _assert_prefixed_run_id(test: unittest.TestCase, run_id: str, prefix: str) -
     test.assertRegex(entropy, r"^[0-9a-f]{8}$")
 
 
+from puppetmaster.identity import make_ref
+
+
+def _test_reference(root, job_id, *, expected_incarnation=None, launch_binding=False):
+    assert launch_binding is True
+    return make_ref(root, job_id, "00000000-0000-4000-8000-000000000001")
+
+
 class NewRunIdConcurrencyTests(unittest.TestCase):
     def test_new_run_id_unique_when_time_and_pid_frozen(self) -> None:
         with patch("puppetmaster.run_id.time.time", return_value=FROZEN_MS / 1000.0), patch(
@@ -209,6 +217,7 @@ class NewRunIdConcurrencyTests(unittest.TestCase):
 
 
 class StartCliLogIsolationTests(unittest.TestCase):
+    @patch("puppetmaster.identity.reference_at", new=_test_reference)
     def test_start_cli_concurrent_launches_do_not_share_log_paths(self) -> None:
         def fake_popen(*_args, **_kwargs):
             process = MagicMock()
@@ -307,6 +316,7 @@ class CodegraphIndexLogIsolationTests(unittest.TestCase):
 
 
 class SwarmLaunchLogIsolationTests(unittest.TestCase):
+    @patch("puppetmaster.identity.reference_at", new=_test_reference)
     def test_detach_analysis_swarm_concurrent_log_paths(self) -> None:
         def fake_popen(*_args, **_kwargs):
             process = MagicMock()

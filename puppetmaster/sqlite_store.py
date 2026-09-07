@@ -95,7 +95,7 @@ class SQLiteSwarmStore(SwarmStore):
     """SQLite-backed coordination store for multi-process worker coordination."""
 
     backend_name = "sqlite"
-    schema_version = 5
+    schema_version = 7
     busy_timeout_ms = _SQLITE_BUSY_TIMEOUT_MS
     synchronous_policy = _SQLITE_SYNCHRONOUS
 
@@ -104,6 +104,7 @@ class SQLiteSwarmStore(SwarmStore):
         self.db_path = self.root / "state.sqlite3"
         # Schema DDL is supervisor-only (ensure_schema / init). Workers attach
         # and never CREATE/INSERT metadata. Both flags are per-process.
+        self._incarnation = None
         self._initialized = False
         self._attached = False
         self._open_mode = "deferred"
@@ -214,6 +215,8 @@ class SQLiteSwarmStore(SwarmStore):
             self._migrate_schema(connection)
         chmod_private_file(self.db_path)
         self._initialized = True
+        from puppetmaster.readonly import selection
+        self._read_selection = selection(self)
         self._attached = True
         from puppetmaster.host_lifecycle import record_host_start
 
@@ -237,19 +240,42 @@ class SQLiteSwarmStore(SwarmStore):
             # on attach() and fail closed instead of racing DDL.
             self.ensure_schema()
             return
-        connection = self._connect_with_lock_retry()
-        try:
-            self._assert_schema(connection)
-        finally:
-            connection.close()
+        for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
+            connection = None
+            try:
+                connection = self._connect_readonly(attach_binding=True)
+                self._assert_schema(connection)
+                from puppetmaster.identity import read_identity, StoreIdentityError
+                version = connection.execute("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key='schema_version'").fetchone()[0]
+                self._legacy_schema = str(version) != str(self.schema_version)
+                incarnation = read_identity(connection, "sqlite") if str(version) != "5" else None
+                if self._incarnation is not None and self._incarnation != incarnation:
+                    raise StoreIdentityError("store replaced since reference binding")
+                self._incarnation = incarnation
+                break
+            except sqlite3.OperationalError as exc:
+                from puppetmaster.readonly import ReadUnavailable
+                locked = _is_sqlite_lock_error(exc)
+                if not locked and not isinstance(exc, ReadUnavailable):
+                    raise
+                if locked:
+                    self._record_lock_error()
+                if attempt + 1 == _SQLITE_LOCK_RETRY_ATTEMPTS:
+                    raise
+                self._sleep_lock_backoff(attempt)
+            finally:
+                if connection is not None:
+                    connection.close()
         self._attached = True
 
     def _assert_schema(self, connection: sqlite3.Connection) -> None:
         try:
             row = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
+                "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
         except sqlite3.OperationalError as exc:
+            if _is_sqlite_lock_error(exc):
+                raise
             raise SqliteSchemaError(
                 f"SQLite store schema is missing at {self.db_path}: {exc}"
             ) from exc
@@ -276,7 +302,7 @@ class SQLiteSwarmStore(SwarmStore):
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
             ).fetchone() is None:
                 raise SqliteSchemaError(f"SQLite {table} missing; supervisor must migrate")
-        if current != self.schema_version:
+        if current not in (5, 6, self.schema_version):
             raise SqliteSchemaError(
                 f"SQLite store schema_version {current} does not match "
                 f"{self.schema_version} at {self.db_path}"
@@ -298,7 +324,7 @@ class SQLiteSwarmStore(SwarmStore):
         """Upgrade older state.sqlite3 files to the current schema_version."""
         self._reserve_writer(connection)
         row = connection.execute(
-            "SELECT value FROM metadata WHERE key = 'schema_version'"
+            "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
         try:
             current = int(row["value"]) if row is not None else 0
@@ -368,10 +394,14 @@ class SQLiteSwarmStore(SwarmStore):
                 (str(self.schema_version),),
             )
 
+        from puppetmaster.identity import bootstrap
+        self._incarnation = bootstrap(connection, "sqlite", legacy=current < 6)
         # Generated SQL can be stale even when the table shape/version is current.
         from puppetmaster.projections import install_source_triggers
         install_source_triggers(connection)
-        if current < 5:
+        from puppetmaster.history_metadata import install_source_triggers as install_history
+        install_history(connection)
+        if current < 7:
             connection.execute("UPDATE metadata SET value=? WHERE key='schema_version'",
                                (str(self.schema_version),))
 
@@ -570,9 +600,13 @@ class SQLiteSwarmStore(SwarmStore):
         if active is not None:
             yield active
             return
-        connection = self._connect_with_lock_retry()
+        connection = self._connect_readonly() if getattr(self, "_legacy_schema", False) else self._connect_with_lock_retry()
         try:
             with connection:
+                if self._incarnation is not None:
+                    from puppetmaster.identity import read_identity, StoreIdentityError
+                    if read_identity(connection, "sqlite") != self._incarnation:
+                        raise StoreIdentityError("store replaced since attach; explicitly reopen and rebind")
                 yield connection
         except sqlite3.OperationalError as exc:
             if _is_sqlite_lock_error(exc):
@@ -2086,12 +2120,12 @@ class SQLiteSwarmStore(SwarmStore):
             job_dir.rmdir()
 
     def schema_status(self) -> dict[str, str]:
-        self._ensure_attached()
-        with self._session() as connection:
+        from contextlib import closing
+        with closing(self._connect_readonly()) as connection:
             row = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
+                "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            journal = connection.execute("PRAGMA journal_mode").fetchone()
+            journal = (connection.source_journal_mode,)
             busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()
             foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
             synchronous = connection.execute("PRAGMA synchronous").fetchone()
@@ -2170,15 +2204,11 @@ class SQLiteSwarmStore(SwarmStore):
             "check_kind": "quick_check",
         }
 
-    def _connect_readonly(self) -> sqlite3.Connection:
+    def _connect_readonly(self, *, attach_binding=False) -> sqlite3.Connection:
         """Open the DB read-only without applying write-side durability PRAGMAs."""
-        uri = self.db_path.resolve().as_uri() + "?mode=ro"
-        connection = sqlite3.connect(
-            uri, uri=True, timeout=self.busy_timeout_ms / 1000.0
-        )
+        from puppetmaster.readonly import connect
+        connection = connect(self, timeout=self.busy_timeout_ms / 1000.0, attach_binding=attach_binding)
         try:
-            connection.row_factory = sqlite3.Row
-            # busy_timeout is connection-local and read-safe; keeps the probe bounded.
             connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         except Exception:
             connection.close()

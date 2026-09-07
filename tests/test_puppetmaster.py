@@ -3744,7 +3744,7 @@ class PuppetmasterTests(unittest.TestCase):
                 ) as popen:
                     result = call_tool(
                         "puppetmaster_codegraph_init",
-                        {"cwd": tmp, "index": True},
+                        {"cwd": tmp, "state_dir": tmp, "index": True},
                     )
             finally:
                 del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
@@ -3785,7 +3785,7 @@ class PuppetmasterTests(unittest.TestCase):
                     "puppetmaster.mcp_server.subprocess.Popen",
                     return_value=fake_proc,
                 ) as popen:
-                    result = call_tool("puppetmaster_codegraph_index", {"cwd": tmp})
+                    result = call_tool("puppetmaster_codegraph_index", {"cwd": tmp, "state_dir": tmp})
             finally:
                 del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
 
@@ -5045,6 +5045,11 @@ class PuppetmasterTests(unittest.TestCase):
         observed: dict = {}
 
         class _FakeStore:
+            def job_ref(self, job_id):
+                from puppetmaster.models import JobRef
+                return JobRef(job_id, "test-state", version=2,
+                              incarnation="00000000-0000-4000-8000-000000000001")
+
             def get_job(self, job_id):
                 return Job(id=job_id, goal="running follow", status=JobStatus.RUNNING)
 
@@ -8814,8 +8819,8 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             status = store.schema_status()
             checks = {check.name: check for check in run_doctor(root, root / ".puppetmaster")}
 
-            self.assertEqual(status["schema_version"], "5")
-            self.assertEqual(status["expected_schema_version"], "5")
+            self.assertEqual(status["schema_version"], "7")
+            self.assertEqual(status["expected_schema_version"], "7")
             self.assertEqual(checks["sqlite-state"].status, "ok")
 
     def test_cli_last_and_clean_support_daily_run_management(self) -> None:
@@ -11710,11 +11715,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "long audit",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                     "timeout_seconds": 600,
@@ -11768,11 +11774,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "quick audit",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                 }
@@ -11949,11 +11956,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "fresh swarm",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                 }
@@ -11970,11 +11978,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "memory swarm",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                     "disable_memory": False,
@@ -20576,10 +20585,10 @@ class PlatformLockTests(unittest.TestCase):
         from puppetmaster import mcp_server
         from puppetmaster import platform_lock as pl
 
-        with patch.dict(os.environ, {pl.ONLY_ENV: "cursor"}), patch.object(
+        with TemporaryDirectory() as state_dir, patch.dict(os.environ, {pl.ONLY_ENV: "cursor"}), patch.object(
             mcp_server, "start_cli", return_value={"ok": True}
         ) as spawn:
-            result = mcp_server.start_cursor_swarm({"goal": "audit the repo"})
+            result = mcp_server.start_cursor_swarm({"goal": "audit the repo", "state_dir": state_dir})
         self.assertEqual(result, {"ok": True})
         spawn.assert_called_once()
 
@@ -29116,12 +29125,13 @@ class JobLabelTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "fresh swarm",
                     "label": "auth review",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                 }

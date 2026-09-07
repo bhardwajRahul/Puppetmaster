@@ -62,7 +62,6 @@ from puppetmaster.state import (
     find_state_dir_for_job,
     list_project_state_dirs,
     resolve_state_dir,
-    state_identity,
 )
 from puppetmaster.store_factory import create_store
 from puppetmaster.stitcher import Stitcher
@@ -88,10 +87,7 @@ def read_job_state(store, job_id: str, *, timed_out: bool = False) -> dict:
         "timed_out": bool(timed_out),
         "completed_at": job.completed_at,
         "budget_policy": dataclasses.asdict(job.budget_policy) if job.budget_policy else None,
-        "job_ref": {
-            "job_id": job_id,
-            "state_id": state_identity(getattr(store, "root", Path.cwd())),
-        },
+        "job_ref": (getattr(store, "_legacy_read_ref", None) or store.job_ref(job_id)).as_dict(),
         "delivery": snapshot.get("delivery"),
         "progress": snapshot.get("progress"),
     }
@@ -339,3 +335,19 @@ def _run_await_command(args, store) -> int:
     if state["timed_out"]:
         return 1
     return 0 if (state.get("delivery") or {}).get("successful", False) else 1
+
+
+def cmd_bounded_metadata(args, store, reference):
+    from puppetmaster.models import to_jsonable
+    if args.command == 'selected-economics':
+        result = store.get_selected_economics(reference, expected_summary_revision=args.expected_summary_revision)
+    else:
+        kwargs = {name: getattr(args, name) for name in
+                  ('cursor', 'limit', 'max_scan', 'max_bytes', 'status', 'origin', 'project_id', 'session_id')}
+        kwargs['job_ref'] = reference
+        if args.command == 'job-summary-changes':
+            result = store.read_job_summary_changes(after_revision=args.after_revision, **kwargs)
+        else:
+            result = store.list_job_summaries(**kwargs)
+    print(json.dumps(to_jsonable(result), ensure_ascii=True, separators=(',', ':')))
+    return 0

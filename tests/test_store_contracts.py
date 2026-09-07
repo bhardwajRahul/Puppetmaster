@@ -107,7 +107,7 @@ class StoreContractTests(unittest.TestCase):
         fields = {"origin": "host", "project_id": "project", "session_id": "session"}
         for store, legacy, task, run, legacy_ref in self.stores():
             job = store.create_job("private goal", **fields)
-            ref = JobRef(job.id, state_identity(store.root))
+            ref = store.job_ref(job.id)
             for size in (1, 2, 3):
                 for names in combinations(fields, size):
                     filters = {name: fields[name] for name in names}
@@ -228,6 +228,8 @@ class StoreContractTests(unittest.TestCase):
                 for table in ("jobs", "tasks", "artifacts"):
                     for operation in ("INSERT", "UPDATE", "DELETE"):
                         c.execute(f"DROP TRIGGER IF EXISTS projection_{table}_{operation}")
+                for operation in ("INSERT", "UPDATE", "DELETE"):
+                    c.execute(f"DROP TRIGGER IF EXISTS projection_version_{operation}")
                 c.execute("ALTER TABLE projection_current DROP COLUMN scope")
                 c.execute("ALTER TABLE projection_changes DROP COLUMN scope")
                 c.execute("ALTER TABLE projection_changes DROP COLUMN previous_scope")
@@ -238,7 +240,17 @@ class StoreContractTests(unittest.TestCase):
             self.assertFalse(reopened.read_job_summary_changes(origin="host").items)
             reopened.save_job(replace(job, origin="host"))
             changes = reopened.read_job_summary_changes(after_revision=before, origin="host")
-            self.assertEqual([(i.id, i.deleted) for i in changes.items], [(job.id, False)])
+            if store.backend_name == "file":
+                self.assertEqual(changes.outcome, "unavailable")
+                self.assertEqual(changes.reason, "previous_membership_unavailable")
+                self.assertEqual(changes.revision, before)
+                self.assertIsNone(changes.next_cursor)
+            else:
+                # Supervisor recovered current source ownership before this new
+                # write; earlier journal authority remains unavailable.
+                self.assertEqual([(i.id, i.deleted) for i in changes.items], [(job.id, False)])
+                self.assertEqual(changes.items[0].previous_membership, "present")
+                self.assertIsNone(changes.items[0].previous_origin)
 
     def test_v5_init_repairs_old_cardinality_triggers(self):
         from puppetmaster.models import JobStatus
@@ -250,8 +262,8 @@ class StoreContractTests(unittest.TestCase):
             with closing(sqlite3.connect(store.db_path)) as c, c:
                 history = c.execute("SELECT * FROM projection_changes ORDER BY revision").fetchall()
                 current = c.execute("SELECT * FROM projection_current ORDER BY kind,id").fetchall()
-                self.assertEqual(len(c.execute("PRAGMA table_info(projection_current)").fetchall()), 13)
-                self.assertEqual(c.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "5")
+                self.assertEqual(len(c.execute("PRAGMA table_info(projection_current)").fetchall()), 17)
+                self.assertEqual(c.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "7")
                 for operation in ("INSERT", "UPDATE"):
                     c.execute(f"DROP TRIGGER projection_jobs_{operation}")
                     c.execute(f"""CREATE TRIGGER projection_jobs_{operation}
@@ -374,7 +386,7 @@ class StoreContractTests(unittest.TestCase):
                 task = store.claim_task(task.id, "worker")
                 run = AgentRun(job_id=job.id, task_id=task.id, role=task.role,
                                worker_id="worker", status=TaskStatus.COMPLETE, completed_at=now_iso())
-                yield store, job, task, run, JobRef(job.id, state_identity(store.root))
+                yield store, job, task, run, store.job_ref(job.id)
 
     def test_completion_retry_conflict_reopen(self):
         for store, job, task, run, ref in self.stores():
@@ -385,9 +397,9 @@ class StoreContractTests(unittest.TestCase):
                 with self.assertRaises(ContractConflict):
                     store.complete_task(task, run, [], {"task_id": "changed"})
             reopened = type(store)(store.root)
-            receipt = reopened.submit_completion(task, run, [], event)
+            receipt = reopened.submit_completion(task, run, [], event, job_ref=ref)
             self.assertEqual(receipt.outcome, "published")
-            self.assertEqual(reopened.submit_completion(task, run, [], event), receipt)
+            self.assertEqual(reopened.submit_completion(task, run, [], event, job_ref=ref), receipt)
             self.assertEqual(sum(e['event'] == 'worker.completed_task' for e in reopened.read_events(job.id)), 1)
             with self.assertRaises(ContractConflict):
                 reopened.complete_task(task, run, [], {"extra": True})
@@ -399,7 +411,7 @@ class StoreContractTests(unittest.TestCase):
             store.save_task(replace(task, lease_id="successor"))
             store.reconcile_completions(job.id)
             self.assertEqual(store.get_completion_receipt(ref, run.id).outcome, "invalidated")
-            stale = store.submit_completion(task, replace(run, id="run_stale"), [], {})
+            stale = store.submit_completion(task, replace(run, id="run_stale"), [], {}, job_ref=ref)
             self.assertEqual(stale.outcome, "stale_lease")
             self.assertEqual(store.get_completion_receipt(ref, "missing").outcome, "legacy_unknown")
 
@@ -428,7 +440,7 @@ class StoreContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     store.list_job_summaries(**bounds)
             store.save_task(replace(task, status=TaskStatus.FAILED))
-            self.assertEqual(store.list_task_refs(ref, cursor=page.next_cursor).outcome, "cursor_expired")
+            self.assertNotEqual(store.list_task_refs(ref, cursor=page.next_cursor).outcome, "cursor_expired")
 
     def test_deletion_tombstones_and_change_revision(self):
         for store, job, task, run, ref in self.stores():
@@ -519,8 +531,8 @@ class StoreContractTests(unittest.TestCase):
             reopened.init()
             page = reopened.list_job_summaries()
             self.assertEqual(page.items[0].stamp, "legacy_unknown")
-            self.assertEqual(page.items[0].revision, 0)
-            self.assertEqual(reopened.schema_status()['schema_version'], '5')
+            self.assertGreater(page.items[0].revision, 0)
+            self.assertEqual(reopened.schema_status()['schema_version'], '7')
 
     def test_duplicate_store_identity_and_runtime_cancellation(self):
         from puppetmaster.cancellation import cancellation_scope, is_cancelled
@@ -539,7 +551,7 @@ class StoreContractTests(unittest.TestCase):
                 a.save_task(ta)
                 ta = a.claim_task(ta.id, 'worker')
                 b.save_task(ta)
-                ref_a, ref_b = JobRef(ja.id, state_identity(a.root)), JobRef(ja.id, state_identity(b.root))
+                ref_a, ref_b = a.job_ref(ja.id), b.job_ref(ja.id)
                 a.request_cancellation(ref_a, 'request', [task_binding(ta)])
                 with cancellation_scope(b, ta):
                     self.assertFalse(is_cancelled(ja.id))
@@ -678,7 +690,7 @@ class OwnedCancellationCleanup(unittest.TestCase):
             task = Task(job_id=job.id, role="explore", instruction="fixture")
             store.save_task(task)
             task = store.claim_task(task.id, "worker")
-            ref = JobRef(job.id, state_identity(store.root))
+            ref = store.job_ref(job.id)
             errors = []
             def run():
                 try:

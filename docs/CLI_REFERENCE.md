@@ -405,3 +405,41 @@ per-call estimate cap.
 `demo` and `crash-demo` also accept these five flags because their default
 workers can auto-route to external adapters. Each demo run has one job budget.
 The `daemon` command consumes existing jobs and uses their stored policies.
+
+
+### Incarnation-bound continuation
+
+Pass the v2 reference returned by a launcher before the subcommand:
+
+```sh
+python -m puppetmaster --job-ref '{"job_id":"job_example","state_id":"state_example","version":2,"incarnation":"f47a3b9c-0c44-414e-91ea-7cf9bdd56b37"}' status job_example
+```
+
+`--state-dir` can select an explicit owning directory. A mismatched path,
+incarnation, or job ID is rejected. Legacy two-field references cannot prove
+incarnation. Read commands such as `await`, `feed`, `status`, `artifacts`, and
+`cost` accept them through explicit legacy selection and preserve the legacy
+reference in returned state. Strict mutation/replay requires explicit v2
+rebinding with `store.job_ref(job_id)` after inspecting the store. Existing bare
+job-ID commands retain their legacy behavior. MCP forwards the reference to the child CLI rather than
+reducing it to a path and job ID.
+
+
+### Bounded job display and selected economics
+
+```sh
+python -m puppetmaster --state-dir /path/to/state --backend sqlite job-summaries --limit 50 --max-scan 100 --max-bytes 65536 --json
+python -m puppetmaster --state-dir /path/to/state --backend sqlite job-summary-changes --after-revision 42 --limit 50 --json
+python -m puppetmaster --state-dir /path/to/state --backend sqlite --job-ref "$JOB_REF_JSON" selected-economics --expected-summary-revision 43 --json
+```
+
+Summary commands accept `--cursor`, `--status`, `--origin`, `--project-id`, and
+`--session-id`. They return one page with its continuation token; they do not
+fetch later pages. Limits are 1..200 returned rows, 1..1000 scanned candidates,
+and 1024..262144 response bytes. The goal preview is at most 512 UTF-8 bytes.
+
+`selected-economics` requires the complete v2 `--job-ref`. Its fixed response is
+at most 8192 bytes and is separate from `cost` and `consumption`. A revision
+mismatch returns `unavailable`/`selection_changed`; refetch the summary before
+combining results. A missing or ambiguous receipt never becomes measured zero.
+See [Store contracts](STORE_CONTRACTS.md#frozen-selected-result-economics).

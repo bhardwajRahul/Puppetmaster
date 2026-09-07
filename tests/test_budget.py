@@ -362,7 +362,7 @@ class SQLiteBudgetTests(BudgetContract, unittest.TestCase):
             SQLiteSwarmStore(self.root).attach()
         migrated = SQLiteSwarmStore(self.root)
         migrated.init()
-        self.assertEqual(migrated.schema_status()["schema_version"], "5")
+        self.assertEqual(migrated.schema_status()["schema_version"], "7")
         self.assertEqual(migrated.list_attempts(self.job.id), [self.attempt])
         self.assertEqual(migrated.budget_snapshot(self.job.id)["reservations"], [])
         new_attempt = replace(self.attempt, attempt_id="post-migration")

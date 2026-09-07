@@ -62,6 +62,8 @@ class AttemptConsumptionReport:
     attempt_count: int
     attempts: Tuple[AttemptConsumption, ...]
     totals: ConsumptionTotals
+    telemetry_coverage: Literal["captured", "partial", "unknown"] = "unknown"
+    complete_invocation_history: bool = False
 
     def to_dict(self) -> dict:
         """Detached, JSON-serializable fields, with unknowns preserved as null."""
@@ -140,4 +142,6 @@ def build_attempt_consumption_report(
         field: _sum_metrics(getattr(row.totals, field) for row in rows)
         for field in ConsumptionTotals.__dataclass_fields__
     })
-    return AttemptConsumptionReport(job_id, len(rows), tuple(rows), totals)
+    return AttemptConsumptionReport(job_id, len(rows), tuple(rows), totals,
+                                    "partial" if any(not row.observation_ids for row in rows) else
+                                    "captured" if rows else "unknown")

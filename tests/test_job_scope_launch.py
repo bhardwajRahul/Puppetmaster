@@ -19,6 +19,14 @@ from puppetmaster.store import SwarmStore
 from puppetmaster.swarm_launch import detach_analysis_swarm
 
 
+from puppetmaster.identity import make_ref
+
+
+def _test_reference(root, job_id, *, expected_incarnation=None, launch_binding=False):
+    assert launch_binding is True
+    return make_ref(root, job_id, "00000000-0000-4000-8000-000000000001")
+
+
 class JobScopeLaunchTests(unittest.TestCase):
     def test_local_cli_and_mcp_environment_create_scoped_jobs(self):
         fields = dict(origin="test-host", project_id="project", session_id="session")
@@ -52,6 +60,7 @@ class JobScopeLaunchTests(unittest.TestCase):
                     self.assertEqual(getattr(jobs[0], name), value)
                 self.assertEqual(store.list_job_summaries(**fields).items[0].id, jobs[0].id)
 
+    @patch("puppetmaster.identity.reference_at", new=_test_reference)
     def test_detached_cli_transports_scope_in_parseable_command(self):
         fields = dict(origin="host", project_id="p", session_id="s")
         with TemporaryDirectory() as tmp:

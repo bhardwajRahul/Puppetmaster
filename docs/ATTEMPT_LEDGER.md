@@ -230,3 +230,26 @@ execution settles. Complete metric coverage means coverage of recorded attempts
 only: slice-2 persistence failures and hidden CLI retries remain the documented
 telemetry limits. Unknown, partial, estimated, and conflicting metrics must not
 be treated as exact measured charges.
+
+
+## Bounded historical inspection
+
+Use `store.list_attempt_refs(ref)`, `list_run_refs(ref)`,
+`list_process_outcome_refs(ref)`, or `list_usage_observation_refs(ref)` for bounded
+metadata pages, and `historical_evidence_counts(ref)` for indexed captured-record
+counts. These do not hydrate the ledger or build and then truncate a consumption
+report. See [store contracts](STORE_CONTRACTS.md#bounded-historical-evidence) for
+cursor, coverage, deletion, and byte-bound semantics.
+
+Consumption reports add `telemetry_coverage` (`captured`, `partial`, `unknown`)
+and `complete_invocation_history: false`. Existing receipts without these fields
+remain valid. Captured telemetry is not proof of every provider invocation.
+
+### Bounded observation identity
+
+The v1.25 observation/outcome pages resolve exact task and run IDs using the
+scoped attempt metadata index, independent of the currently loaded attempt
+page. Missing legacy relationships return null IDs and `identity_state=unavailable`.
+An observation never borrows a matching attempt ID from another job or the
+latest run of a task. Facts are allowlisted, byte-bounded before hydration, and
+never represent complete invocation coverage or complete spend.

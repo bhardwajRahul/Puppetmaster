@@ -85,8 +85,35 @@ class JobRef:
     job_id: str
     state_id: str
 
-    def as_dict(self) -> dict[str, str]:
-        return {"job_id": self.job_id, "state_id": self.state_id}
+    version: int = 1
+    incarnation: Optional[str] = None
+
+    def __post_init__(self):
+        from uuid import UUID
+        if type(self.version) is not int or self.version not in (1, 2):
+            raise ValueError("unsupported JobRef version")
+        for name, value in (("job_id", self.job_id), ("state_id", self.state_id)):
+            if type(value) is not str or not 1 <= len(value) <= 256 or not value.isascii():
+                raise ValueError("invalid JobRef " + name)
+        if self.version == 1:
+            if self.incarnation is not None:
+                raise ValueError("legacy JobRef cannot carry an incarnation")
+        else:
+            if (type(self.incarnation) is not str or len(self.incarnation) != 36
+                    or not self.incarnation.isascii()):
+                raise ValueError("v2 JobRef requires a canonical incarnation UUID")
+            try:
+                valid = str(UUID(self.incarnation)) == self.incarnation
+            except (ValueError, TypeError, AttributeError):
+                valid = False
+            if not valid:
+                raise ValueError("v2 JobRef requires a canonical incarnation UUID")
+
+    def as_dict(self) -> dict:
+        value = {"job_id": self.job_id, "state_id": self.state_id}
+        if self.version == 2:
+            value.update(version=2, incarnation=self.incarnation)
+        return value
 
 
 def is_terminal_job_status(status: JobStatus) -> bool:
@@ -379,13 +406,15 @@ def make_graph_edge(
 
 
 def to_jsonable(value: Any) -> Any:
+    if isinstance(value, JobRef):
+        return value.as_dict()
     if isinstance(value, StringEnum):
         return str(value)
     if hasattr(value, "__dataclass_fields__"):
-        return {key: to_jsonable(item) for key, item in asdict(value).items()}
+        return {key: to_jsonable(item) for key, item in ((name, getattr(value, name)) for name in value.__dataclass_fields__)}
     if isinstance(value, dict):
         return {key: to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [to_jsonable(item) for item in value]
     return value
 

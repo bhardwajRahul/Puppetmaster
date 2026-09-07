@@ -731,6 +731,8 @@ def maybe_stamp_terminal_cost_receipt(store: Any, job: Job) -> Job:
         receipt["pricing_note"] = (
             "Frozen at job completion against the registry then in force."
         )
+        from puppetmaster.selected_economics import freeze
+        receipt['bounded_economics'] = freeze(receipt, artifacts)
         return replace(job, cost_receipt=receipt)
     except Exception:
         return job

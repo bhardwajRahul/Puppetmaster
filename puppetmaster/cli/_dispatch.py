@@ -604,14 +604,47 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command == "setup" and getattr(args, "verify_first_run", None) is not None:
         return _run_setup(args)
     state_dir = _resolve_command_state_dir(args)
+    reference = None
+    if args.command in ('job-summaries', 'job-summary-changes', 'selected-economics'):
+        from puppetmaster.models import JobRef
+        from puppetmaster.state import resolve_metadata_state
+        from puppetmaster.cli.commands_jobs import cmd_bounded_metadata
+        reference = JobRef(**json.loads(args.job_ref)) if args.job_ref is not None else None
+        state_dir = resolve_metadata_state(job_ref=reference, job_id=getattr(args, "job_id", None),
+                                           state_dir=args.state_dir, default_dir=state_dir)
+        store = create_store(args.backend, state_dir)
+        if args.store_incarnation is not None:
+            store._incarnation = args.store_incarnation
+        return cmd_bounded_metadata(args, store, reference)
+    if args.job_ref is not None:
+        from puppetmaster.models import JobRef
+        from puppetmaster.state import resolve_job_state
+        reference = JobRef(**json.loads(args.job_ref))
+        state_dir = resolve_job_state(job_id=getattr(args, "job_id", None), job_ref=reference,
+                                      state_dir=args.state_dir, default_dir=state_dir)
     store = create_store(args.backend, state_dir)
+    if args.store_incarnation is not None:
+        from puppetmaster.identity import read_identity, StoreIdentityError
+        from puppetmaster.projections import connection
+        with connection(store, metadata_only=True) as c:
+            if read_identity(c, store.backend_name) != args.store_incarnation:
+                raise StoreIdentityError("store replaced between launch and child attach")
+        store._incarnation = args.store_incarnation
+        if args.backend == "sqlite":
+            store._open_mode = "attach"
+    if reference is not None:
+        store.bind_job_ref(reference, legacy_read=args.command in {
+            "status", "show", "artifacts", "feed", "logs", "cost", "receipt",
+            "await", "attempts", "consumption", "dashboard", "jobs", "last",
+            "graph", "diff", "events", "open", "job-summaries", "job-summary-changes",
+        })
     on_job_created = early_job_printer if args.emit_job_id_early else None
 
     # Read-only inspectors: pivot to whichever project state dir owns
     # the requested job_id. Write-side commands (run/cursor/claude/
     # daemon/...) intentionally do NOT pivot — those should always
     # use the caller's workspace state.
-    if args.command in {
+    if reference is None and args.command in {
         "show",
         "receipt",
         "observe-scm",

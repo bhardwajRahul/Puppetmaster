@@ -15,15 +15,22 @@ def create_store(
 ) -> SwarmStore:
     """Build a coordination store.
 
-    ``mode`` applies to the SQLite backend only:
+    ``mode`` controls bootstrap for both backends:
     - ``deferred`` (default): construct only. Supervisor APIs such as
       ``create_job`` call ``ensure_schema``; dashboard listing must not
       rewrite a corrupt ``state.sqlite3`` on open.
     - ``ensure``: create dirs, DDL, migrate immediately.
-    - ``attach`` (workers): PRAGMAs + schema_version assert; never CREATE.
+    - ``attach``: read-only validation; never create or migrate.
     """
+    if mode not in {"deferred", "ensure", "attach"}:
+        raise ValueError(f"unsupported store mode: {mode}")
     if backend == "file":
-        return SwarmStore(state_dir)
+        store = SwarmStore(state_dir)
+        if mode == "ensure":
+            store.init()
+        elif mode == "attach":
+            store.incarnation
+        return store
     if backend == "sqlite":
         store = SQLiteSwarmStore(state_dir)
         store._open_mode = mode
@@ -41,6 +48,4 @@ def create_store(
 
 def create_worker_store(backend: str, state_dir: Union[Path, str]) -> SwarmStore:
     """Open a store the way a worker process must: attach only."""
-    if backend == "file":
-        return SwarmStore(state_dir)
     return create_store(backend, state_dir, mode="attach")
