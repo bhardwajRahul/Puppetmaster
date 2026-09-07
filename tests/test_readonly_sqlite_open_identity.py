@@ -105,18 +105,24 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'POSIX ctime fence')
     def test_posix_second_open_aba_rejects_foreign_rows(self):
         responses, bound, _, _ = self.race()
-        self.assertEqual(bound, [('FOREIGN B' if sys.platform.startswith('linux') else 'A',)])
-        self.assertEqual(responses[-1]['kind'], 'unavailable')
+        self.assert_safe_binding(responses, bound)
+
+    def assert_safe_binding(self, responses, bound):
+        # Unix VFS builds differ in whether they resolve the descriptor URI.
+        self.assertIn(bound, ([('A',)], [('FOREIGN B',)]))
+        self.assertTrue(responses)
+        if bound == [('FOREIGN B',)]:
+            self.assertEqual(responses[-1]['kind'], 'unavailable')
+            self.assertFalse(any('rows' in response for response in responses), responses)
+        elif responses[-1].get('kind') == 'unavailable':
+            self.assertFalse(any('rows' in response for response in responses), responses)
+        else:
+            self.assertEqual(responses[-1]['rows'], [('A',)])
 
     @unittest.skipIf(os.name == 'nt', 'POSIX directory replacement')
     def test_posix_directory_aba_rejects_foreign_rows(self):
         responses, bound, _, _ = self.race(directory_aba=True)
-        if sys.platform.startswith('linux'):
-            self.assertEqual(bound, [('FOREIGN B',)])
-            self.assertEqual(responses[-1]['kind'], 'unavailable')
-        else:
-            self.assertEqual(bound, [('A',)])
-            self.assertEqual(responses[-1]['rows'], [('A',)])
+        self.assert_safe_binding(responses, bound)
 
     def test_windows_second_open_aba_with_equal_times_is_blocked(self):
         responses, bound, blocked, handles = self.race(windows_seam=True)

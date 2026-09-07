@@ -1,12 +1,15 @@
 """Exact adversarial inputs from the final v1.25 review."""
 import base64
 import hmac
+import io
 import json
 import sqlite3
 import sys
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -183,6 +186,81 @@ class FinalBoundaryRepairs(unittest.TestCase):
                             readonly.connect(store, reuse=reuse)
                     self.assertAlmostEqual(clock[0], budget)
                     self.assertEqual(opens.call_count, attempts)
+
+    def test_exact_worker_lock_codes_have_short_in_helper_budget(self):
+        for reuse, budget in ((True, .1), (False, 1.0)):
+            for code in (5, 6, 261, 262, 517):
+                with self.subTest(reuse=reuse, code=code), TemporaryDirectory() as root:
+                    store = SQLiteSwarmStore(root)
+                    store.ensure_schema()
+                    clock = [0.0]
+                    transports = []
+
+                    class Transport:
+                        def __init__(self, path):
+                            self.closed = False
+                            self.busy = threading.Lock()
+                            self.process = SimpleNamespace(stdin=io.StringIO())
+                            self.responses = SimpleNamespace(get=lambda timeout: json.dumps(
+                                dict(kind='OperationalError', error='contended', code=code)))
+                            transports.append(self)
+
+                        def close(self):
+                            self.closed = True
+
+                    def sleep(seconds):
+                        clock[0] += seconds
+
+                    with patch.object(readonly, '_Transport', Transport), \
+                            patch.object(readonly, 'time', SimpleNamespace(
+                                monotonic=lambda: clock[0], sleep=sleep)):
+                        with self.assertRaises(sqlite3.OperationalError):
+                            readonly.connect(store, reuse=reuse)
+                    self.assertAlmostEqual(clock[0], budget)
+                    self.assertEqual(len(transports), 1)
+                    self.assertTrue(transports[0].closed)
+                    self.assertFalse(transports[0].busy.locked())
+
+    def test_mixed_unavailable_and_lock_share_ordinary_deadline(self):
+        for reuse, budget in ((True, .1), (False, 1.0)):
+            for code in (5, 6, 261, 262, 517):
+                with self.subTest(reuse=reuse, code=code), TemporaryDirectory() as root:
+                    store = SQLiteSwarmStore(root)
+                    store.ensure_schema()
+                    clock = [0.0]
+                    transports = []
+
+                    class Transport:
+                        def __init__(self, path):
+                            self.closed = False
+                            self.pid = readonly.os.getpid()
+                            self.busy = threading.Lock()
+                            self.process = SimpleNamespace(stdin=io.StringIO())
+                            error = (dict(kind='unavailable', error=
+                                'unable to open database: active reader; sidecars may be missing')
+                                if not transports else
+                                dict(kind='OperationalError', error='contended', code=code))
+                            self.responses = SimpleNamespace(get=lambda timeout: json.dumps(error))
+                            transports.append(self)
+
+                        def close(self):
+                            self.closed = True
+
+                    def sleep(seconds):
+                        clock[0] += seconds
+
+                    with patch.object(readonly, '_Transport', Transport), \
+                            patch.object(readonly, 'time', SimpleNamespace(
+                                monotonic=lambda: clock[0], sleep=sleep)):
+                        with self.assertRaises(sqlite3.OperationalError) as raised:
+                            readonly.connect(store, reuse=reuse)
+                    self.assertEqual(raised.exception.sqlite_errorcode, code)
+                    self.assertAlmostEqual(clock[0], budget)
+                    self.assertLessEqual(clock[0], budget)
+                    self.assertEqual(len(transports), 2)
+                    for transport in transports:
+                        self.assertTrue(transport.closed)
+                        self.assertFalse(transport.busy.locked())
 
 
 if __name__ == '__main__':

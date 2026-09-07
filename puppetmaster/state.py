@@ -196,6 +196,10 @@ def resolve_metadata_state(*, job_ref=None, job_id=None, state_dir=None, cwd=Non
 class _OwnershipReader:
     backend_name = "sqlite"
 
+    def __init__(self):
+        # One scan intentionally reopens its helper across different roots.
+        self._readonly_reuse_key = object()
+
 
 # Cache only proven unscoped SQL membership. Directory stamps are essential:
 # creating then unlinking live WAL sidecars can leave the main DB unchanged.

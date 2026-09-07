@@ -250,9 +250,8 @@ class SQLiteSwarmStore(SwarmStore):
             connection = None
             try:
                 connection = self._connect_readonly(attach_binding=True, attach_deadline=attach_deadline)
-                self._assert_schema(connection)
+                version = self._assert_schema(connection)
                 from puppetmaster.identity import read_identity, StoreIdentityError
-                version = connection.execute("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key='schema_version'").fetchone()[0]
                 self._legacy_schema = str(version) != str(self.schema_version)
                 incarnation = read_identity(connection, "sqlite") if str(version) != "5" else None
                 if self._incarnation is not None and self._incarnation != incarnation:
@@ -289,11 +288,19 @@ class SQLiteSwarmStore(SwarmStore):
                     connection.close()
         self._attached = True
 
-    def _assert_schema(self, connection: sqlite3.Connection) -> None:
+    def _assert_schema(self, connection: sqlite3.Connection) -> str:
         from puppetmaster.readonly import ReadTimeout
+        # Attach holds an exclusive advisory lock across validation. Batch the
+        # fixed schema checks to avoid serializing eight IPC round trips per
+        # worker when many processes attach to the same store.
         try:
             row = connection.execute(
-                "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key = 'schema_version'"
+                "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value, "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='completions'), "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_attempts'), "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_observations'), "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_reservations') "
+                "FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
         except sqlite3.OperationalError as exc:
             if isinstance(exc, ReadTimeout) or _is_sqlite_lock_error(exc):
@@ -306,9 +313,7 @@ class SQLiteSwarmStore(SwarmStore):
                 f"SQLite store has no schema_version at {self.db_path}; "
                 "the supervisor must call ensure_schema() before workers attach"
             )
-        if connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'completions'"
-        ).fetchone() is None:
+        if not row[1]:
             raise SqliteSchemaError(
                 "SQLite completion journal is missing; the supervisor must call ensure_schema()"
             )
@@ -319,16 +324,15 @@ class SQLiteSwarmStore(SwarmStore):
             raise SqliteSchemaError(
                 f"SQLite store schema_version is invalid at {self.db_path}: {raw!r}"
             ) from exc
-        for table in ("execution_attempts", "usage_observations", "budget_reservations"):
-            if connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-            ).fetchone() is None:
+        for index, table in enumerate(("execution_attempts", "usage_observations", "budget_reservations"), 2):
+            if not row[index]:
                 raise SqliteSchemaError(f"SQLite {table} missing; supervisor must migrate")
         if current not in (5, 6, self.schema_version):
             raise SqliteSchemaError(
                 f"SQLite store schema_version {current} does not match "
                 f"{self.schema_version} at {self.db_path}"
             )
+        return raw
 
     @staticmethod
     def _execute_schema_script(connection: sqlite3.Connection, script: str) -> None:

@@ -19,6 +19,36 @@ from puppetmaster.sqlite_store import SQLiteSwarmStore
 
 
 class ReadonlyWriteRaceTests(unittest.TestCase):
+    def test_attach_validation_batches_checks_under_exclusive_lock(self):
+        with TemporaryDirectory() as tmp:
+            supervisor = SQLiteSwarmStore(tmp)
+            supervisor.ensure_schema()
+            store = SQLiteSwarmStore(tmp)
+            execute = readonly.ReadConnection.execute
+            statements = []
+
+            def observed(connection, sql, parameters=()):
+                statements.append(sql)
+                return execute(connection, sql, parameters)
+
+            with patch.object(readonly.ReadConnection, 'execute', observed):
+                store.attach()
+            self.assertTrue(store._attached)
+            self.assertEqual(store._incarnation, supervisor._incarnation)
+            self.assertEqual(len(statements), 3)
+            for table in ('completions', 'execution_attempts', 'usage_observations', 'budget_reservations'):
+                with self.subTest(table=table):
+                    with closing(sqlite3.connect(store.db_path)) as database:
+                        database.execute(f'ALTER TABLE {table} RENAME TO hidden_table')
+                        database.commit()
+                    try:
+                        with self.assertRaises(sqlite_store.SqliteSchemaError):
+                            SQLiteSwarmStore(tmp).attach()
+                    finally:
+                        with closing(sqlite3.connect(store.db_path)) as database:
+                            database.execute(f'ALTER TABLE hidden_table RENAME TO {table}')
+                            database.commit()
+
     def test_writer_between_stat_and_descriptor_is_classified(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite3'
@@ -141,7 +171,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
             readonly._metadata_fence(before, (1, 2, 100, 200, 301))
 
     def test_mixed_writes_and_locks_share_attach_deadline(self):
-        for code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        for code in (5, 6):  # SQLITE_BUSY, SQLITE_LOCKED (constants absent on Python 3.9).
             with self.subTest(code=code), TemporaryDirectory() as tmp:
                 supervisor = SQLiteSwarmStore(tmp)
                 supervisor.ensure_schema()
@@ -260,8 +290,8 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                     {p.name: p.read_bytes() for p in store.root.iterdir() if p.is_file()})
 
     def test_attach_open_near_deadline_bounds_every_validation_response(self):
-        # PRAGMA, schema version, four table checks, version, incarnation.
-        for silent_query in range(8):
+        # PRAGMA, batched schema validation, incarnation.
+        for silent_query in range(3):
             for exhausted in (False, True):
                 with self.subTest(query=silent_query, exhausted=exhausted), TemporaryDirectory() as tmp:
                     supervisor = SQLiteSwarmStore(tmp)

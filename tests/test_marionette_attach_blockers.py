@@ -17,7 +17,7 @@ from readonly_fixtures import damaged_sidecars, file_bytes
 
 from puppetmaster.identity import StoreIdentityError
 from puppetmaster.projections import connection
-from puppetmaster.sqlite_store import SqliteSchemaError
+from puppetmaster.sqlite_store import SQLiteSwarmStore, SqliteSchemaError
 from puppetmaster.store_factory import create_store
 
 
@@ -267,7 +267,11 @@ class MarionetteBlockerTests(unittest.TestCase):
                 self.assertGreater(Path(str(path) + '-wal').stat().st_size, committed_wal_size)
                 before = locked_fingerprint(store.root)
                 from puppetmaster.readonly import connect, ReadUnavailable
-                with self.assertRaises(ReadUnavailable):
+                # This fixture never releases its writer during attach. Exercise
+                # real rejection with a short budget; virtual-clock tests cover
+                # exhaustion of the full production deadline.
+                with patch.object(SQLiteSwarmStore, 'busy_timeout_ms', 100), \
+                        self.assertRaises(ReadUnavailable):
                     create_store(store.backend_name, store.root, mode='attach')
                 page = store.list_job_summaries()
                 self.assertEqual(page.outcome, 'unavailable')
@@ -304,7 +308,8 @@ class MarionetteBlockerTests(unittest.TestCase):
                     with damaged_sidecars(writer, path, missing):
                         # Damage is test setup only; the reader must not repair it.
                         before = locked_fingerprint(store.root)
-                        with self.assertRaises((ReadUnavailable, SqliteSchemaError)):
+                        with patch.object(SQLiteSwarmStore, 'busy_timeout_ms', 100), \
+                                self.assertRaises((ReadUnavailable, SqliteSchemaError)):
                             create_store(store.backend_name, store.root, mode='attach')
                         page = store.list_job_summaries(limit=1, cursor=first.next_cursor)
                         self.assertEqual(page.outcome, 'unavailable')

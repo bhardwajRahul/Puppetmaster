@@ -80,7 +80,7 @@ class MetadataContentionTests(unittest.TestCase):
                         c._control('release', True)
                         c._opened = False
                         failed.append(c)
-                        clock[0] += .2
+                        clock[0] += .1 if outcome == 'unproven' else .01
                         error = dict(kind='unavailable', error='unable to open database: active reader; sidecars may be missing')
                         if outcome != 'unproven':
                             error['code'] = 5
@@ -104,9 +104,9 @@ class MetadataContentionTests(unittest.TestCase):
                             with self.assertRaises(StoreIdentityError if outcome == 'replacement' else sqlite3.OperationalError):
                                 readonly.connect(store, reuse=True, timeout=1)
                         self.assertEqual(spawn.call_count, 1)
-                        self.assertLessEqual(clock[0], 1.2)
+                        self.assertLessEqual(clock[0], .1)
                         if outcome == 'exhausted':
-                            self.assertGreaterEqual(clock[0], 1)
+                            self.assertAlmostEqual(clock[0], .1)
                         if outcome != 'success':
                             self.assertTrue(failed[0].closed)
                 finally:

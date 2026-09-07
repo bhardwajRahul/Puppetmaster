@@ -128,12 +128,56 @@ class _Transport:
         self.process.stdout.close()
 
 
+class _ReuseSlot:
+    def __init__(self):
+        self.busy = threading.Lock()
+        self.transport = None
+        self.finalizer = None
+
+    def discard(self):
+        # Called with busy held, including teardown before another startup.
+        if self.finalizer is not None:
+            self.finalizer()
+            self.finalizer = None
+        self.transport = None
+
+
+_reuse_slots = weakref.WeakValueDictionary()
+_reuse_lock = threading.Lock()
+
+
+def _reset_reuse_after_fork():
+    global _reuse_slots, _reuse_lock
+    # A vanished thread may own either inherited lock. Only replace bookkeeping:
+    # closing buffered pipes here can itself wait on a vanished reader thread.
+    _reuse_slots = weakref.WeakValueDictionary()
+    _reuse_lock = threading.Lock()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_reuse_after_fork)
+
+
+def _reuse_slot(store, path):
+    key = (os.getpid(), getattr(store, '_readonly_reuse_key',
+                               os.path.normcase(os.path.realpath(path))))
+    # Only registry bookkeeping is global; startup, waits and teardown are not.
+    with _reuse_lock:
+        slot = _reuse_slots.get(key)
+        if slot is None:
+            slot = _ReuseSlot()
+            _reuse_slots[key] = slot
+    store._readonly_slot = slot
+    return slot
+
+
 class ReadConnection:
     in_transaction = True
     row_factory = sqlite3.Row
 
     def __init__(self, store, timeout, *, reuse=False, attach_binding=False, launch_binding=False,
-                 attach_deadline=None):
+                 attach_deadline=None, ordinary_deadline=None):
+        self._pid = os.getpid()
         self.store = store
         self.selected = selection(store)
         self._opened = False
@@ -144,7 +188,11 @@ class ReadConnection:
         # Interpreter startup is not evidence of database lock contention.
         self.timeout = 5.0 if timeout <= 0 else max(0.001, timeout)
         open_deadline = time.monotonic() + max(0, timeout)
-        write_deadline = open_deadline if attach_binding or launch_binding else min(open_deadline, time.monotonic() + (0.1 if reuse else 1.0))
+        write_deadline = open_deadline
+        if not (attach_binding or launch_binding):
+            if ordinary_deadline is None:
+                ordinary_deadline = time.monotonic() + (0.1 if reuse else 1.0)
+            write_deadline = min(open_deadline, ordinary_deadline)
         if attach_binding and attach_deadline is not None:
             open_deadline = min(open_deadline, attach_deadline)
             write_deadline = attach_deadline
@@ -156,20 +204,31 @@ class ReadConnection:
             cacheable = reuse
         except TypeError:
             cacheable = False
-        cached = getattr(store, '_readonly_transport', None) if cacheable else None
-        reuse = (cached is not None and cached.pid == os.getpid() and
-                 not cached.closed and cached.busy.acquire(blocking=False))
-        if reuse:
-            self.transport = cached
+        self._slot = _reuse_slot(store, path) if cacheable else None
+        if self._slot is not None:
+            # Sharing startup spends the existing open allowance; it never
+            # restarts the aggregate ordinary contention deadline above.
+            if not self._slot.busy.acquire(timeout=max(0, open_deadline - time.monotonic())):
+                raise ReadTimeout('unable to open database: reader timed out')
+            try:
+                cached = self._slot.transport
+                reuse = cached is not None and not cached.closed
+                if not reuse:
+                    self._slot.discard()
+                    self._slot.transport = _Transport(path)
+                    self._slot.finalizer = weakref.finalize(self._slot, self._slot.transport.close)
+                self.transport = self._slot.transport
+                self.transport.busy.acquire()
+                store._readonly_transport = self.transport
+            except BaseException:
+                self._slot.discard()
+                self._slot.busy.release()
+                raise
         else:
+            reuse = False
             self.transport = _Transport(path)
             self.transport.busy.acquire()
-            # Concurrent sessions get independent descriptor owners. Only the
-            # first is cached; temporary sessions are reaped on close.
-            if cacheable and (cached is None or cached.closed or cached.pid != os.getpid()):
-                store._readonly_transport = self.transport
-                weakref.finalize(store, self.transport.close)
-        self._cached = getattr(store, '_readonly_transport', None) is self.transport
+        self._cached = self._slot is not None
         self.process = self.transport.process
         self.responses = self.transport.responses
         try:
@@ -198,7 +257,8 @@ class ReadConnection:
                     topology_race = attach_binding and getattr(exc, 'launch_topology_change', False)
                     if not (write_race or topology_race or (attach_binding or not launch_binding) and _locked(exc)):
                         raise
-                    retry_deadline = write_deadline if write_race else open_deadline
+                    retry_deadline = (write_deadline if write_race or not (attach_binding or launch_binding)
+                                      else open_deadline)
                     remaining = retry_deadline - time.monotonic()
                     if remaining <= 0:
                         raise
@@ -267,6 +327,7 @@ class ReadConnection:
             return result
 
     def execute(self, sql, parameters=()):
+        self._check_process()
         try:
             self.process.stdin.write(json.dumps(dict(sql=sql, parameters=parameters)) + '\n')
             self.process.stdin.flush()
@@ -277,6 +338,7 @@ class ReadConnection:
             raise
 
     def _control(self, name, value):
+        self._check_process()
         try:
             self.process.stdin.write(json.dumps(dict(control=name, value=value)) + '\n')
             self.process.stdin.flush()
@@ -297,13 +359,32 @@ class ReadConnection:
         self._trace = callback
         self._control('trace', callback is not None)
 
+    def _check_process(self):
+        if self._pid != os.getpid():
+            raise ReadUnavailable('reader belongs to another process; explicitly reopen')
+
     def _abort(self):
+        if self._pid != os.getpid():
+            self.closed = True
+            return
         if not self.closed:
             self.closed = True
-            self.transport.close()
-            self.transport.busy.release()
+            try:
+                if self._slot is not None:
+                    self._slot.discard()
+                else:
+                    self.transport.close()
+            finally:
+                self.transport.busy.release()
+                if self._slot is not None:
+                    self._slot.busy.release()
 
     def close(self):
+        # Inherited pipes remain inert until child exit/exec. Do not flush,
+        # signal the parent's helper, or touch inherited Python I/O locks.
+        if self._pid != os.getpid():
+            self.closed = True
+            return
         if self.closed:
             return
         if not self._cached or any((self._authorizer, self._progress, self._trace)):
@@ -316,6 +397,8 @@ class ReadConnection:
             raise
         self.closed = True
         self.transport.busy.release()
+        if self._slot is not None:
+            self._slot.busy.release()
 
     def __enter__(self):
         return self
@@ -348,8 +431,8 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
         deadline = min(deadline, attach_deadline)
     if launch_binding:
         reuse = False
-    # Unproven availability errors keep their short window. Confirmed
-    # SQLite contention may use the caller budget, before any SQL is exposed.
+    # Ordinary reads keep their short window even for confirmed contention.
+    # Only binding operations may spend the wider caller budget.
     unavailable_deadline = min(deadline, started + (0.1 if reuse else 1.0))
     refresh_stamp = None
     launch_source = _source_stamp(store)[1] if launch_binding else None
@@ -369,7 +452,8 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
                 raise ReadTimeout('unable to open database: reader timed out')
             connection = ReadConnection(store, (remaining if attach_binding else max(.001, remaining)) if timeout > 0 else 0,
                                         reuse=reuse, attach_binding=attach_binding, launch_binding=launch_binding,
-                                        attach_deadline=attach_deadline)
+                                        attach_deadline=attach_deadline,
+                                        ordinary_deadline=unavailable_deadline)
             if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
                 connection._abort()
                 raise ReadUnavailable('unable to open database: source changed')
@@ -396,7 +480,7 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
                  getattr(exc, 'launch_topology_change', False)))
             if launch_binding:
                 unavailable = launch_transient
-            retry_deadline = (deadline if launch_transient or locked
+            retry_deadline = (deadline if launch_transient or locked and (launch_binding or attach_binding)
                               else unavailable_deadline)
             if not (locked or unavailable) or time.monotonic() >= retry_deadline:
                 raise
