@@ -26,6 +26,13 @@ from puppetmaster.budget import BudgetPolicy
 
 
 class BillingProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        from puppetmaster.platform_billing import BillingStatus
+        detector = patch('puppetmaster.platform_billing.detect_adapter_billing',
+                         return_value=BillingStatus('codex', 'unknown', True, 'fixture'))
+        detector.start()
+        self.addCleanup(detector.stop)
+
     def test_adapter_invocations_honor_persisted_billing_through_receipt(self):
         from contextlib import ExitStack
         from unittest.mock import MagicMock

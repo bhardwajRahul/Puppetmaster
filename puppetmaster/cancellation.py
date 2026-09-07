@@ -15,10 +15,14 @@ _context = ContextVar("cancellation_scope", default=None)
 
 @contextmanager
 def cancellation_scope(store, task):
-    from puppetmaster.models import JobRef
-    from puppetmaster.state import state_identity
     from puppetmaster.store_contracts import task_binding
-    ref = JobRef(task.job_id, state_identity(store.root))
+    from puppetmaster.identity import make_ref, read_identity
+    from puppetmaster.projections import connection
+    # Execution is a supervisor operation. Use its normal store session, which
+    # can read committed WAL while another worker holds a write reservation.
+    with connection(store) as c:
+        ref = make_ref(store.root, task.job_id, read_identity(c, store.backend_name))
+        store.validate_job_ref(ref, connection=c, strict=True)
     binding = task_binding(task)
     key = (ref, binding)
     with _lock:

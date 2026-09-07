@@ -183,7 +183,6 @@ def merge_routing_payload(
 
     caller = dict(payload or {})
     merged = {
-        **(decision.model.payload_defaults or {}),
         **stamp_model_billing(caller, decision.model, registry=registry,
                               previous_adapter=previous_adapter),
         "model": decision.model.adapter_model_name,
@@ -982,6 +981,8 @@ class Orchestrator:
             artifact_payload = decision.to_artifact_payload(
                 effective_billing=new_payload["billing"],
             )
+            artifact_payload.update({key: new_payload.get(key) for key in
+                                     ("registry_billing", "billing_source", "billing_evidence")})
             artifact_payload["route_revision"] = new_payload["route_revision"]
             artifact_payload["role"] = task.role
             artifact_payload["fallback_from_adapter"] = failed_adapter
@@ -1190,6 +1191,8 @@ class Orchestrator:
             artifact_payload = decision.to_artifact_payload(
                 effective_billing=new_payload["billing"],
             )
+            artifact_payload.update({key: new_payload.get(key) for key in
+                                     ("registry_billing", "billing_source", "billing_evidence")})
             artifact_payload["route_revision"] = new_payload["route_revision"]
             artifact_payload["role"] = task.role
             artifact_payload["escalated_from_model"] = current_model_id
@@ -1430,6 +1433,8 @@ class Orchestrator:
             artifact_payload = decision.to_artifact_payload(
                 effective_billing=new_payload["billing"],
             )
+            artifact_payload.update({key: new_payload.get(key) for key in
+                                     ("registry_billing", "billing_source", "billing_evidence")})
             artifact_payload["route_revision"] = new_payload["route_revision"]
             artifact_payload["role"] = task.role
             artifact_payload["review_escalated_from_model"] = current_model_id
@@ -1714,7 +1719,9 @@ class Orchestrator:
                     payload={"check": "execution_billing", "result": "recorded",
                              "model_id": task.payload["router_model_id"],
                              "billing": task.payload["billing"],
-                             "registry_digest": task.payload.get("registry_digest")},
+                             "registry_digest": task.payload.get("registry_digest"),
+                             **{key: task.payload.get(key) for key in
+                                ("registry_billing", "billing_source", "billing_evidence")}},
                 ))
         self._emit_predicted_conflicts(job, tasks)
         return tasks
@@ -2152,6 +2159,8 @@ class Orchestrator:
             artifact_payload = decision.to_artifact_payload(
                 effective_billing=new_payload["billing"],
             )
+            artifact_payload.update({key: new_payload.get(key) for key in
+                                     ("registry_billing", "billing_source", "billing_evidence")})
             if registry_reconciliation and registry_reconciliation.dropped:
                 artifact_payload["rejected"] = list(artifact_payload.get("rejected") or [])
                 for entry in registry_reconciliation.dropped:

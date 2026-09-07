@@ -25,6 +25,14 @@ POLICY = BudgetPolicy(0.25, 10000, 2000, 2, 60.5)
 INPUTS = {'budget_' + key: value for key, value in asdict(POLICY).items()}
 
 
+from puppetmaster.identity import make_ref
+
+
+def _test_reference(root, job_id, *, expected_incarnation=None, launch_binding=False):
+    assert launch_binding is True
+    return make_ref(root, job_id, "00000000-0000-4000-8000-000000000001")
+
+
 class PublicBudgetTests(unittest.TestCase):
     def test_validation_and_omission(self):
         self.assertIsNone(budget_policy_from_inputs({'max_cost_usd': 0.1}))
@@ -178,6 +186,7 @@ class PublicBudgetTests(unittest.TestCase):
             spawn.assert_not_called()
             run.assert_not_called()
 
+    @patch("puppetmaster.identity.reference_at", new=_test_reference)
     def test_detached_swarm_transports_policy(self):
         with TemporaryDirectory() as root, patch('puppetmaster.swarm_launch.subprocess.Popen') as spawn, patch(
             'puppetmaster.swarm_launch.wait_for_job_id', return_value='job_test'

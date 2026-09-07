@@ -195,7 +195,7 @@ class SQLiteLedgerTests(LedgerContract, unittest.TestCase):
             SQLiteSwarmStore(self.root).attach()
         migrated = SQLiteSwarmStore(self.root)
         migrated.init()
-        self.assertEqual(migrated.schema_status()["schema_version"], "5")
+        self.assertEqual(migrated.schema_status()["schema_version"], "7")
         self.assertEqual(migrated.get_job(self.job.id).goal, self.job.goal)
         self.assertEqual(migrated.get_task_by_id(self.task.id), self.task)
         self.assertEqual(migrated.list_attempts(self.job.id), [])

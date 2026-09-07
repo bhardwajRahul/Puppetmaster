@@ -1,14 +1,15 @@
 """Owner-only filesystem permissions for sensitive Puppetmaster state.
 
 On POSIX, directories are created as ``0700`` and files as ``0600``. Umask can
-strip mode bits from ``mkdir``, so we always follow up with an explicit
-``chmod``. On Windows these calls are best-effort no-ops so callers never crash.
+strip mode bits from ``mkdir``, so we check and correct the resulting mode.
+On Windows these calls are best-effort no-ops so callers never crash.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import stat
 from pathlib import Path
 
 from puppetmaster.interprocess_lock import InterProcessFileLock
@@ -25,7 +26,8 @@ def chmod_private_dir(path: os.PathLike[str] | str) -> None:
     if not supports_posix_modes():
         return
     try:
-        os.chmod(path, _DIR_MODE)
+        if stat.S_IMODE(os.stat(path).st_mode) != _DIR_MODE:
+            os.chmod(path, _DIR_MODE)
     except OSError:
         pass
 
@@ -34,7 +36,10 @@ def chmod_private_file(path: os.PathLike[str] | str) -> None:
     if not supports_posix_modes():
         return
     try:
-        os.chmod(path, _FILE_MODE)
+        # Even chmod to the current mode changes ctime, invalidating readers
+        # that fence the database against replacement and metadata changes.
+        if stat.S_IMODE(os.stat(path).st_mode) != _FILE_MODE:
+            os.chmod(path, _FILE_MODE)
     except OSError:
         pass
 

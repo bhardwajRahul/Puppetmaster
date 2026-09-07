@@ -53,7 +53,7 @@ def _cancel(raw):
 
 
 def _key(value):
-    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+    if not isinstance(value, str) or len(value) > 256 or not value.strip():
         raise ValueError("contract identity must be a nonempty string of at most 256 characters")
 
 
@@ -68,12 +68,19 @@ def _check_effect_cancellation(c, receipt):
 class StoreContracts:
     def request_cancellation(self, job_ref, request_id, bindings):
         """Request cooperative stop of exactly these generations, never successors."""
-        self.validate_job_ref(job_ref)
+        self.validate_job_ref(job_ref, strict=True)
         _key(request_id)
-        bindings = tuple(sorted(bindings, key=lambda b: b.task_id))
-        if not bindings or len(bindings) > 200 or len({b.task_id for b in bindings}) != len(bindings):
+        from itertools import islice
+        bindings = tuple(islice(bindings, 201))
+        if not bindings or len(bindings) > 200:
             raise ValueError("provide 1..200 unique task bindings")
+        if any(not isinstance(b, TaskBinding) for b in bindings):
+            raise ValueError("cancellation requires task bindings")
+        if len({b.task_id for b in bindings}) != len(bindings):
+            raise ValueError("provide 1..200 unique task bindings")
+        bindings = tuple(sorted(bindings, key=lambda b: b.task_id))
         with _transaction(self) as c:
+            self.validate_job_ref(job_ref, connection=c, strict=True)
             prior = _load(c, "cancel", job_ref, request_id)
             if prior:
                 prior = _cancel(prior)
@@ -99,14 +106,14 @@ class StoreContracts:
             return receipt
 
     def get_cancellation_receipt(self, job_ref, request_id):
-        self.validate_job_ref(job_ref)
-        with connection(self) as c:
+        with connection(self, metadata_only=True) as c:
+            self.validate_job_ref(job_ref, connection=c)
             value = _load(c, "cancel", job_ref, request_id)
             return _cancel(value) if value else None
 
     def cancellation_pending(self, job_ref, binding):
-        self.validate_job_ref(job_ref)
         with connection(self) as c:
+            self.validate_job_ref(job_ref, connection=c, strict=True)
             row = c.execute("""SELECT 1 FROM cancellation_targets
                 WHERE job_id=? AND task_id=? AND binding_digest=? LIMIT 1""",
                 (job_ref.job_id, binding.task_id, immutable_digest(binding))).fetchone()
@@ -114,10 +121,11 @@ class StoreContracts:
 
     def observe_cancellation(self, job_ref, binding, *, cleanup="unknown"):
         """Called after local execution stops; says nothing about remote effects."""
-        self.validate_job_ref(job_ref)
+        self.validate_job_ref(job_ref, strict=True)
         if cleanup not in {"unknown", "partial", "local_process_exited"}:
             raise ValueError("invalid cleanup outcome")
         with _transaction(self) as c:
+            self.validate_job_ref(job_ref, connection=c, strict=True)
             rows = c.execute("""SELECT request_id FROM cancellation_targets
                 WHERE job_id=? AND task_id=? AND binding_digest=? AND observed=0""",
                 (job_ref.job_id, binding.task_id, immutable_digest(binding))).fetchall()
@@ -134,13 +142,13 @@ class StoreContracts:
                     outcome="requested" if pending else "observed_stop", cleanup=cleanup))
 
     def get_effect_receipt(self, job_ref, effect_id):
-        self.validate_job_ref(job_ref)
-        with connection(self) as c:
+        with connection(self, metadata_only=True) as c:
+            self.validate_job_ref(job_ref, connection=c)
             raw = _load(c, "effect", job_ref, effect_id)
             return _effect(raw) if raw else None
 
     def _accept_effect(self, c, receipt):
-        self.validate_job_ref(receipt.job_ref)
+        self.validate_job_ref(receipt.job_ref, connection=c, strict=True)
         for key in (receipt.effect_id, receipt.run_id, receipt.attempt_id, receipt.request_digest):
             _key(key)
         if receipt.replay_policy not in {"safe", "reconcile_first", "requires_authorization", "provider_idempotent"}:
@@ -150,7 +158,12 @@ class StoreContracts:
         raw = _load(c, "effect", receipt.job_ref, receipt.effect_id)
         if raw:
             prior = _effect(raw)
-            if replace(prior, revision=1, outcome="not_dispatched", evidence_refs=()) != receipt:
+            # Explicit v2 authorization permits replay of the persisted v1 identity.
+            comparison = prior
+            if prior.job_ref.version == 1:
+                self.validate_job_ref(prior.job_ref, connection=c)
+                comparison = replace(prior, job_ref=receipt.job_ref)
+            if replace(comparison, revision=1, outcome="not_dispatched", evidence_refs=()) != receipt:
                 raise ContractConflict("effect intent has different immutable facts")
             return prior, False
         task = self.get_task_by_id(receipt.binding.task_id)
@@ -202,13 +215,13 @@ class StoreContracts:
 
     def advance_effect(self, job_ref, effect_id, *, expected_revision, outcome, evidence_refs=()):
         """CAS observation update. Unknown can be reconciled, never redispatched."""
-        self.validate_job_ref(job_ref)
+        self.validate_job_ref(job_ref, strict=True)
         if outcome not in {"in_flight", "succeeded", "failed_no_effect", "unknown"}:
             raise ValueError("invalid effect outcome")
-        evidence_refs = tuple(evidence_refs)
-        if not evidence_refs or any(not isinstance(v, str) or not v for v in evidence_refs):
-            raise ValueError("effect transition requires evidence refs")
+        from puppetmaster.contracts import bounded_evidence
+        evidence_refs = bounded_evidence(evidence_refs)
         with _transaction(self) as c:
+            self.validate_job_ref(job_ref, connection=c, strict=True)
             raw = _load(c, "effect", job_ref, effect_id)
             if not raw:
                 raise KeyError(effect_id)

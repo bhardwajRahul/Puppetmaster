@@ -73,6 +73,7 @@ from puppetmaster.providers import (
     provider_retry_backoff_seconds,
 )
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.usage import selected_token_usage
 from puppetmaster.swarm_reasoning import DEFAULT_SWARM_REASONING_EFFORT
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.hashline import (
@@ -1223,6 +1224,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
             "cached_tokens": 0, "cost_usd": 0.0,
         }
+        selected_usage = None
+        cost_complete = True
         final_text = ""
         mutated = False
         turns = 0
@@ -1301,8 +1304,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
             except JobCancelled:
                 stop_reason = "cancelled"
                 break
+            selected_usage = selected_token_usage(
+                turn.accounting_usage if turn.accounting_usage is not None else turn.usage, selected_usage)
             for key in usage_total:
                 if key == "cost_usd":
+                    cost_complete = cost_complete and type(turn.usage.get(key)) in (int, float)
                     usage_total[key] += float(turn.usage.get(key, 0.0) or 0.0)
                 else:
                     usage_total[key] += int(turn.usage.get(key, 0) or 0)
@@ -1549,8 +1555,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 except ProviderError:
                     continue
                 turns += 1
+                selected_usage = selected_token_usage(
+                    turn.accounting_usage if turn.accounting_usage is not None else turn.usage, selected_usage)
                 for key in usage_total:
                     if key == "cost_usd":
+                        cost_complete = cost_complete and type(turn.usage.get(key)) in (int, float)
                         usage_total[key] += float(turn.usage.get(key, 0.0) or 0.0)
                     else:
                         usage_total[key] += int(turn.usage.get(key, 0) or 0)
@@ -1574,6 +1583,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 break
 
         usage_out = {
+            **(selected_usage if selected_usage is not None else selected_token_usage({})),
             "tokens_in": usage_total["prompt_tokens"],
             "tokens_out": usage_total["completion_tokens"],
             "tokens_total": usage_total["total_tokens"],
@@ -1582,7 +1592,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
             "submit_forced_budget": submit_forced_budget,
             "submit_forced_max_turns": submit_forced_max_turns,
         }
-        if usage_total["cost_usd"] > 0:
+        # A selected charge requires provider cost on every contributing turn.
+        # Zero is measured; a subtotal with missing turns is not a total.
+        if selected_usage is not None and cost_complete:
             usage_out["real_cost_usd"] = round(usage_total["cost_usd"], 6)
         return final_text, usage_out, turns, mutated, stop_reason, submitted, submitted_criteria
 

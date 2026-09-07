@@ -850,9 +850,13 @@ def _run_cost_command(args, store) -> int:
                 f"  {mid[:28]:<28}  {v['calls']:>5}  {tokens:>14,}  "
                 f"{cost_cell:>12}"
             )
+        for row in actual.get("tasks", []):
+            equivalent = row.get("api_equivalent_cost_usd")
+            if row.get("billing") == "unknown" and equivalent is not None:
+                print(f"  {row['model_id']}: API-equivalent valuation = ${equivalent:.6f} (estimate)")
         if actual.get("unpriced_tasks"):
             print(
-                f"\n  note: {actual['unpriced_tasks']} task(s) ran on a model not in "
+                f"\n  note: {actual['unpriced_tasks']} task(s) have unknown billing or a model not in "
                 "your registry, so selected-model cost is unknown (not $0)."
             )
             priced_subtotal = actual.get("priced_subtotal_usd")
@@ -880,7 +884,8 @@ def _run_cost_command(args, store) -> int:
     if has_usage:
         print(
             "\n  note: selected-model usage cost uses plan-zero, then "
-            "provider-reported real_cost_usd, then tokens × registry price. "
+            "provider-reported real_cost_usd, then tokens × registry price for known billing. "
+            "Unknown billing retains API-equivalent valuation only. "
             "It is not a provider billing API total."
         )
 

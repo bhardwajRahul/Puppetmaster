@@ -106,8 +106,8 @@ class FinalReviewRepairTests(unittest.TestCase):
         from puppetmaster.consumption import build_attempt_consumption_report
         client = Path(__file__).resolve().parents[1] / "clients/typescript/puppetmaster.ts"
         # Compile the exported wire declarations, independent of Node runtime types.
-        declarations = client.read_text().split("export interface ConsumptionMetric", 1)[1]
-        declarations = "export interface ConsumptionMetric" + declarations
+        declarations = client.read_text().split("export interface LegacyJobRef", 1)[1]
+        declarations = "export interface LegacyJobRef" + declarations
         for store, job, task, run, ref in self.stores():
             attempt = ExecutionAttempt.from_run(run, adapter="local")
             store.record_attempt(attempt)

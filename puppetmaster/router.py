@@ -1434,7 +1434,7 @@ def route_task(
         generation_presence=generation_presence,
     )
     production = replace(production, registry_billing=next(
-        model.billing for model in original_models if model.id == production.model.id
+        model.billing for model in authority if model.id == production.model.id
     ))
     if shadow_policy is None:
         return production
@@ -1678,7 +1678,7 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
 
     return TaskSignals(
         instruction=instruction,
-        billing_payload={key: payload[key] for key in ("model", "router_model_id", "billing") if key in payload},
+        billing_payload={key: payload[key] for key in ("model", "router_model_id", "billing", "billing_source", "openai_api_key", "executable") if key in payload},
         billing_adapter=getattr(spec, "adapter", None),
         role=getattr(spec, "role", "explore") or "explore",
         payload_size_chars=payload_size_chars,

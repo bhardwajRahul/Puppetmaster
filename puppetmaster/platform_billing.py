@@ -16,7 +16,8 @@ authenticated on this machine right now:
 * **Codex** reads ``$CODEX_HOME/auth.json`` when ``CODEX_HOME`` is set, else
   ``~/.codex/auth.json`` (``auth_mode``/``tokens``) directly — an API key is
   out-of-pocket; a ChatGPT login is subscription-covered — falling back to
-  ``codex login status`` only when that file is absent.
+  ``codex login status`` only when that file is absent. Custom executable
+  commands use their own login status instead of ambient auth files.
 
 Every probe is a pure function with injectable ``env`` / ``home`` / ``run``
 dependencies so the test suite can exercise each branch without real
@@ -66,7 +67,7 @@ class AuthContext:
     """
 
     env: Mapping[str, str]
-    home: Path
+    home: Optional[Path]
     label: str = "process"
 
 
@@ -76,22 +77,35 @@ def auth_context(
     home: Optional[Path] = None,
     label: str = "process",
 ) -> AuthContext:
-    return AuthContext(
-        env=env if env is not None else os.environ,
-        home=home if home is not None else Path.home(),
-        label=label,
-    )
+    effective_env = env if env is not None else os.environ
+    if home is None:
+        if env is None:
+            try:
+                home = Path.home()
+            except (RuntimeError, OSError):
+                pass
+        else:
+            candidate = (effective_env.get("USERPROFILE") if os.name == "nt"
+                         else effective_env.get("HOME"))
+            if not candidate and os.name == "nt" and effective_env.get("HOMEPATH"):
+                candidate = effective_env.get("HOMEDRIVE", "") + effective_env["HOMEPATH"]
+            if candidate and Path(candidate).is_absolute():
+                home = Path(candidate)
+    if home is not None and not home.is_absolute():
+        home = None
+    return AuthContext(env=effective_env, home=home, label=label)
 
 
-def _default_runner(command: list[str]) -> "tuple[int, str, str]":
+def _default_runner(command: list[str], *, env: Optional[Mapping[str, str]] = None) -> "tuple[int, str, str]":
     try:
         completed = subprocess.run(
             command,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
+            env=dict(env) if env is not None else None,
             timeout=15,
         )
-    except FileNotFoundError:
+    except OSError:
         return (127, "", "command not found")
     except subprocess.TimeoutExpired:
         return (124, "", "timed out")
@@ -303,11 +317,16 @@ def detect_claude_billing(
     )
 
 
-def _codex_auth_path(env: Mapping[str, str], home: Path) -> tuple[Path, str]:
+def _codex_auth_path(env: Mapping[str, str], home: Optional[Path]) -> tuple[Optional[Path], str]:
     codex_home = env.get("CODEX_HOME")
     if codex_home:
-        return Path(codex_home).expanduser() / "auth.json", "$CODEX_HOME/auth.json"
-    return home / ".codex" / "auth.json", "~/.codex/auth.json"
+        path = Path(codex_home)
+        if path.parts and path.parts[0] == "~":
+            path = home.joinpath(*path.parts[1:]) if home is not None else None
+        elif codex_home.startswith("~"):
+            path = None
+        return (path / "auth.json" if path is not None else None), "$CODEX_HOME/auth.json"
+    return (home / ".codex" / "auth.json" if home is not None else None), "~/.codex/auth.json"
 
 
 def _read_codex_auth(path: Path, label: str) -> "Optional[BillingStatus]":
@@ -356,25 +375,30 @@ def _read_codex_auth(path: Path, label: str) -> "Optional[BillingStatus]":
 
 def detect_codex_billing(
     run: Optional[CommandRunner] = None,
-    codex_command: str = "codex",
+    codex_command: Optional[object] = None,
     env: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
     context: Optional[AuthContext] = None,
 ) -> BillingStatus:
     """Codex: API key (api) vs ChatGPT subscription (plan).
 
-    Reads ``$CODEX_HOME/auth.json`` first when CODEX_HOME is set, otherwise
-    ``~/.codex/auth.json`` (fast, deterministic, no subprocess), and only
-    falls back to parsing ``codex login status`` when the file is missing.
+    The stock command uses the ambient auth file first. A custom command
+    owns its credential context: only its login status can establish billing;
+    failure or inconclusive output never falls back to an unrelated auth file.
     """
     ctx = context or auth_context(env=env, home=home)
-    auth_path, auth_label = _codex_auth_path(ctx.env, ctx.home)
-    from_file = _read_codex_auth(auth_path, auth_label)
-    if from_file is not None:
-        return replace(from_file, evidence=[*from_file.evidence, f"auth_context:{ctx.label}"])
-    run = run or _default_runner
-    returncode, stdout, stderr = run([codex_command, "login", "status"])
-    text = f"{stdout}\n{stderr}".lower()
+    from puppetmaster.adapters._base import command_parts
+    command = list(command_parts(codex_command if codex_command is not None
+                                 else ctx.env.get("CODEX_COMMAND") or "codex"))
+    if command == ["codex"]:
+        auth_path, auth_label = _codex_auth_path(ctx.env, ctx.home)
+        from_file = _read_codex_auth(auth_path, auth_label) if auth_path is not None else None
+        if from_file is not None:
+            return replace(from_file, evidence=[*from_file.evidence, f"auth_context:{ctx.label}"])
+    command.extend(["login", "status"])
+    returncode, stdout, stderr = (run(command) if run is not None
+                                  else _default_runner(command, env=ctx.env))
+    text = f"{stdout[:8192]}\n{stderr[:8192]}".lower()
     if returncode == 127 or "command not found" in text:
         return BillingStatus(
             adapter="codex",
@@ -391,7 +415,7 @@ def detect_codex_billing(
             detail="Codex is not logged in (run `codex login`).",
             evidence=["codex_login:none", f"auth_context:{ctx.label}"],
         )
-    if "api key" in text:
+    if returncode == 0 and "logged in" in text and "api key" in text:
         return BillingStatus(
             adapter="codex",
             billing="api",
@@ -402,7 +426,7 @@ def detect_codex_billing(
             ),
             evidence=["codex_login:api_key", f"auth_context:{ctx.label}"],
         )
-    if "logged in" in text or "chatgpt" in text:
+    if returncode == 0 and "logged in" in text and "chatgpt" in text:
         return BillingStatus(
             adapter="codex",
             billing="plan",
@@ -706,7 +730,8 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
         env=kw.get("env"), home=kw.get("home")
     ),
     "codex": lambda **kw: detect_codex_billing(
-        run=kw.get("run"), env=kw.get("env"), home=kw.get("home"), context=kw.get("context")
+        run=kw.get("run"), env=kw.get("env"), home=kw.get("home"), context=kw.get("context"),
+        codex_command=kw.get("codex_command")
     ),
     "hermes": lambda **kw: detect_hermes_billing(
         env=kw.get("env"), home=kw.get("home")
@@ -728,6 +753,7 @@ def detect_adapter_billing(
     home: Optional[Path] = None,
     run: Optional[CommandRunner] = None,
     context: Optional[AuthContext] = None,
+    codex_command: Optional[object] = None,
 ) -> BillingStatus:
     """Detect the billing posture for ``adapter``.
 
@@ -747,7 +773,7 @@ def detect_adapter_billing(
             detail=f"No billing detector for adapter {adapter!r}; treating as pass-through.",
             evidence=[f"adapter:{adapter}", "detector:none"],
         )
-    return detector(env=env, home=home, run=run, context=context)
+    return detector(env=env, home=home, run=run, context=context, codex_command=codex_command)
 
 
 _BILLING_CACHE: dict[str, tuple[BillingStatus, float]] = {}

@@ -9,6 +9,7 @@ from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.failure import classify_codex_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.usage import selected_token_usage
 
 from ._base import (
     CliInvocation,
@@ -388,6 +389,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "live_log": completed.live_log_path,
                 "last_message": _redacted_tail(last_message, _STDOUT_TAIL_CHARS),
                 "last_message_capture": last_message_capture,
+                **selected_token_usage(usage),
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
                 "tokens_total": tokens_in + tokens_out,
