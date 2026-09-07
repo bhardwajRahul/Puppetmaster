@@ -148,7 +148,8 @@ class SqliteAttachEnsureTests(unittest.TestCase):
                 for thread in threads:
                     thread.join()
 
-            self.assertEqual(errors, [])
+            if errors:
+                self.fail("\n\n".join(errors[:2]))
             self.assertEqual(scripts, [])
             self.assertEqual(metadata_inserts, [])
 
