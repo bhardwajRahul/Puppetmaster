@@ -1,10 +1,13 @@
 """Native metadata interleavings, without requiring a Windows test host."""
 from tests.readonly_fixtures import ProtocolTransport
 import ctypes
+import io
 import json
 import queue
 import sqlite3
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -156,6 +159,48 @@ class WindowsSequenceTests(unittest.TestCase):
             backoff.assert_not_called()
             self.assertEqual(store.lock_error_count, 0)
             self.assertFalse(store._attached)
+
+    def test_windows_attach_retries_active_wal_as_immutable_checkpoint(self):
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            replies = iter([
+                json.dumps(dict(session_closed=True, kind='unavailable', code=5,
+                    checkpoint_snapshot=True,
+                    error='unable to open database: active reader; sidecars may be missing')),
+                json.dumps(dict(journal='wal')),
+            ])
+
+            class Permit:
+                def release(self):
+                    pass
+
+            class Transport:
+                def __init__(self, path, deadline=None):
+                    self.closed = False
+                    self.busy = threading.Lock()
+                    self.process = SimpleNamespace(stdin=io.StringIO())
+                    self.responses = SimpleNamespace(get=lambda timeout: next(replies))
+                    self.token = readonly._cleanup.register(self, readonly.selection(store)[1])
+
+                def ready(self, deadline):
+                    pass
+
+                def close(self, deadline=None):
+                    self.closed = True
+
+            with patch.object(readonly, '_Transport', Transport), \
+                    patch.object(readonly, 'ReaderAdmission', return_value=Permit()), \
+                    patch.object(readonly.os, 'name', 'nt'), \
+                    patch.object(readonly, 'source_stamp', return_value=(1, 2, 3, 4, 5)), \
+                    patch.object(readonly, '_source_stamp', return_value=(
+                        (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+                        None, None, None, None)):
+                connection = readonly.ReadConnection(
+                    store, 1, attach_binding=True, attach_deadline=time.monotonic() + 1)
+            requests = [json.loads(line) for line in connection.process.stdin.getvalue().splitlines()]
+            self.assertEqual([request['checkpoint_snapshot'] for request in requests], [False, True])
+            connection.close()
 
 
 if __name__ == '__main__':

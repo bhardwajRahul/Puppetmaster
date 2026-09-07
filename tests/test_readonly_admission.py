@@ -556,6 +556,8 @@ class AdmissionTests(unittest.TestCase):
                 ReaderAdmission(alias, time.monotonic() + 1).release()
 
     def test_outer_readmission_obeys_existing_ordinary_window(self):
+        import threading
+        import weakref
         from types import SimpleNamespace
         for reuse, window in ((True, .1), (False, 1.0)):
             with TemporaryDirectory() as root:
@@ -574,6 +576,8 @@ class AdmissionTests(unittest.TestCase):
                 timer = SimpleNamespace(monotonic=lambda: now[0],
                     sleep=lambda delay: now.__setitem__(0, now[0] + delay))
                 with patch.object(readonly, '_cleanup', cleanup), \
+                        patch.object(readonly, '_reuse_slots', weakref.WeakValueDictionary()), \
+                        patch.object(readonly, '_reuse_lock', threading.Lock()), \
                         patch.object(readonly, 'time', timer), \
                         patch.object(readonly, 'ReaderAdmission', admission), \
                         patch.object(readonly.ReadConnection, '_receive',

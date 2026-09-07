@@ -133,7 +133,7 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(fd)
 
-    def test_windows_live_attach_keeps_delete_guard_without_exclusive_lock(self):
+    def test_windows_checkpoint_attach_keeps_delete_guard_without_exclusive_lock(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'source.sqlite3'
             with closing(sqlite3.connect(path)) as c, c:
@@ -168,10 +168,11 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
                     patch.dict(sys.modules, msvcrt=SimpleNamespace(
                         open_osfhandle=lambda handle, flags: handle,
                         get_osfhandle=lambda fd: fd)):
-                worker.main(path, wal_snapshot=True)
+                worker.main(path, checkpoint_snapshot=True)
 
             self.assertEqual(lock_calls, [])
-            self.assertEqual(connect.call_args.args[0], path.resolve().as_uri() + '?mode=ro')
+            self.assertEqual(connect.call_args.args[0],
+                             path.resolve().as_uri() + '?mode=ro&immutable=1')
             self.assertEqual(responses[-1]['rows'], [('A',)])
 
     @unittest.skipUnless(os.name == 'nt', 'requires native Windows delete sharing')
