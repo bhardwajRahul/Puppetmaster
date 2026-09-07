@@ -214,7 +214,9 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
     def test_only_windows_guard_open_marks_sharing_denial_as_contention(self):
         denied = PermissionError('Access is denied')
         denied.winerror = 5
-        with patch.object(worker, 'stamps', return_value=[
+        native_path = type(Path())
+        with patch.object(worker, 'Path', native_path), \
+                patch.object(worker, 'stamps', return_value=[
                 (1, 2, 3, 4, 5), None, None, None]), \
                 patch.object(worker, 'open_windows_source', side_effect=denied), \
                 patch.object(worker.os, 'name', 'nt'):
