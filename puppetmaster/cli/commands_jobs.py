@@ -73,7 +73,8 @@ from puppetmaster.workers import WorkerSpec
 from puppetmaster.cli.helpers import _registry_path_from_args
 
 
-def read_job_state(store, job_id: str, *, timed_out: bool = False, stall_after_seconds=None) -> dict:
+def read_job_state(store, job_id: str, *, timed_out: bool = False, stall_after_seconds=None,
+                   reference=None) -> dict:
     """Return the canonical non-blocking state payload for one durable job."""
     if stall_after_seconds is None:
         _reap_quietly(store)
@@ -92,7 +93,7 @@ def read_job_state(store, job_id: str, *, timed_out: bool = False, stall_after_s
         "timed_out": bool(timed_out),
         "completed_at": job.completed_at,
         "budget_policy": dataclasses.asdict(job.budget_policy) if job.budget_policy else None,
-        "job_ref": (getattr(store, "_legacy_read_ref", None) or store.job_ref(job_id)).as_dict(),
+        "job_ref": (reference or getattr(store, "_legacy_read_ref", None) or store.job_ref(job_id)).as_dict(),
         "delivery": snapshot.get("delivery"),
         "progress": snapshot.get("progress"),
     }
@@ -124,7 +125,8 @@ def await_job_state(
     while True:
         try:
             with read_deadline(deadline):
-                state = read_job_state(store, job_id, stall_after_seconds=stall_after_seconds)
+                state = read_job_state(store, job_id, stall_after_seconds=stall_after_seconds,
+                                       reference=reference)
         except ReadUnavailable:
             if deadline is not None and time.monotonic() >= deadline:
                 return {**state, "timed_out": True}
