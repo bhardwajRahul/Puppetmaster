@@ -260,7 +260,8 @@ class Review2Repairs(unittest.TestCase):
                 try:
                     with patch.object(module.subprocess, 'Popen', side_effect=spawn), \
                             patch.object(module, 'wait_for_job_id', return_value='job_started'), \
-                            patch('puppetmaster.identity.reference_at', side_effect=StoreIdentityError('post-launch proof')):
+                            patch('puppetmaster.identity.' + ('make_ref' if module is mcp_server else 'reference_at'),
+                                  side_effect=StoreIdentityError('post-launch proof')):
                         with self.assertRaisesRegex(StoreIdentityError, 'post-launch proof'):
                             if module is mcp_server:
                                 module.start_cli(['cursor', 'review', 'goal'], dict(cwd=tmp, state_dir=str(Path(tmp) / 'state')))

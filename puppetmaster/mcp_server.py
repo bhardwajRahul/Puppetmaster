@@ -4299,8 +4299,12 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
             process,
             timeout_seconds=EARLY_JOB_ID_TIMEOUT_SECONDS,
         )
-        from puppetmaster.identity import reference_at
-        job_ref = reference_at(Path(state_dir), job_id, expected_incarnation=incarnation, launch_binding=True).as_dict()
+        from puppetmaster.identity import make_ref
+        # The child attached the supervisor's incarnation and reports its job
+        # after creation. Bind that launch receipt, without reopening an
+        # actively written store through the source-stable observation reader.
+        # A replacement remains fenced by this original incarnation on use.
+        job_ref = make_ref(Path(state_dir), job_id, incarnation).as_dict()
     except BaseException:
         # The child was spawned but never reported a job id (startup crash or
         # parse timeout). Don't leave a detached full-edit agent running.

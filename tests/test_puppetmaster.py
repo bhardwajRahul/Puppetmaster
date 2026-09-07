@@ -331,7 +331,7 @@ class PuppetmasterTests(unittest.TestCase):
 
     def test_mcp_start_tool_returns_job_id_without_waiting_for_completion(self) -> None:
         with TemporaryDirectory() as tmp:
-            before_process_count = len(ASYNC_PROCESSES)
+            before_processes = set(ASYNC_PROCESSES)
             result = call_tool(
                 "puppetmaster_start_swarm",
                 {
@@ -361,7 +361,9 @@ class PuppetmasterTests(unittest.TestCase):
             )
             self.assertFalse(result["isError"])
 
-            spawned = ASYNC_PROCESSES[before_process_count:]
+            # Registration also prunes exited launchers, so list offsets cannot
+            # identify this launch when the test runs after another start.
+            spawned = [p for p in ASYNC_PROCESSES if p not in before_processes]
             _wait_for_spawned_or_kill(self, spawned, timeout=60)
 
             status = call_tool(

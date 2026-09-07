@@ -1,4 +1,4 @@
-"""Post-launch identity reads tolerate only bounded helper-start contention."""
+"""Explicit launch binding reads retain bounded helper-start contention retries."""
 import json
 import sqlite3
 import sys
@@ -7,23 +7,22 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
 
-from puppetmaster import mcp_server, readonly
+from puppetmaster import identity, readonly
 from puppetmaster.identity import StoreIdentityError
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 
 
 class ReadonlyLaunchRetryTests(unittest.TestCase):
-    def launch(self, errors, *, step=0.2, after_failure=None, query_error=None):
+    def bind(self, errors, *, step=0.2, after_failure=None, query_error=None):
         clock = [0.0]
         failed = []
         opened = []
         receive = readonly.ReadConnection._receive
-        launcher = Mock(pid=987654)
         self.addCleanup(lambda: [c.close() for c in opened if not c.closed])
 
         def assert_reaped():
@@ -61,25 +60,16 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         tmp = directory.name
-        job = SQLiteSwarmStore(Path(tmp) / 'state').create_job('launch contention')
+        store = SQLiteSwarmStore(Path(tmp) / 'state')
+        job = store.create_job('launch contention')
         with \
                 patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)), \
-                patch.object(readonly.ReadConnection, '_receive', injected), \
-                patch.object(mcp_server.subprocess, 'Popen', return_value=launcher), \
-                patch.object(mcp_server, '_track_async_process'), \
-                patch.object(mcp_server, '_terminate_launcher_tree') as terminate, \
-                patch.object(mcp_server, 'wait_for_job_id', return_value=job.id):
+                patch.object(readonly.ReadConnection, '_receive', injected):
             try:
-                result = mcp_server.start_cli(['review', 'goal'],
-                    dict(cwd=tmp, state_dir=str(Path(tmp) / 'state')))
-            except BaseException:
-                terminate.assert_called_once_with(launcher)
-                raise
-            else:
-                terminate.assert_not_called()
-                body = json.loads(result['content'][0]['text'])
-                self.assertEqual(body['job_ref']['job_id'], job.id)
-                self.assertEqual(body['job_ref']['version'], 2)
+                ref = identity.reference_at(Path(tmp) / 'state', job.id,
+                    expected_incarnation=store._incarnation, launch_binding=True)
+                self.assertEqual(ref.job_id, job.id)
+                self.assertEqual(ref.version, 2)
                 return len(opened), clock[0]
             finally:
                 if query_error is not None:
@@ -92,28 +82,28 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
         # Numeric values work on Python 3.9, before sqlite_errorcode constants.
         for code in (5, 6, 261, 517, 262):
             with self.subTest(code=code):
-                count, elapsed = self.launch([dict(kind='OperationalError', error='contended', code=code)])
+                count, elapsed = self.bind([dict(kind='OperationalError', error='contended', code=code)])
                 self.assertEqual(count, 2)
                 self.assertGreater(elapsed, .1)
         for message in ('database is locked', 'database table is locked', 'database schema is locked'):
             with self.subTest(message=message):
-                count, _ = self.launch([dict(kind='OperationalError', error=message)])
+                count, _ = self.bind([dict(kind='OperationalError', error=message)])
                 self.assertEqual(count, 2)
 
     def test_confirmed_reader_lock_then_success(self):
-        count, elapsed = self.launch([dict(kind='unavailable', code=5,
+        count, elapsed = self.bind([dict(kind='unavailable', code=5,
             error='unable to open database: active reader; sidecars may be missing')])
         self.assertEqual(count, 2)
         self.assertGreater(elapsed, .1)
 
     def test_unclassified_active_reader_then_success(self):
-        count, elapsed = self.launch([dict(kind='unavailable',
+        count, elapsed = self.bind([dict(kind='unavailable',
             error='unable to open database: active reader; sidecars may be missing')])
         self.assertEqual(count, 2)
         self.assertGreater(elapsed, .1)
 
     def test_proven_topology_change_then_success(self):
-        count, _ = self.launch([dict(kind='unavailable',
+        count, _ = self.bind([dict(kind='unavailable',
             error='unable to open database: source changed', launch_topology_change=True)])
         self.assertEqual(count, 2)
 
@@ -124,7 +114,7 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
             path.rename(moved)
             moved.rename(path)
         with self.assertRaises(StoreIdentityError):
-            self.launch([dict(kind='unavailable',
+            self.bind([dict(kind='unavailable',
                 error='unable to open database: active reader; sidecars may be missing')], after_failure=aba)
 
     def test_exhausted_deadline_propagates_and_reaps(self):
@@ -132,7 +122,7 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
             with self.subTest(code=code):
                 errors = [dict(kind='OperationalError', error='contended', code=code) for _ in range(3)]
                 with self.assertRaises(sqlite3.OperationalError) as caught:
-                    self.launch(errors, step=2.5)
+                    self.bind(errors, step=2.5)
                 self.assertEqual(caught.exception.sqlite_errorcode, code)
                 self.assertEqual(len(errors), 1)
 
@@ -152,7 +142,7 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
             with self.subTest(kind=kind, message=message, code=code):
                 errors = [dict(kind=kind, error=message, code=code)] * 2
                 with self.assertRaises(sqlite3.DatabaseError) as caught:
-                    self.launch(errors)
+                    self.bind(errors)
                 self.assertEqual(str(caught.exception), message)
                 self.assertEqual(len(errors), 1)
 
@@ -162,7 +152,7 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
                 c.execute("UPDATE metadata SET value='00000000-0000-0000-0000-000000000001' WHERE key='incarnation'")
                 c.commit()
         with self.assertRaises(StoreIdentityError):
-            self.launch([dict(kind='OperationalError', error='contended', code=5)],
+            self.bind([dict(kind='OperationalError', error='contended', code=5)],
                         after_failure=replace_identity)
 
     def test_missing_identity_after_contention_is_not_retried(self):
@@ -171,12 +161,12 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
                 c.execute("DELETE FROM metadata WHERE key='incarnation'")
                 c.commit()
         with self.assertRaisesRegex(StoreIdentityError, 'missing or corrupt'):
-            self.launch([dict(kind='OperationalError', error='contended', code=262)],
+            self.bind([dict(kind='OperationalError', error='contended', code=262)],
                         after_failure=remove_identity)
 
     def test_query_lock_is_not_retried(self):
         with self.assertRaises(sqlite3.OperationalError) as caught:
-            self.launch([], query_error=dict(kind='OperationalError', error='query lock', code=517))
+            self.bind([], query_error=dict(kind='OperationalError', error='query lock', code=517))
         self.assertEqual(caught.exception.sqlite_errorcode, 517)
 
 
