@@ -8,6 +8,13 @@ import time
 from pathlib import Path
 
 
+_WINDOWS = os.name == 'nt'
+
+
+def stamp(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def emit(value):
     print(json.dumps(value), flush=True)
 
@@ -17,7 +24,7 @@ def stamps(path):
     for suffix in ('', '-wal', '-shm', '-journal'):
         try:
             st = os.stat(str(path) + suffix)
-            result.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+            result.append(stamp(st))
         except FileNotFoundError:
             result.append(None)
     return result
@@ -71,6 +78,17 @@ def main(path):
         source = path.open('rb')
         exclusive = False
     with source:
+        descriptor = os.fstat(source.fileno())
+        descriptor_before = stamp(descriptor)
+        # CPython 3.12 Windows stat uses CreationTime for ctime, while
+        # fstat uses ChangeTime. Bind in the path's time domain, then keep
+        # the complete descriptor stamp (including ChangeTime) for its fence.
+        bound_stamp = descriptor_before
+        if _WINDOWS and hasattr(descriptor, 'st_birthtime_ns'):
+            bound_stamp = descriptor_before[:4] + (descriptor.st_birthtime_ns,)
+        if bound_stamp != before[0]:
+            emit(dict(kind='unavailable', error='unable to open database: source changed'))
+            return
         if os.name == 'nt':
             import msvcrt
             from ctypes import wintypes
@@ -148,7 +166,7 @@ def main(path):
                 return
             def unchanged():
                 st = os.fstat(source.fileno())
-                return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns) == before[0]
+                return stamp(st) == descriptor_before
             emit(dict(journal='wal' if header[18:20] == b'\x02\x02' else 'delete'))
             def event(name, args):
                 emit(dict(event=name, args=args))
