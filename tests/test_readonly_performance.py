@@ -120,6 +120,28 @@ class ReadonlyPerformanceTests(unittest.TestCase):
                     _ = store.incarnation
                 self.assertEqual(opens.call_count, 1)
 
+    def test_incarnation_retries_transient_reader_unavailability(self):
+        from puppetmaster import projections
+
+        with TemporaryDirectory() as root:
+            store = SwarmStore(root)
+            store.create_job('retry worker attach')
+            expected = store.incarnation
+            original = projections.connection
+            calls = [0]
+
+            def open_connection(*args, **kwargs):
+                calls[0] += 1
+                if calls[0] == 1:
+                    raise readonly.ReadUnavailable(
+                        'unable to open database: active reader; sidecars may be missing'
+                    )
+                return original(*args, **kwargs)
+
+            with patch.object(projections, 'connection', side_effect=open_connection):
+                self.assertEqual(store.incarnation, expected)
+            self.assertEqual(calls[0], 2)
+
     def test_cached_helper_refreshes_commits_and_fences_replacement(self):
         for cls in (SwarmStore, SQLiteSwarmStore):
             with self.subTest(backend=cls.backend_name), TemporaryDirectory() as tmp:
