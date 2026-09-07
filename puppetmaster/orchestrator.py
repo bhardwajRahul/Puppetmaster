@@ -2411,16 +2411,14 @@ class Orchestrator:
         roles = sorted({task.role for task in tasks})
         record_orchestrator_heartbeat(self.store, job.id)
         processes = [
-            self._spawn_worker(job.id, role, lease_seconds=lease_seconds)
+            (role, self._spawn_worker(job.id, role, lease_seconds=lease_seconds))
             for role in roles
         ]
         try:
-            for process in processes:
+            for role, process in processes:
                 self._wait_for_worker(process, job, tasks)
                 if process.returncode != 0:
-                    raise RuntimeError(
-                        f"worker process failed with exit code {process.returncode}"
-                    )
+                    raise self._worker_exit_error(job.id, role, process)
 
             if self.store.has_incomplete_tasks(job.id):
                 recovered = self.store.recover_stale_tasks(job.id)
@@ -2465,7 +2463,7 @@ class Orchestrator:
                 elif self._should_fail_closed(job, allowed_task_ids):
                     raise RuntimeError("swarm exited with incomplete tasks")
         finally:
-            for process in processes:
+            for _role, process in processes:
                 if process.poll() is None:
                     process.terminate()
                     try:
@@ -2584,21 +2582,21 @@ class Orchestrator:
         roles = sorted({task.role for task in dependencies})
         self._ensure_store_schema()
         processes = [
-            self._spawn_worker(job.id, role, lease_seconds=lease_seconds)
+            (role, self._spawn_worker(job.id, role, lease_seconds=lease_seconds))
             for role in roles
         ]
         try:
-            for process in processes:
+            for role, process in processes:
                 process.wait(timeout=self._worker_wait_timeout(dependencies))
                 if process.returncode != 0:
-                    raise RuntimeError(
-                        f"prerequisite worker failed with exit code {process.returncode}"
+                    raise self._worker_exit_error(
+                        job.id, role, process, phase="prerequisite worker"
                     )
         finally:
             # If a wait timed out or a prerequisite failed mid-batch, don't
             # leave the remaining workers running as orphans — terminate (then
             # kill) any that are still alive so they don't outlive the job.
-            for process in processes:
+            for _role, process in processes:
                 if process.poll() is None:
                     process.terminate()
                     try:
@@ -2656,6 +2654,30 @@ class Orchestrator:
             env["TRACEPARENT"] = self._traceparent
             env["PUPPETMASTER_TRACEPARENT"] = self._traceparent
         return subprocess.Popen(command, env=env)
+
+    def _worker_exit_error(
+        self,
+        job_id: str,
+        role: str,
+        process: subprocess.Popen,
+        *,
+        phase: str = "worker",
+    ) -> RuntimeError:
+        """Include the worker's durable failure traceback when one exists."""
+        message = f"{phase} {role!r} failed with exit code {process.returncode}"
+        expected = f"startup_error-worker-{role}-{process.pid}.log"
+        task_dir = self.store.job_dir(job_id) / "tasks"
+        try:
+            error_file = next(
+                path for path in task_dir.glob("startup_error-*.log")
+                if path.name == expected
+            )
+            detail = error_file.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, StopIteration):
+            detail = ""
+        if detail:
+            message += f"\n{detail[-8000:]}"
+        return RuntimeError(message)
 
     @staticmethod
     def _worker_wait_timeout(tasks: list[Task]) -> int:
