@@ -156,7 +156,7 @@ class SqliteAttachEnsureTests(unittest.TestCase):
                     thread.join()
 
             if errors:
-                self.fail("\n\n".join(errors[:2]))
+                self.fail("\n\n".join(str(error) for error in errors[:2]))
             self.assertEqual(scripts, [])
             self.assertEqual(metadata_inserts, [])
 
