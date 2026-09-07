@@ -26,6 +26,10 @@ class ReadUnavailable(sqlite3.OperationalError):
     retry_after_ms = 100
 
 
+class ReadTimeout(ReadUnavailable):
+    """The helper exhausted its response budget without reporting contention."""
+
+
 def _source_stamp(store):
     path = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
     result = []
@@ -134,8 +138,10 @@ class ReadConnection:
         self._opened = False
         self.closed = False
         self._authorizer = self._progress = self._trace = None
-        self.timeout = max(0.001, timeout)
-        open_deadline = time.monotonic() + self.timeout
+        # A zero SQLite busy budget still permits one bounded helper response.
+        # Interpreter startup is not evidence of database lock contention.
+        self.timeout = 5.0 if timeout <= 0 else max(0.001, timeout)
+        open_deadline = time.monotonic() + max(0, timeout)
         write_deadline = open_deadline if attach_binding or launch_binding else min(open_deadline, time.monotonic() + (0.1 if reuse else 1.0))
         path = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
         try:
@@ -169,7 +175,7 @@ class ReadConnection:
                 self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
                 self.process.stdin.flush()
             while True:
-                if attach_binding:
+                if attach_binding and timeout > 0:
                     self.timeout = max(.001, open_deadline - time.monotonic())
                 try:
                     self.source_journal_mode = self._receive()['journal']
@@ -196,6 +202,8 @@ class ReadConnection:
                     self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
                     self.process.stdin.flush()
             self._opened = True
+            if timeout <= 0:
+                self.timeout = .1
         except BaseException as exc:
             self._abort()
             if (reuse and isinstance(exc, ReadUnavailable) and
@@ -214,7 +222,7 @@ class ReadConnection:
             try:
                 line = self.responses.get(timeout=self.timeout)
             except queue.Empty as exc:
-                raise ReadUnavailable('unable to open database: reader timed out') from exc
+                raise ReadTimeout('unable to open database: reader timed out') from exc
             if not self._opened:
                 self._fence()
             if not line or len(line) > 8 * 1024 * 1024:
@@ -334,7 +342,7 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
         if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
             raise ReadUnavailable('unable to open database: source changed')
         try:
-            connection = ReadConnection(store, max(0, deadline - time.monotonic()) if timeout > 0 else 0.1,
+            connection = ReadConnection(store, max(.001, deadline - time.monotonic()) if timeout > 0 else 0,
                                         reuse=reuse, attach_binding=attach_binding, launch_binding=launch_binding)
             if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
                 connection._abort()

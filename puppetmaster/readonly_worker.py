@@ -51,13 +51,21 @@ def source_stamp(path=None, *, fd=None):
             close(handle)
             raise
     try:
-        st = os.fstat(fd)
-        info = BasicInfo()
-        if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):
-            raise ctypes.WinError(ctypes.get_last_error())
+        # fstat's size and FILE_BASIC_INFO are separate native queries. Fence
+        # the size query with BasicInfo so a writer cannot splice old size into
+        # new timestamps (or new size into old timestamps).
         epoch = 116444736000000000
-        return (st.st_dev, st.st_ino, st.st_size,
-                (info.write - epoch) * 100, (info.change - epoch) * 100)
+        for _ in range(8):
+            first, last = BasicInfo(), BasicInfo()
+            if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(first), ctypes.sizeof(first)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            st = os.fstat(fd)
+            if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(last), ctypes.sizeof(last)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            write = (last.write - epoch) * 100
+            if (first.write, first.change) == (last.write, last.change) and st.st_mtime_ns == write:
+                return (st.st_dev, st.st_ino, st.st_size, write, (last.change - epoch) * 100)
+        raise OSError('source metadata did not stabilize')
     finally:
         if owned:
             os.close(fd)

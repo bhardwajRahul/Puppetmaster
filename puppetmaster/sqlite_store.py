@@ -82,6 +82,9 @@ class SqliteSchemaError(RuntimeError):
 def _is_sqlite_lock_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return isinstance(code, int) and (code & 0xff) in (5, 6)
     message = str(exc).lower()
     return "locked" in message or "busy" in message
 
@@ -254,8 +257,16 @@ class SQLiteSwarmStore(SwarmStore):
                 self._incarnation = incarnation
                 break
             except sqlite3.OperationalError as exc:
-                from puppetmaster.readonly import ReadUnavailable
+                from puppetmaster.readonly import ReadTimeout, ReadUnavailable
                 locked = _is_sqlite_lock_error(exc)
+                # A silent helper has used its response budget, not reported a
+                # SQLite lock. Do not multiply its startup allowance here.
+                if isinstance(exc, ReadTimeout):
+                    raise
+                # The helper already exhausted any proven write retry. A fresh
+                # binding must not erase an unproven source-change rejection.
+                if isinstance(exc, ReadUnavailable) and "source changed" in str(exc):
+                    raise
                 if not locked and not isinstance(exc, ReadUnavailable):
                     raise
                 if locked:
