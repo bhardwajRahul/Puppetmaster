@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import threading
 import time
 from dataclasses import replace
@@ -494,7 +495,17 @@ class WorkerRuntime:
         lease_id: Optional[str] = None,
     ) -> None:
         while not stop.wait(self._heartbeat_interval()):
-            run, renewed = self._heartbeat_run_and_lease(run, task_id, lease_id)
+            try:
+                run, renewed = self._heartbeat_run_and_lease(run, task_id, lease_id)
+            except sqlite3.OperationalError as exc:
+                from puppetmaster.sqlite_store import _is_sqlite_lock_error
+
+                if not _is_sqlite_lock_error(exc):
+                    raise
+                # A failed reservation did not mutate either record. Let the
+                # next heartbeat determine whether the lease still belongs to
+                # this worker instead of killing the background thread.
+                continue
             if renewed is None:
                 self._lease_lost.set()
                 stop.set()

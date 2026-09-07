@@ -27182,6 +27182,37 @@ class AuditFixTests(unittest.TestCase):
         self.assertTrue(stop.is_set())
         self.assertTrue(runtime._lease_lost.is_set())
 
+    def test_heartbeat_loop_survives_transient_sqlite_writer_contention(self) -> None:
+        import sqlite3
+
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        renewed = MagicMock()
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+            lease_seconds=30,
+            heartbeat_seconds=0.01,
+        )
+        stop = MagicMock()
+        stop.wait.side_effect = [False, False, True]
+
+        with patch.object(
+            runtime,
+            "_heartbeat_run_and_lease",
+            side_effect=[
+                sqlite3.OperationalError("database is locked"),
+                (MagicMock(), renewed),
+            ],
+        ) as heartbeat:
+            runtime._heartbeat_until_stopped(MagicMock(), "task_x", stop)
+
+        self.assertEqual(heartbeat.call_count, 2)
+        self.assertFalse(runtime._lease_lost.is_set())
+
     def test_heartbeat_loop_uses_heartbeat_interval_not_poll_interval(self) -> None:
         from puppetmaster.worker_runtime import WorkerRuntime
 
