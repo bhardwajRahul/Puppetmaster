@@ -198,6 +198,7 @@ class ReadConnection:
             write_deadline = attach_deadline
         response_deadline = open_deadline
         initial_response = True
+        retry_error = None
         path = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
         try:
             weakref.ref(store)
@@ -252,12 +253,24 @@ class ReadConnection:
                 try:
                     self.source_journal_mode = self._receive()['journal']
                     break
+                except ReadTimeout:
+                    # A retry may have only microseconds left in the ordinary
+                    # contention window. Expiring that window is still the
+                    # proven contention, not an unresponsive startup. Keep
+                    # binding/initial-response timeouts distinct and bounded.
+                    if (retry_error is not None and not (attach_binding or launch_binding)
+                            and write_deadline < open_deadline
+                            and time.monotonic() >= write_deadline):
+                        raise retry_error
+                    raise
                 except sqlite3.OperationalError as exc:
                     write_race = getattr(exc, 'same_store_write', False)
                     topology_race = attach_binding and getattr(exc, 'launch_topology_change', False)
                     if not (write_race or topology_race or (attach_binding or not launch_binding) and _locked(exc)):
                         raise
-                    retry_deadline = (write_deadline if write_race or not (attach_binding or launch_binding)
+                    # A responsive attach helper keeps the aggregate allowance
+                    # after BUSY too; restarting it amplifies startup contention.
+                    retry_deadline = (write_deadline if write_race or attach_binding or not launch_binding
                                       else open_deadline)
                     remaining = retry_deadline - time.monotonic()
                     if remaining <= 0:
@@ -273,6 +286,7 @@ class ReadConnection:
                     _metadata_fence(retry_source, current_source)
                     retry_source = current_source
                     response_deadline = retry_deadline
+                    retry_error = exc
                     self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
                     self.process.stdin.flush()
             self._opened = True

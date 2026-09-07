@@ -218,10 +218,54 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                     with self.assertRaises(sqlite3.OperationalError):
                         store.attach()
                 self.assertLessEqual(clock[0], .501)
-                self.assertEqual(spawn.call_count, 2)
-                self.assertEqual(store.lock_error_count, 2)
+                self.assertEqual(spawn.call_count, 1)
+                self.assertEqual(store.lock_error_count, 1)
                 self.assertFalse(store._attached)
                 self.assertTrue(all(c.closed and c.process.poll() is not None for c in responses))
+
+    def test_delayed_attach_busy_retries_in_the_started_helper(self):
+        for code in (5, 6):
+            with self.subTest(code=code), TemporaryDirectory() as tmp:
+                supervisor = SQLiteSwarmStore(tmp)
+                supervisor.ensure_schema()
+                store = SQLiteSwarmStore(tmp)
+                store.busy_timeout_ms = 100
+                clock = [0.0]
+                receive = readonly.ReadConnection._receive
+                opened = []
+
+                def delayed_busy(connection):
+                    response = receive(connection)
+                    if not connection._opened and not opened:
+                        opened.append(connection)
+                        connection._opened = True
+                        connection._control('release', True)
+                        connection._opened = False
+                        # A scheduled helper can answer after the individual
+                        # busy timeout but within the aggregate attach budget.
+                        clock[0] += .15
+                        with patch.object(connection.responses, 'get', return_value=json.dumps(
+                                dict(kind='OperationalError', error='database is locked', code=code))):
+                            return receive(connection)
+                    return response
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
+                with patch.object(readonly.ReadConnection, '_receive', delayed_busy), \
+                        patch.object(readonly, 'time', timer), \
+                        patch.object(sqlite_store, 'time', timer), \
+                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn, \
+                        patch.object(store, '_sleep_lock_backoff') as backoff:
+                    store.attach()
+                self.assertTrue(store._attached)
+                self.assertEqual(store._incarnation, supervisor._incarnation)
+                self.assertEqual(spawn.call_count, 1)
+                backoff.assert_not_called()
+                self.assertLess(clock[0], .5)
+                self.assertTrue(opened[0].closed)
+                self.assertIsNotNone(opened[0].process.poll())
 
     def test_attach_startup_uses_shared_deadline(self):
         for delay, prior_busy in ((6.0, False), (24.0, False), (None, False), (None, True)):
@@ -257,6 +301,9 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                                 clock[0] += delay
                                 return json.dumps(dict(journal='delete'))
                             request = json.loads(self.process.stdin.getvalue().splitlines()[-1])
+                            if 'open' in request:
+                                clock[0] += timeout
+                                raise queue.Empty()
                             cursor = database.execute(request['sql'], request['parameters'])
                             return json.dumps(dict(rows=cursor.fetchall(),
                                 names=[d[0] for d in cursor.description or ()]))
@@ -274,7 +321,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         if delay is None:
                             with self.assertRaises(readonly.ReadTimeout):
                                 store.attach()
-                            self.assertEqual(clock[0], 25.0)
+                            self.assertAlmostEqual(clock[0], 11.05 if prior_busy else 25.0)
                         else:
                             store.attach()
                             self.assertTrue(store._attached)
@@ -282,9 +329,9 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                             self.assertTrue(all(t <= 5 for _, t in waits[1:]))
                 self.assertEqual(waits[0], (0.0, 25.0))
                 self.assertTrue(all(start + t <= 25 for start, t in waits))
-                self.assertEqual(len(transports), 2 if prior_busy else 1)
+                self.assertEqual(len(transports), 1)
                 self.assertTrue(all(t.closed and not t.busy.locked() for t in transports))
-                self.assertEqual(store.lock_error_count, int(prior_busy))
+                self.assertEqual(store.lock_error_count, 0)
                 self.assertEqual(store._attached, delay is not None)
                 self.assertEqual(before,
                     {p.name: p.read_bytes() for p in store.root.iterdir() if p.is_file()})
