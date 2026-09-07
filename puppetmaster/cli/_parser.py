@@ -111,6 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="puppetmaster",
         description="Run independent agent workers that write structured artifacts.",
     )
+    parser.add_argument("--store-incarnation", help=argparse.SUPPRESS)
+    parser.add_argument("--job-ref", help="Versioned JobRef JSON; validates and pins the store incarnation.")
     parser.add_argument(
         "--state-dir",
         help=(
@@ -649,6 +651,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force promoted shared-memory injection on all workers.",
     )
     _add_label_argument(run)
+
+    for command in ('job-summaries', 'job-summary-changes', 'selected-economics'):
+        bounded = subcommands.add_parser(command, help='Read one bounded metadata result without source hydration.')
+        bounded.add_argument('--json', action='store_true')
+        if command == 'selected-economics':
+            bounded.add_argument('--expected-summary-revision', type=int)
+        else:
+            bounded.add_argument('--cursor')
+            bounded.add_argument('--limit', type=int, default=100)
+            bounded.add_argument('--max-scan', type=int, default=1000)
+            bounded.add_argument('--max-bytes', type=int, default=262144)
+            for name in ('status', 'origin', 'project-id', 'session-id'):
+                bounded.add_argument('--' + name)
+            if command == 'job-summary-changes':
+                bounded.add_argument('--after-revision', type=int, default=0)
 
     jobs_parser = subcommands.add_parser("jobs", help="List known jobs.")
     jobs_parser.add_argument(

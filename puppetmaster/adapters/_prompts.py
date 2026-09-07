@@ -432,7 +432,7 @@ def with_job_brief(prompt: str, task: Task) -> str:
     return _reanchor_acceptance_criteria(prompt, task)
 
 
-def _open_store_for_task(task: Task):
+def _open_store_for_task(task: Task, *, discover: bool = True):
     """Best-effort open of the active store for ``task.job_id``.
 
     Mirrors :func:`puppetmaster.job_brief.resolve_job_brief_for_task` state-dir
@@ -450,7 +450,7 @@ def _open_store_for_task(task: Task):
     from puppetmaster.store_factory import create_store
 
     state_dir = _resolve_sidecar_state_dir()
-    if state_dir is None:
+    if state_dir is None and discover:
         state_dir = find_state_dir_for_job(job_id)
     if state_dir is None and os.environ.get(STATE_DIR_ENV):
         try:
@@ -561,12 +561,12 @@ def with_prewalk_plan(prompt: str, task: Task) -> str:
             cwd = None
         role = str(payload.get("prewalk_role") or getattr(task, "role", "") or "")
         verify_role = role == VERIFY_ROLE
-        store = _open_store_for_task(task)
         inline = payload.get("prewalk_artifacts")
         if inline is not None:
             artifacts = list(inline)
             if not artifacts:
                 return prompt
+            store = _open_store_for_task(task, discover=False)
             if verify_role:
                 return inject_upstream_into_prompt(
                     prompt, artifacts, cwd=cwd, store=store
@@ -575,6 +575,7 @@ def with_prewalk_plan(prompt: str, task: Task) -> str:
                 prompt, artifacts, cwd=cwd, store=store
             )
 
+        store = _open_store_for_task(task)
         edge_artifacts: list = []
         if store is not None:
             edge_artifacts = list(

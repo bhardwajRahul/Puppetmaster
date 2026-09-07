@@ -71,6 +71,36 @@ def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, int]]:
     return result
 
 
+def selected_token_usage(usage, previous=None):
+    """Bounded presence facts; a missing turn cannot become a measured zero."""
+    aliases = {
+        'tokens_in': ('inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'),
+        'tokens_out': ('outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'),
+        'cache_read_tokens': ('cacheReadTokens', 'cache_read_tokens'),
+        'cache_write_tokens': ('cacheWriteTokens', 'cache_write_tokens'),
+    }
+    usage = usage if isinstance(usage, dict) else {}
+    estimated = usage.get('tokens_estimated', False)
+    result = {'version': 1}
+    for field, keys in aliases.items():
+        value = next((usage[k] for k in keys if k in usage), None)
+        if type(estimated) is not bool or type(value) is not int:
+            value = None
+        elif not 0 <= value <= 2**53 - 1:
+            value = -1  # Bounded invalid count preserves the numeric-limit outcome.
+        if previous is not None:
+            prior = previous['selected_facts'].get(field)
+            if prior is not None and value is not None:
+                value = -1 if prior < 0 or value < 0 else prior + value
+            else:
+                value = None
+            if value is not None and value > 2**53 - 1:
+                value = -1
+        result[field] = value
+    return {'selected_facts': result, 'tokens_estimated': estimated is True or
+            (previous is not None and previous['tokens_estimated'])}
+
+
 def token_usage(
     *,
     sdk_usage: Any = None,
@@ -88,7 +118,7 @@ def token_usage(
         record = {
             "tokens_in": measured["tokens_in"],
             "tokens_out": measured["tokens_out"],
-            "tokens_estimated": False,
+            **selected_token_usage(sdk_usage),
         }
         for cache_key in ("cache_read_tokens", "cache_write_tokens"):
             if cache_key in measured:
@@ -98,6 +128,7 @@ def token_usage(
         "tokens_in": _approx_tokens(prompt_text),
         "tokens_out": _approx_tokens(output_text),
         "tokens_estimated": True,
+        "selected_facts": {"version": 1, "tokens_in": _approx_tokens(prompt_text), "tokens_out": _approx_tokens(output_text)},
     }
 
 
@@ -161,7 +192,17 @@ def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
             "real_cost_usd": payload.get("real_cost_usd"),
             "tokens_estimated": bool(payload.get("tokens_estimated")),
             "model": payload.get("model"),
+            "selected_facts": {key: payload["selected_facts"].get(key) for key in
+                               ("tokens_in", "tokens_out", "cache_read_tokens", "cache_write_tokens")}
+            if (isinstance(payload.get("selected_facts"), dict)
+                and type(payload["selected_facts"].get("version")) is int
+                and payload["selected_facts"]["version"] == 1
+                and type(payload.get("tokens_estimated")) is bool) else {},
         }
+        # An explicit provider cost (including zero) does not inherit the
+        # legacy token-normalizer's missing-field ambiguity.
+        if "real_cost_usd" in payload:
+            records[task_id]["selected_facts"]["real_cost_usd"] = payload["real_cost_usd"]
         # Presence distinguishes SDK split (exclusive input) from legacy
         # tokens_cached (a subset of input). Do not synthesize absent keys.
         for key in ("cache_read_tokens", "cache_write_tokens"):

@@ -310,22 +310,8 @@ def wait_for_job_id(
 
 def terminate_launcher_tree(process: subprocess.Popen) -> None:
     """Terminate a detached launcher's exact process tree on early failure."""
-    try:
-        if os.name == "nt":
-            from puppetmaster.win_process import kill_process_tree
-
-            if process.pid and kill_process_tree(process.pid):
-                return
-    except Exception:
-        pass
-    try:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-    except (OSError, ProcessLookupError):
-        pass
+    from puppetmaster.win_process import cleanup_owned_process
+    cleanup_owned_process(process, "", time.monotonic() + 2)
 
 
 def detach_analysis_swarm(
@@ -376,6 +362,8 @@ def detach_analysis_swarm(
         disable_memory=disable_memory,
         playbook=playbook,
     )
+    from puppetmaster.identity import prepare_launch
+    incarnation = prepare_launch(Path(state_dir), backend)
     run_dir = Path(state_dir) / "mcp-runs"
     run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
         run_dir, "swarm"
@@ -391,6 +379,8 @@ def detach_analysis_swarm(
         str(state_dir),
         "--backend",
         backend,
+        "--store-incarnation",
+        incarnation,
         "--emit-job-id-early",
         "run",
         "--goal-file",
@@ -437,19 +427,18 @@ def detach_analysis_swarm(
         stdout_handle.close()
         stderr_handle.close()
         raise
+    process._puppetmaster_session = True
     stdout_handle.close()
     stderr_handle.close()
     try:
         job_id = wait_for_job_id(
             stdout_path, stderr_path, process, timeout_seconds=job_id_timeout_seconds
         )
+        from puppetmaster.identity import reference_at
+        job_ref = reference_at(Path(state_dir), job_id, expected_incarnation=incarnation, launch_binding=True).as_dict()
     except BaseException:
         terminate_launcher_tree(process)
         raise
-    job_ref = {
-        "job_id": job_id,
-        "state_id": state_identity(state_dir),
-    }
     body = {
         "ok": True,
         "job_id": job_id,

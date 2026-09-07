@@ -82,6 +82,9 @@ class SqliteSchemaError(RuntimeError):
 def _is_sqlite_lock_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return isinstance(code, int) and (code & 0xff) in (5, 6)
     message = str(exc).lower()
     return "locked" in message or "busy" in message
 
@@ -95,7 +98,7 @@ class SQLiteSwarmStore(SwarmStore):
     """SQLite-backed coordination store for multi-process worker coordination."""
 
     backend_name = "sqlite"
-    schema_version = 5
+    schema_version = 7
     busy_timeout_ms = _SQLITE_BUSY_TIMEOUT_MS
     synchronous_policy = _SQLITE_SYNCHRONOUS
 
@@ -104,6 +107,7 @@ class SQLiteSwarmStore(SwarmStore):
         self.db_path = self.root / "state.sqlite3"
         # Schema DDL is supervisor-only (ensure_schema / init). Workers attach
         # and never CREATE/INSERT metadata. Both flags are per-process.
+        self._incarnation = None
         self._initialized = False
         self._attached = False
         self._open_mode = "deferred"
@@ -214,6 +218,8 @@ class SQLiteSwarmStore(SwarmStore):
             self._migrate_schema(connection)
         chmod_private_file(self.db_path)
         self._initialized = True
+        from puppetmaster.readonly import selection
+        self._read_selection = selection(self)
         self._attached = True
         from puppetmaster.host_lifecycle import record_host_start
 
@@ -237,19 +243,67 @@ class SQLiteSwarmStore(SwarmStore):
             # on attach() and fail closed instead of racing DDL.
             self.ensure_schema()
             return
-        connection = self._connect_with_lock_retry()
-        try:
-            self._assert_schema(connection)
-        finally:
-            connection.close()
+        # All helper attempts and lock backoffs share this availability budget.
+        timeout = self.busy_timeout_ms / 1000.0
+        attach_deadline = time.monotonic() + timeout * _SQLITE_LOCK_RETRY_ATTEMPTS if timeout > 0 else None
+        for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
+            connection = None
+            try:
+                connection = self._connect_readonly(attach_binding=True, attach_deadline=attach_deadline)
+                version = self._assert_schema(connection)
+                from puppetmaster.identity import read_identity, StoreIdentityError
+                self._legacy_schema = str(version) != str(self.schema_version)
+                incarnation = read_identity(connection, "sqlite") if str(version) != "5" else None
+                if self._incarnation is not None and self._incarnation != incarnation:
+                    raise StoreIdentityError("store replaced since reference binding")
+                self._incarnation = incarnation
+                break
+            except sqlite3.OperationalError as exc:
+                from puppetmaster.readonly import ReadTimeout, ReadUnavailable
+                locked = _is_sqlite_lock_error(exc)
+                # A silent helper has used its response budget, not reported a
+                # SQLite lock. Do not multiply its startup allowance here.
+                if isinstance(exc, ReadTimeout):
+                    raise
+                # The helper already exhausted any proven write retry. A fresh
+                # binding must not erase an unproven source-change rejection.
+                if isinstance(exc, ReadUnavailable) and "source changed" in str(exc):
+                    raise
+                if not locked and not isinstance(exc, ReadUnavailable):
+                    raise
+                if locked:
+                    self._record_lock_error()
+                if attempt + 1 == _SQLITE_LOCK_RETRY_ATTEMPTS:
+                    raise
+                if attach_deadline is None:
+                    self._sleep_lock_backoff(attempt)
+                else:
+                    if time.monotonic() >= attach_deadline:
+                        raise
+                    self._sleep_lock_backoff(attempt, deadline=attach_deadline)
+                    if time.monotonic() >= attach_deadline:
+                        raise
+            finally:
+                if connection is not None:
+                    connection.close()
         self._attached = True
 
-    def _assert_schema(self, connection: sqlite3.Connection) -> None:
+    def _assert_schema(self, connection: sqlite3.Connection) -> str:
+        from puppetmaster.readonly import ReadTimeout
+        # Batch the fixed schema checks into one snapshot to avoid serializing
+        # eight IPC round trips per worker when many processes attach at once.
         try:
             row = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
+                "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value, "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='completions'), "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_attempts'), "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_observations'), "
+                "EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_reservations') "
+                "FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
         except sqlite3.OperationalError as exc:
+            if isinstance(exc, ReadTimeout) or _is_sqlite_lock_error(exc):
+                raise
             raise SqliteSchemaError(
                 f"SQLite store schema is missing at {self.db_path}: {exc}"
             ) from exc
@@ -258,9 +312,7 @@ class SQLiteSwarmStore(SwarmStore):
                 f"SQLite store has no schema_version at {self.db_path}; "
                 "the supervisor must call ensure_schema() before workers attach"
             )
-        if connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'completions'"
-        ).fetchone() is None:
+        if not row[1]:
             raise SqliteSchemaError(
                 "SQLite completion journal is missing; the supervisor must call ensure_schema()"
             )
@@ -271,16 +323,15 @@ class SQLiteSwarmStore(SwarmStore):
             raise SqliteSchemaError(
                 f"SQLite store schema_version is invalid at {self.db_path}: {raw!r}"
             ) from exc
-        for table in ("execution_attempts", "usage_observations", "budget_reservations"):
-            if connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-            ).fetchone() is None:
+        for index, table in enumerate(("execution_attempts", "usage_observations", "budget_reservations"), 2):
+            if not row[index]:
                 raise SqliteSchemaError(f"SQLite {table} missing; supervisor must migrate")
-        if current != self.schema_version:
+        if current not in (5, 6, self.schema_version):
             raise SqliteSchemaError(
                 f"SQLite store schema_version {current} does not match "
                 f"{self.schema_version} at {self.db_path}"
             )
+        return raw
 
     @staticmethod
     def _execute_schema_script(connection: sqlite3.Connection, script: str) -> None:
@@ -298,7 +349,7 @@ class SQLiteSwarmStore(SwarmStore):
         """Upgrade older state.sqlite3 files to the current schema_version."""
         self._reserve_writer(connection)
         row = connection.execute(
-            "SELECT value FROM metadata WHERE key = 'schema_version'"
+            "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
         try:
             current = int(row["value"]) if row is not None else 0
@@ -368,10 +419,14 @@ class SQLiteSwarmStore(SwarmStore):
                 (str(self.schema_version),),
             )
 
+        from puppetmaster.identity import bootstrap
+        self._incarnation = bootstrap(connection, "sqlite", legacy=current < 6)
         # Generated SQL can be stale even when the table shape/version is current.
         from puppetmaster.projections import install_source_triggers
         install_source_triggers(connection)
-        if current < 5:
+        from puppetmaster.history_metadata import install_source_triggers as install_history
+        install_history(connection)
+        if current < 7:
             connection.execute("UPDATE metadata SET value=? WHERE key='schema_version'",
                                (str(self.schema_version),))
 
@@ -530,9 +585,12 @@ class SQLiteSwarmStore(SwarmStore):
     def _record_lock_error(self) -> None:
         self.lock_error_count += 1
 
-    def _sleep_lock_backoff(self, attempt: int) -> None:
+    def _sleep_lock_backoff(self, attempt: int, *, deadline=None) -> None:
         delay = _SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
-        time.sleep(delay + random.uniform(0, delay))
+        delay += random.uniform(0, delay)
+        if deadline is not None:
+            delay = min(delay, max(0, deadline - time.monotonic()))
+        time.sleep(delay)
 
     def _connect_with_lock_retry(self) -> sqlite3.Connection:
         last_error: Optional[sqlite3.OperationalError] = None
@@ -570,9 +628,13 @@ class SQLiteSwarmStore(SwarmStore):
         if active is not None:
             yield active
             return
-        connection = self._connect_with_lock_retry()
+        connection = self._connect_readonly() if getattr(self, "_legacy_schema", False) else self._connect_with_lock_retry()
         try:
             with connection:
+                if self._incarnation is not None:
+                    from puppetmaster.identity import read_identity, StoreIdentityError
+                    if read_identity(connection, "sqlite") != self._incarnation:
+                        raise StoreIdentityError("store replaced since attach; explicitly reopen and rebind")
                 yield connection
         except sqlite3.OperationalError as exc:
             if _is_sqlite_lock_error(exc):
@@ -2086,12 +2148,12 @@ class SQLiteSwarmStore(SwarmStore):
             job_dir.rmdir()
 
     def schema_status(self) -> dict[str, str]:
-        self._ensure_attached()
-        with self._session() as connection:
+        from contextlib import closing
+        with closing(self._connect_readonly()) as connection:
             row = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
+                "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            journal = connection.execute("PRAGMA journal_mode").fetchone()
+            journal = (connection.source_journal_mode,)
             busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()
             foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
             synchronous = connection.execute("PRAGMA synchronous").fetchone()
@@ -2170,15 +2232,15 @@ class SQLiteSwarmStore(SwarmStore):
             "check_kind": "quick_check",
         }
 
-    def _connect_readonly(self) -> sqlite3.Connection:
+    def _connect_readonly(self, *, attach_binding=False, attach_deadline=None) -> sqlite3.Connection:
         """Open the DB read-only without applying write-side durability PRAGMAs."""
-        uri = self.db_path.resolve().as_uri() + "?mode=ro"
-        connection = sqlite3.connect(
-            uri, uri=True, timeout=self.busy_timeout_ms / 1000.0
-        )
+        from puppetmaster.readonly import connect
+        timeout = self.busy_timeout_ms / 1000.0
+        # Spend attach's write-contention budget in one fenced helper. A proven
+        # write can outlast one busy timeout; rebinding here would lose history.
+        connection = connect(self, timeout=timeout, attach_binding=attach_binding,
+                             attach_deadline=attach_deadline)
         try:
-            connection.row_factory = sqlite3.Row
-            # busy_timeout is connection-local and read-safe; keeps the probe bounded.
             connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         except Exception:
             connection.close()

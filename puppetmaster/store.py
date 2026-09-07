@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import json
 import os
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -23,6 +24,7 @@ from puppetmaster.models import (
     GraphEdgeType,
     GraphNodeKind,
     Job,
+    JobRef,
     JobStatus,
     MemoryRecord,
     Task,
@@ -43,9 +45,13 @@ from puppetmaster.attempts import (
     ExecutionAttempt, UsageObservation, LedgerConflictError, canonical_record,
 )
 from puppetmaster.cost import maybe_stamp_terminal_cost_receipt
+from puppetmaster.selected_economics import SelectedEconomics
 from puppetmaster.redaction import redact_payload_for_storage
 from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
-from puppetmaster.state import ensure_state_dir, resolve_state_dir
+from puppetmaster.state import resolve_state_dir
+from puppetmaster.readonly import ReadUnavailable, selection
+from puppetmaster.identity import make_ref, read_identity, StoreIdentityError
+from puppetmaster.projections import connection as projection_connection
 
 _WINDOWS_LOCK_RETRIES = 10
 _WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
@@ -233,7 +239,6 @@ class SwarmStore(StoreContracts):
 
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         self.root = resolve_state_dir(root)
-        ensure_state_dir(self.root)
         self.jobs_dir = self.root / "jobs"
         self.memory_dir = self.root / "memory"
         self.stream_dir = self.root / "streams"
@@ -242,8 +247,10 @@ class SwarmStore(StoreContracts):
         # JSONL, so an unchanged size means an unchanged line count; this lets
         # event_cursor skip re-counting the whole file on every poll.
         self._event_cursor_cache: dict[str, tuple[int, int]] = {}
+        self._incarnation = None
         self._metadata_initialized = False
         self._budget_locks = threading.local()
+        self._read_selection = selection(self)
 
     def init(self) -> None:
         for directory in [
@@ -258,6 +265,7 @@ class SwarmStore(StoreContracts):
             from puppetmaster.projections import initialize_file
             initialize_file(self)
             self._metadata_initialized = True
+            self._read_selection = selection(self)
         from puppetmaster.host_lifecycle import record_host_start
 
         record_host_start(self)
@@ -1195,7 +1203,8 @@ class SwarmStore(StoreContracts):
         task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
         lock_name = f"task:{task_id}"
-        lock_ttl = max(lease_seconds * 3, lease_seconds + 1)
+        # Cover the read retry budget even for workers with very short leases.
+        lock_ttl = max(lease_seconds * 3, lease_seconds + 1, 30)
         if not self.acquire_lock(lock_name, worker_id, ttl_seconds=lock_ttl):
             return None
         try:
@@ -1253,10 +1262,34 @@ class SwarmStore(StoreContracts):
             foreign_active_writer,
         )
 
-        from puppetmaster.models import JobRef
-        from puppetmaster.state import state_identity
         from puppetmaster.store_contracts import task_binding
-        if self.cancellation_pending(JobRef(task.job_id, state_identity(self.root)), task_binding(task)):
+        # Retry only the read fence, while the caller still owns the claim lock.
+        # Never replay precheck mutations or the claim itself.
+        deadline = time.monotonic() + 5.0
+        delay = 0.01
+        while True:
+            try:
+                cancelled = self.cancellation_pending(self._claim_job_ref(task.job_id), task_binding(task))
+                break
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, 'sqlite_errorcode', None)
+                if isinstance(exc, ReadUnavailable):
+                    transient = str(exc) in (
+                        'unable to open database: active reader; sidecars may be missing',
+                        'unable to open database: live sidecars; retry after checkpoint',
+                    ) and (code is None or isinstance(code, int) and (code & 0xff) in (5, 6))
+                else:
+                    transient = (isinstance(code, int) and (code & 0xff) in (5, 6)) if code is not None else str(exc) in (
+                        'database is locked', 'database table is locked', 'database schema is locked',
+                    )
+                remaining = deadline - time.monotonic()
+                if not transient or remaining <= 0:
+                    raise
+                time.sleep(min(delay, remaining))
+                if time.monotonic() >= deadline:
+                    raise
+                delay = min(delay * 2, 0.1)
+        if cancelled:
             return True
         if task.status == TaskStatus.RUNNING and self._has_pending_completion(task):
             return True
@@ -2281,16 +2314,82 @@ class SwarmStore(StoreContracts):
         )
         return updated
 
-    def validate_job_ref(self, job_ref):
+    @property
+    def incarnation(self):
+        from puppetmaster.identity import read_identity
+        from puppetmaster.projections import connection
+        import sqlite3
+        from puppetmaster.readonly import ReadUnavailable
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with connection(self, metadata_only=True) as c:
+                    return read_identity(c, self.backend_name)
+            except sqlite3.OperationalError as exc:
+                transient = str(exc) == 'database is locked' or (
+                    isinstance(exc, ReadUnavailable) and any(reason in str(exc)
+                    for reason in ('source changed', 'active reader', 'live sidecars')))
+                if not transient or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.01)
+
+    def _claim_job_ref(self, job_id):
+        """Bind a local claim through its store session, including live WAL."""
+        if selection(self) != self._read_selection:
+            raise StoreIdentityError('store removed or replaced before claim')
+        with projection_connection(self) as c:
+            if not c.in_transaction:
+                c.execute('BEGIN')
+            ref = make_ref(self.root, job_id, read_identity(c, self.backend_name))
+            self.validate_job_ref(ref, connection=c, strict=True)
+            if selection(self) != self._read_selection:
+                raise StoreIdentityError('store removed or replaced during claim')
+            return ref
+
+    def job_ref(self, job_id, *, _launch_binding=False):
+        """Explicitly bind a job in the currently selected store (read-only)."""
+        from puppetmaster.identity import make_ref
+        from puppetmaster.projections import connection
+        from puppetmaster.identity import read_identity
+        with connection(self, metadata_only=True, launch_binding=_launch_binding) as c:
+            if not c.in_transaction:
+                c.execute("BEGIN")
+            ref = make_ref(self.root, job_id, read_identity(c, self.backend_name))
+            ref = self.validate_job_ref(ref, connection=c)
+            if _launch_binding:
+                from puppetmaster.readonly import selection
+                from puppetmaster.identity import StoreIdentityError
+                if selection(self) != self._read_selection:
+                    raise StoreIdentityError('store removed or replaced during launch binding')
+            return ref
+
+    def bind_job_ref(self, job_ref, *, legacy_read=False):
+        """Pin a continuation before opening any operation connection. Never migrate."""
         from puppetmaster.models import JobRef
-        from puppetmaster.state import state_identity
-        if not isinstance(job_ref, JobRef) or job_ref.state_id != state_identity(self.root):
-            raise ValueError("job_ref.state_id does not match this store")
-        self._assert_safe_job_dir(job_ref.job_id)
+        from puppetmaster.projections import connection
+        if isinstance(job_ref, dict):
+            job_ref = JobRef(**job_ref)
+        with connection(self, metadata_only=True) as c:
+            if not c.in_transaction:
+                c.execute("BEGIN")
+            self.validate_job_ref(job_ref, connection=c, strict=not legacy_read)
+            if job_ref.version == 2:
+                self._incarnation = job_ref.incarnation
+            self._legacy_read_ref = job_ref if job_ref.version == 1 else None
         if self.backend_name == "sqlite":
-            if not self._all("SELECT 1 FROM jobs WHERE id=?", (job_ref.job_id,)):
-                raise KeyError(job_ref.job_id)
-        elif not (self.job_dir(job_ref.job_id) / "job.json").exists():
+            self._open_mode = "attach"
+        return self
+
+    def validate_job_ref(self, job_ref, *, connection=None, strict=False):
+        from puppetmaster.identity import validate
+        from puppetmaster.projections import connection as open_connection
+        if connection is None:
+            with open_connection(self, metadata_only=True) as c:
+                return self.validate_job_ref(job_ref, connection=c, strict=strict)
+        validate(self, job_ref, connection, strict=strict)
+        table = "jobs" if self.backend_name == "sqlite" else "projection_current"
+        where = "id=?" if self.backend_name == "sqlite" else "kind='job' AND id=?"
+        if not connection.execute(f"SELECT 1 FROM {table} WHERE {where}", (job_ref.job_id,)).fetchone():
             raise KeyError(job_ref.job_id)
         return job_ref
 
@@ -2307,6 +2406,30 @@ class SwarmStore(StoreContracts):
         if values.keys() & kwargs.keys():
             raise ValueError("duplicate job summary filter")
         return {**values, **kwargs}
+
+    def get_selected_economics(self, job_ref: JobRef, *, expected_summary_revision: Optional[int] = None) -> SelectedEconomics:
+        from puppetmaster.selected_economics import read
+        return read(self, job_ref, expected_summary_revision)
+
+    def historical_evidence_counts(self, job_ref):
+        from puppetmaster.history_metadata import counts
+        return counts(self, job_ref)
+
+    def list_attempt_refs(self, job_ref, **kwargs):
+        from puppetmaster.history_metadata import page
+        return page(self, "attempt", job_ref, **kwargs)
+
+    def list_run_refs(self, job_ref, **kwargs):
+        from puppetmaster.history_metadata import page
+        return page(self, "run", job_ref, **kwargs)
+
+    def list_process_outcome_refs(self, job_ref, **kwargs):
+        from puppetmaster.history_metadata import page
+        return page(self, "outcome", job_ref, **kwargs)
+
+    def list_usage_observation_refs(self, job_ref, **kwargs):
+        from puppetmaster.history_metadata import page
+        return page(self, "observation", job_ref, **kwargs)
 
     def list_job_summaries(self, filters=None, **kwargs):
         from puppetmaster.projections import page
@@ -2333,18 +2456,20 @@ class SwarmStore(StoreContracts):
             raise ValueError("SQLite projections are transactional")
         from puppetmaster.projections import connection, project_file
         self.init()
-        with connection(self) as c:
-            c.execute("BEGIN IMMEDIATE")
+        with connection(self, write=True) as c:
             c.execute("""INSERT INTO projection_changes(kind,job_id,id,status,sha256,stamp,deleted,
                 task_count,artifact_count,binding,task_id,artifact_type,scope)
                 SELECT kind,job_id,id,status,sha256,'legacy_unknown',1,
                 task_count,artifact_count,binding,task_id,artifact_type,scope FROM projection_current""")
             c.execute("DELETE FROM projection_current")
+            c.execute("DELETE FROM historical_refs")
+            c.execute("DELETE FROM completion_receipts")
+            c.execute("DELETE FROM selected_economics_current")
             c.execute("DELETE FROM projection_pending")
             c.execute("UPDATE projection_meta SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'")
             for path in self.jobs_dir.glob("*/job.json"):
                 project_file(c, path, self.read_json(path), legacy=True)
-                for directory in ("tasks", "artifacts"):
+                for directory in ("tasks", "artifacts", "runs", "completions", "consumption/attempts", "consumption/observations"):
                     for child in (path.parent / directory).glob("*.json"):
                         project_file(c, child, self.read_json(child), legacy=True)
 
@@ -2366,8 +2491,12 @@ class SwarmStore(StoreContracts):
     def _completion_intent_scope(self, job_id: str):
         owner = new_id("intent")
         name = f"completion-intent:{job_id}"
-        if not self.acquire_lock(name, owner, ttl_seconds=300):
-            raise RuntimeError("completion intent busy; retry")
+        deadline = time.monotonic() + 5.0
+        while not self.acquire_lock(name, owner, ttl_seconds=300):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("completion intent busy; retry (waited 5 seconds)")
+            time.sleep(min(0.01, remaining))
         try:
             yield
         finally:
@@ -2395,19 +2524,12 @@ class SwarmStore(StoreContracts):
         return self.read_json(path) if path.exists() else None
 
     def get_completion_receipt(self, job_ref, run_id: str):
-        from puppetmaster.contracts import CompletionReceipt
-        self.validate_job_ref(job_ref)
-        if not run_id or self._safe_key(run_id) != run_id:
-            raise ValueError("invalid completion run id")
-        record = self._get_completion(job_ref.job_id, run_id)
-        if record is None:
-            return CompletionReceipt(job_ref, run_id, None, "legacy_unknown")
-        return CompletionReceipt(job_ref, run_id, record.get("intent_digest"),
-                                 record.get("publication", "legacy_unknown"))
+        from puppetmaster.completion_metadata import read
+        return read(self, job_ref, run_id)
 
     def complete_task(
         self, task: Task, run: AgentRun, artifacts: list[Artifact],
-        event_payload: dict[str, Any],
+        event_payload: dict[str, Any], *, job_ref=None,
     ) -> Task:
         """Journal accepted output before publishing children or terminal state.
 
@@ -2417,7 +2539,8 @@ class SwarmStore(StoreContracts):
         multi-file transaction or a power-loss/fsync guarantee. Its existing
         expiring lock requires publication to finish within 300 seconds; a
         killed publisher can delay recovery until that lock expires. Contention
-        defers replay to the next poll; intent publication does not take the lock.
+        defers replay to the next poll; intent acquisition waits up to five
+        seconds on a separate lock, without retrying the publication body.
         Concurrent file-backend claim/reset/lease writes retain weaker isolation.
         """
         from puppetmaster.contracts import ContractConflict, immutable_digest
@@ -2434,6 +2557,12 @@ class SwarmStore(StoreContracts):
         if any(a.job_id != task.job_id or a.task_id != task.id for a in artifacts):
             raise ValueError("completion artifact does not belong to task")
         with self._completion_intent_scope(task.job_id):
+            if job_ref is not None:
+                if job_ref.job_id != task.job_id:
+                    raise ValueError("completion job_ref conflicts with task")
+                from puppetmaster.projections import connection
+                with connection(self) as c:
+                    self.validate_job_ref(job_ref, connection=c, strict=True)
             existing = self._get_completion(task.job_id, run.id)
             if existing is not None:
                 if existing.get("intent_digest") != digest:
@@ -2458,18 +2587,21 @@ class SwarmStore(StoreContracts):
         self.reconcile_completions(task.job_id)
         return self.get_task_by_id(task.id)
 
-    def submit_completion(self, task, run, artifacts, event_payload):
+    def submit_completion(self, task, run, artifacts, event_payload, *, job_ref=None):
         from puppetmaster.contracts import CompletionReceipt
-        from puppetmaster.models import JobRef
-        from puppetmaster.state import state_identity
-        self.complete_task(task, run, artifacts, event_payload)
-        ref = JobRef(task.job_id, state_identity(self.root))
+        from puppetmaster.identity import StoreIdentityError
+        if job_ref is None:
+            raise StoreIdentityError("submit_completion requires a v2 JobRef; inspect and bind with store.job_ref(job_id)")
+        self.complete_task(task, run, artifacts, event_payload, job_ref=job_ref)
+        ref = job_ref
         receipt = self.get_completion_receipt(ref, run.id)
-        if receipt.outcome == "legacy_unknown" and self._get_completion(task.job_id, run.id) is None:
+        if receipt.outcome == "legacy_unknown":
             return CompletionReceipt(ref, run.id, None, "stale_lease")
         return receipt
 
     def reconcile_completions(self, job_id: str) -> None:
+        if not any(not record["done"] for record in self._completion_records(job_id)):
+            return
         with self._completion_scope(job_id) as acquired:
             if not acquired:
                 return
@@ -3245,7 +3377,7 @@ class SwarmStore(StoreContracts):
         job_dir = self._assert_safe_job_dir(job_id)
         from puppetmaster.projections import connection
         self.init()
-        with connection(self) as c:
+        with connection(self, write=True) as c:
             c.execute("INSERT OR IGNORE INTO projection_pending VALUES(?)", (str(job_dir),))
         if job_dir.exists():
             for path in sorted(job_dir.rglob("*"), reverse=True):
@@ -3254,12 +3386,14 @@ class SwarmStore(StoreContracts):
                 elif path.is_dir():
                     path.rmdir()
             job_dir.rmdir()
-        with connection(self) as c:
-            c.execute("BEGIN IMMEDIATE")
+        with connection(self, write=True) as c:
             c.execute("""INSERT INTO projection_changes(kind,job_id,id,status,sha256,stamp,deleted,task_count,artifact_count)
                 SELECT kind,job_id,id,status,sha256,'known',1,task_count,artifact_count
                 FROM projection_current WHERE job_id=?""", (job_id,))
             c.execute("DELETE FROM projection_current WHERE job_id=?", (job_id,))
+            c.execute("DELETE FROM historical_refs WHERE job_id=?", (job_id,))
+            c.execute("DELETE FROM completion_receipts WHERE job_id=?", (job_id,))
+            c.execute("DELETE FROM selected_economics_current WHERE job_id=?", (job_id,))
             c.execute("DELETE FROM projection_pending WHERE path=?", (str(job_dir),))
 
     def acquire_lock(
@@ -3481,14 +3615,29 @@ class SwarmStore(StoreContracts):
         if projected:
             self.init()
             marker = str(path) + ":" + new_id("write")
-            with connection(self) as c:
+            with connection(self, write=True) as c:
                 c.execute("INSERT INTO projection_pending VALUES(?)", (marker,))
+        if projected and file_kind(path) == 'job':
+            from puppetmaster.selected_economics import check_receipt_replacement
+            from puppetmaster.contracts import ContractConflict
+            try:
+                with connection(self, write=True) as c:
+                    if path.exists():
+                        check_receipt_replacement(self.read_json(path), to_jsonable(value))
+                    self._write_json_file(path, value)
+                    project_file(c, path, self.read_json(path))
+                    c.execute("DELETE FROM projection_pending WHERE path=?", (marker,))
+            except ContractConflict:
+                # Rejection preceded rename; there is no pending source write.
+                with connection(self, write=True) as c:
+                    c.execute("DELETE FROM projection_pending WHERE path=?", (marker,))
+                raise
+            return
         self._write_json_file(path, value)
         if projected:
-            with connection(self) as c:
+            with connection(self, write=True) as c:
                 # Read back under the index writer lock: a competing rename may
                 # have won, so indexing our caller's value would be stale.
-                c.execute("BEGIN IMMEDIATE")
                 project_file(c, path, self.read_json(path))
                 c.execute("DELETE FROM projection_pending WHERE path=?", (marker,))
 

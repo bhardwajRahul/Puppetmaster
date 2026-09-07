@@ -83,7 +83,7 @@ class UsageObservation:
         for value in (self.job_id, self.attempt_id, self.observation_id,
                       self.source, self.observed_at):
             _identity(value)
-        if self.returncode is not None and type(self.returncode) is not int:
+        if self.returncode is not None and (type(self.returncode) is not int or not -(2**63) <= self.returncode < 2**63):
             raise ValueError("returncode must be an integer or None")
         if self.timed_out is not None and type(self.timed_out) is not bool:
             raise ValueError("timed_out must be a boolean or None")
@@ -93,7 +93,7 @@ class UsageObservation:
         counts = (self.tokens_in, self.tokens_out, self.cache_read_tokens,
                   self.cache_write_tokens)
         for count in counts:
-            if count is not None and (type(count) is not int or count < 0):
+            if count is not None and (type(count) is not int or not 0 <= count < 2**63):
                 raise ValueError("token counts must be nonnegative integers or None")
         if (self.usage_state == "unknown") != all(v is None for v in counts):
             raise ValueError("usage state must agree with presence of token counts")
@@ -101,7 +101,7 @@ class UsageObservation:
             raise ValueError("invalid cost basis")
         if self.cost_usd is not None:
             if (type(self.cost_usd) not in (int, float) or
-                    not math.isfinite(self.cost_usd) or self.cost_usd < 0):
+                    not 0 <= self.cost_usd <= 1_000_000_000_000 or not math.isfinite(self.cost_usd)):
                 raise ValueError("cost must be finite and nonnegative or None")
             object.__setattr__(self, "cost_usd", float(self.cost_usd))
         if (self.cost_state == "unknown") != (self.cost_usd is None):

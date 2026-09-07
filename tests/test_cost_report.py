@@ -458,7 +458,8 @@ class TerminalReceiptLifecycleTests(unittest.TestCase):
                     self.assertEqual(completed.status, JobStatus.COMPLETE)
                     self.assertIsNone(completed.cost_receipt)
                     store.save_artifacts(
-                        [_usage(job.id, model="ghost-model", tokens_in=500, tokens_out=500, real_cost_usd=0.42)]
+                        [_routing(job.id, "t1", "ghost-model", billing="api"),
+                         _usage(job.id, model="ghost-model", tokens_in=500, tokens_out=500, real_cost_usd=0.42)]
                     )
                     report = build_cost_report(store, job.id, registry=_registry())
                     _assert_source_total(self, report, "legacy_artifacts", 0.42)
@@ -653,6 +654,7 @@ class UnpricedAndIdentityTests(unittest.TestCase):
         ]
         plan = [_usage("job_x", model="plan/cursor")]
         reported = [
+            _routing("job_x", "t1", "ghost-model", billing="api"),
             _usage(
                 "job_x",
                 model="ghost-model",
@@ -699,7 +701,7 @@ class UnpricedAndIdentityTests(unittest.TestCase):
             actual = report["actual_cost"]
             self.assertEqual(actual["unpriced_tasks"], 0)
             self.assertAlmostEqual(actual["total_marginal_cost_usd"], 0.05, places=6)
-            self.assertEqual(actual["tasks"][0]["billing"], "reported")
+            self.assertEqual(actual["tasks"][0]["billing"], "api")
 
     def test_final_route_absent_id_does_not_fall_through(self) -> None:
         artifacts = [
@@ -824,6 +826,7 @@ class LegacyArtifactCostTests(unittest.TestCase):
             (
                 "legacy reported",
                 lambda job_id: [
+                    _routing(job_id, "t1", "ghost-model", billing="api"),
                     _usage(
                         job_id,
                         model="ghost-model",
@@ -834,7 +837,7 @@ class LegacyArtifactCostTests(unittest.TestCase):
                 ],
                 _cheaper_mid(),
                 0.05,
-                "reported",
+                "api",
             ),
         )
         for goal, artifacts_for, registry, total, billing in cases:
@@ -882,6 +885,7 @@ class ReceiptValidationTests(unittest.TestCase):
                         tokens_out=0,
                         real_cost_usd=0.01,
                     )
+                    store.save_artifact(_routing(job.id, "t1", "ghost-model", billing="api"))
                     _write_receipt(
                         store,
                         job.id,
@@ -1014,7 +1018,8 @@ class CostCliHumanTests(unittest.TestCase):
             )
             rc, text = _run_cost_text(store, job.id, registry_path)
             self.assertEqual(rc, 0)
-            self.assertIn("selected-model usage cost = $3.000000", text)
+            self.assertIn("API-equivalent valuation = $3.000000 (estimate)", text)
+            self.assertIn("cost unavailable", text)
             self.assertIn("not a provider billing API total", text)
             self.assertNotIn("you paid", text)
             self.assertNotIn("actual measured spend", text)

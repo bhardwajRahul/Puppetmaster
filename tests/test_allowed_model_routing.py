@@ -1,8 +1,12 @@
 """Focused coverage for allowed-model routing + run_status_error reroute."""
 from __future__ import annotations
 
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic_env  # noqa: F401
 
 from puppetmaster.model_registry import load_registry, registry_digest, save_registry
 from tempfile import TemporaryDirectory

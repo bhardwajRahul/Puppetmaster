@@ -25,6 +25,13 @@ from puppetmaster.workers import WorkerSpec
 
 
 class EconomicsProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        from puppetmaster.platform_billing import BillingStatus
+        detector = patch('puppetmaster.platform_billing.detect_adapter_billing',
+                         return_value=BillingStatus('codex', 'unknown', True, 'fixture'))
+        detector.start()
+        self.addCleanup(detector.stop)
+
     def test_removed_registry_model_retains_execution_billing(self):
         from puppetmaster.cost import build_cost_report
 
@@ -50,7 +57,7 @@ class EconomicsProvenanceTests(unittest.TestCase):
                         'model': 'shared', 'tokens_in': 10, 'tokens_out': 2,
                         'real_cost_usd': reported}))
                 save_registry([], registry)
-                expected = 0.0 if billing == 'plan' else reported
+                expected = 0.0 if billing == 'plan' else reported if billing == 'api' else None
                 reopened = store_type(root / 'state')
                 artifacts = reopened.list_artifacts(job.id)
                 priced = price_job(artifacts, [])
@@ -69,7 +76,7 @@ class EconomicsProvenanceTests(unittest.TestCase):
                 self.assertEqual(receipt['actual_cost']['tasks'][0]['billing'], billing)
                 self.assertEqual(build_cost_report(terminal, job.id, [model]), receipt)
 
-    def test_removed_model_route_revision_overrides_pin_and_legacy_stays_reported(self):
+    def test_removed_model_route_revision_overrides_pin_and_legacy_stays_unknown(self):
         usage = Artifact(job_id='j', task_id='t', type=ArtifactType.VERIFICATION,
             created_by='worker', confidence=1, evidence=['usage'], payload={
                 'model': 'shared', 'tokens_in': 10, 'tokens_out': 2, 'real_cost_usd': 0.25})
@@ -85,8 +92,9 @@ class EconomicsProvenanceTests(unittest.TestCase):
             self.assertEqual(priced.tasks[0].billing, 'api')
             self.assertEqual(priced.total_marginal_cost_usd, 0.25)
         legacy = price_job([usage], [])
-        self.assertEqual(legacy.tasks[0].billing, 'reported')
-        self.assertEqual(legacy.total_marginal_cost_usd, 0.25)
+        self.assertEqual(legacy.tasks[0].billing, 'unknown')
+        self.assertFalse(legacy.tasks[0].priced)
+        self.assertEqual(legacy.total_marginal_cost_usd, 0)
 
     def model(self):
         return ModelSpec(id='codex/gpt-6-astra', adapter='codex',

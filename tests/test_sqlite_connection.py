@@ -28,10 +28,11 @@ class SqliteConnectionPragmaTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
             connection = sqlite3.connect(store.db_path)
+            store = SQLiteSwarmStore(Path(tmp))
             proxy = mock.MagicMock(wraps=connection)
             proxy.execute.side_effect = sqlite3.OperationalError("setup failed")
             try:
-                with mock.patch("sqlite3.connect", return_value=proxy):
+                with mock.patch("puppetmaster.readonly.connect", return_value=proxy):
                     with self.assertRaises(sqlite3.OperationalError):
                         store._connect_readonly()
                 with self.assertRaises(sqlite3.ProgrammingError):

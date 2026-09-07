@@ -331,7 +331,7 @@ class PuppetmasterTests(unittest.TestCase):
 
     def test_mcp_start_tool_returns_job_id_without_waiting_for_completion(self) -> None:
         with TemporaryDirectory() as tmp:
-            before_process_count = len(ASYNC_PROCESSES)
+            before_processes = set(ASYNC_PROCESSES)
             result = call_tool(
                 "puppetmaster_start_swarm",
                 {
@@ -361,7 +361,9 @@ class PuppetmasterTests(unittest.TestCase):
             )
             self.assertFalse(result["isError"])
 
-            spawned = ASYNC_PROCESSES[before_process_count:]
+            # Registration also prunes exited launchers, so list offsets cannot
+            # identify this launch when the test runs after another start.
+            spawned = [p for p in ASYNC_PROCESSES if p not in before_processes]
             _wait_for_spawned_or_kill(self, spawned, timeout=60)
 
             status = call_tool(
@@ -3744,7 +3746,7 @@ class PuppetmasterTests(unittest.TestCase):
                 ) as popen:
                     result = call_tool(
                         "puppetmaster_codegraph_init",
-                        {"cwd": tmp, "index": True},
+                        {"cwd": tmp, "state_dir": tmp, "index": True},
                     )
             finally:
                 del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
@@ -3785,7 +3787,7 @@ class PuppetmasterTests(unittest.TestCase):
                     "puppetmaster.mcp_server.subprocess.Popen",
                     return_value=fake_proc,
                 ) as popen:
-                    result = call_tool("puppetmaster_codegraph_index", {"cwd": tmp})
+                    result = call_tool("puppetmaster_codegraph_index", {"cwd": tmp, "state_dir": tmp})
             finally:
                 del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
 
@@ -5045,6 +5047,11 @@ class PuppetmasterTests(unittest.TestCase):
         observed: dict = {}
 
         class _FakeStore:
+            def job_ref(self, job_id):
+                from puppetmaster.models import JobRef
+                return JobRef(job_id, "test-state", version=2,
+                              incarnation="00000000-0000-4000-8000-000000000001")
+
             def get_job(self, job_id):
                 return Job(id=job_id, goal="running follow", status=JobStatus.RUNNING)
 
@@ -8814,8 +8821,8 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             status = store.schema_status()
             checks = {check.name: check for check in run_doctor(root, root / ".puppetmaster")}
 
-            self.assertEqual(status["schema_version"], "5")
-            self.assertEqual(status["expected_schema_version"], "5")
+            self.assertEqual(status["schema_version"], "7")
+            self.assertEqual(status["expected_schema_version"], "7")
             self.assertEqual(checks["sqlite-state"].status, "ok")
 
     def test_cli_last_and_clean_support_daily_run_management(self) -> None:
@@ -10425,7 +10432,7 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_price_job_prices_pinned_run_from_usage(self) -> None:
         """A pinned run emits no ROUTING artifact, but its token usage + the
-        registry price of the model it ran on still yield a priced ledger."""
+        registry price yield only an API-equivalent valuation when billing is unknown."""
         from puppetmaster.cost import price_job
 
         registry = self._three_tier_registry()  # mid-model: $3 in / $15 out
@@ -10437,18 +10444,18 @@ class ModelRouterTests(unittest.TestCase):
             )
         ]
         cost = price_job(artifacts, registry)
-        self.assertEqual(cost.priced_tasks, 1)
-        self.assertEqual(cost.unpriced_tasks, 0)
-        self.assertAlmostEqual(cost.total_marginal_cost_usd, 18.0, places=6)
-        # Measured tokens -> measured cost bucket, not estimated.
-        self.assertAlmostEqual(cost.measured_cost_usd, 18.0, places=6)
-        self.assertEqual(cost.estimated_cost_usd, 0.0)
+        self.assertEqual(cost.priced_tasks, 0)
+        self.assertEqual(cost.unpriced_tasks, 1)
+        self.assertEqual(cost.total_marginal_cost_usd, 0)
+        self.assertEqual(cost.measured_cost_usd, 0)
+        self.assertEqual(cost.tasks[0].api_equivalent_cost_usd, 18)
         self.assertEqual(cost.by_model["mid-model"]["billing"], "unknown")
 
     def test_price_job_prefers_router_model_id_over_recorded_model(self) -> None:
         from puppetmaster.cost import price_job
 
-        registry = self._three_tier_registry()
+        from dataclasses import replace
+        registry = [replace(model, billing="api") for model in self._three_tier_registry()]
         artifacts = [
             self._routing_artifact("t1", model_id="frontier-model"),  # $15/$75
             self._usage_verification(
@@ -10465,7 +10472,8 @@ class ModelRouterTests(unittest.TestCase):
         from puppetmaster.cost import price_job
         from puppetmaster.models import Artifact, ArtifactType
 
-        registry = self._three_tier_registry()
+        from dataclasses import replace
+        registry = [replace(model, billing="api") for model in self._three_tier_registry()]
         artifacts = [
             Artifact(
                 job_id="job_x",
@@ -10510,7 +10518,8 @@ class ModelRouterTests(unittest.TestCase):
     def test_price_job_estimated_tokens_route_to_estimated_bucket(self) -> None:
         from puppetmaster.cost import price_job
 
-        registry = self._three_tier_registry()
+        from dataclasses import replace
+        registry = [replace(model, billing="api") for model in self._three_tier_registry()]
         artifacts = [
             self._usage_verification(
                 "t1", model="cheap-v1", tokens_in=1_000_000, tokens_out=0, estimated=True
@@ -10664,7 +10673,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.05, places=6)
         self.assertTrue(cost.tasks[0].priced)
 
-    def test_price_job_real_cost_usd_without_registry_spec_still_priced(self) -> None:
+    def test_price_job_real_cost_usd_without_registry_spec_is_unpriced(self) -> None:
         from puppetmaster.cost import price_job
 
         artifacts = [
@@ -10674,10 +10683,10 @@ class ModelRouterTests(unittest.TestCase):
             )
         ]
         cost = price_job(artifacts, self._three_tier_registry())
-        self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.05, places=6)
-        self.assertEqual(cost.priced_tasks, 1)
-        self.assertEqual(cost.unpriced_tasks, 0)
-        self.assertEqual(cost.tasks[0].billing, "reported")
+        self.assertEqual(cost.total_marginal_cost_usd, 0)
+        self.assertEqual(cost.priced_tasks, 0)
+        self.assertEqual(cost.unpriced_tasks, 1)
+        self.assertEqual(cost.tasks[0].billing, "unknown")
 
     def test_agentic_loop_usage_includes_cached_tokens_and_real_cost(self) -> None:
         from puppetmaster.adapters import agentic
@@ -11219,7 +11228,7 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_cost_command_prices_pinned_run_without_routing_artifacts(self) -> None:
         """End-to-end: a job with usage but no ROUTING artifacts no longer dead-ends
-        at '$0, didn't auto-route' — it reports actual measured spend."""
+        at '$0, didn't auto-route' — unknown billing retains only valuation."""
         from puppetmaster.model_registry import save_registry
         from puppetmaster.store_factory import create_store
 
@@ -11269,11 +11278,9 @@ class ModelRouterTests(unittest.TestCase):
             data = json.loads(stdout.getvalue())
             # No routing happened -> the pre-flight estimate is zero...
             self.assertEqual(data["total_estimated_cost_usd"], 0.0)
-            # ...but actual measured spend is priced from usage × registry price.
-            self.assertAlmostEqual(
-                data["actual_cost"]["total_marginal_cost_usd"], 18.0, places=6
-            )
-            self.assertEqual(data["actual_cost"]["priced_tasks"], 1)
+            self.assertIsNone(data["actual_cost"]["total_marginal_cost_usd"])
+            self.assertEqual(data["actual_cost"]["tasks"][0]["api_equivalent_cost_usd"], 18)
+            self.assertEqual(data["actual_cost"]["priced_tasks"], 0)
             # The task breakdown falls back to the priced-usage rows.
             self.assertEqual(len(data["tasks"]), 1)
             self.assertEqual(data["tasks"][0]["model_id"], "mid-model")
@@ -11710,11 +11717,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "long audit",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                     "timeout_seconds": 600,
@@ -11768,11 +11776,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "quick audit",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                 }
@@ -11949,11 +11958,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "fresh swarm",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                 }
@@ -11970,11 +11980,12 @@ class ModelRouterTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "memory swarm",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                     "disable_memory": False,
@@ -20576,10 +20587,10 @@ class PlatformLockTests(unittest.TestCase):
         from puppetmaster import mcp_server
         from puppetmaster import platform_lock as pl
 
-        with patch.dict(os.environ, {pl.ONLY_ENV: "cursor"}), patch.object(
+        with TemporaryDirectory() as state_dir, patch.dict(os.environ, {pl.ONLY_ENV: "cursor"}), patch.object(
             mcp_server, "start_cli", return_value={"ok": True}
         ) as spawn:
-            result = mcp_server.start_cursor_swarm({"goal": "audit the repo"})
+            result = mcp_server.start_cursor_swarm({"goal": "audit the repo", "state_dir": state_dir})
         self.assertEqual(result, {"ok": True})
         spawn.assert_called_once()
 
@@ -29116,12 +29127,13 @@ class JobLabelTests(unittest.TestCase):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+        with TemporaryDirectory() as state_dir, patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             mcp_server.start_swarm(
                 {
                     "goal": "fresh swarm",
                     "label": "auth review",
                     "cwd": ".",
+                    "state_dir": state_dir,
                     "roles": ["explore"],
                     "allow_local_demo": True,
                 }

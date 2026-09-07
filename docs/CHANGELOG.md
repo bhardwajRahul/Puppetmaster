@@ -1,3 +1,19 @@
+## v1.25.0 — 2026-09-06
+
+- Fix direct Codex billing provenance and preserve unknown registry valuations as API-equivalent estimates (#136, reported by @kbentonferguson).
+- Add persisted store incarnation UUIDs and strict v2 JobRefs. Fence stale continuations, scoped mutations, and completion; retain weak v1 read compatibility and legacy receipt decoding.
+- Bound nonmutating job summaries, change feeds, history reference pages, JSON metadata, and read retries. Isolated readers never initialize or migrate stores; unavailable reads preserve checkpoints. Keep display previews and delivery states in snapshots, changes, and tombstones.
+- Repair completion publication, task claims, and detached launches under contention. Retry transient reads and lock acquisition without replaying mutations; preserve launch identity and clean up failed starts.
+- Add bounded selected-economics lookups, frozen with terminal receipts and checked against summary revisions. Preserve unknown values, measured zero, estimates, billing bases, and usage provenance. Fix Agentic aggregation so provider-reported zero cost remains measured zero.
+- Carry v2 identity, weak v1 reads, bounded history, and selected economics through Python, CLI, MCP, and the TypeScript client. Report captured, partial, or unknown telemetry coverage without claiming complete invocation history.
+- Validate the installed wheel with real jobs, alongside focused contract and contention tests.
+
+Upgrade: stop old writers and let a supervisor migrate to SQLite schema v7 before
+attaching workers. Use `store.job_ref(job_id)` only after inspecting the selected
+store; scoped mutations and `submit_completion(..., job_ref=ref)` require v2.
+Existing unscoped APIs retain legacy semantics. See [store contracts](STORE_CONTRACTS.md)
+for copy, restore, SQLite handle, file-backend, and cursor limitations.
+
 ## v1.24.0 — 2026-09-06
 
 - Add immutable completion receipts and conflict detection while retaining `complete_task` compatibility. Job receipts include attempt consumption; `process_outcomes` records exit codes and timeouts separately from artifact delivery quality and selected-result economics.

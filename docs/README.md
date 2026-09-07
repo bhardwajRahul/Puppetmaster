@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.24.0](CHANGELOG.md#v1240--2026-09-06) — completion receipts, bounded metadata, scoped cancellation, effect replay fences, and process outcomes. Stop long-lived Puppetmaster processes before the SQLite v5 cutover and restart them on the new version. See [CHANGELOG.md](CHANGELOG.md) for migration and trigger repair details.
+**Current release:** [v1.25.0](CHANGELOG.md#v1250--2026-09-06) — strict store incarnation checks, bounded nonmutating reads, selected economics and usage provenance, and contention repairs. Stop old writers and let a supervisor migrate to SQLite schema v7 before attaching workers. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 

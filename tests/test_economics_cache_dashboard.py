@@ -139,6 +139,7 @@ class DashboardEconomicsTests(unittest.TestCase):
             job = store.create_job('partial pricing')
             store.save_artifacts([
                 _usage(job.id, 'known', real_cost_usd=.42),
+                _routing(job.id, 'known', 'mid', billing='api'),
                 _usage(job.id, 'unknown', model='missing'),
             ])
             with patch('puppetmaster.cost.load_registry', return_value=[]):
@@ -146,6 +147,11 @@ class DashboardEconomicsTests(unittest.TestCase):
             self.assertIsNone(actual['total_marginal_cost_usd'])
             self.assertEqual(actual['priced_subtotal_usd'], .42)
             self.assertEqual(actual['unpriced_tasks'], 1)
+            tasks = {task['task_id']: task for task in actual['tasks']}
+            self.assertEqual(tasks['known']['billing'], 'api')
+            self.assertTrue(tasks['known']['priced'])
+            self.assertEqual(tasks['unknown']['billing'], 'unknown')
+            self.assertFalse(tasks['unknown']['priced'])
 
     @unittest.skipUnless(shutil.which('node'), 'Node needed to execute dashboard formatter')
     def test_render_unknown_zero_and_partial(self):

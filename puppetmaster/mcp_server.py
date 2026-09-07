@@ -1343,6 +1343,15 @@ def _build_tools() -> list[McpTool]:
             input_schema=list_models_schema(),
             handler=run_list_models,
         ),
+        McpTool(name="puppetmaster_list_job_summaries",
+                description="Read one bounded summary page; no automatic continuation.",
+                input_schema=bounded_metadata_schema(), handler=run_job_summaries),
+        McpTool(name="puppetmaster_read_job_summary_changes",
+                description="Read one bounded summary change page, including membership removals.",
+                input_schema=bounded_metadata_schema(changes=True), handler=run_job_summary_changes),
+        McpTool(name="puppetmaster_selected_economics",
+                description="Frozen selected-result economics for a v2 JobRef; separate from attempted spend.",
+                input_schema=bounded_metadata_schema(economics=True), handler=run_selected_economics),
         McpTool(
             name="puppetmaster_job_cost",
             description=(
@@ -3438,6 +3447,8 @@ def run_job_cost(args: JsonObject) -> JsonObject:
     backend = str(args.get("backend") or "sqlite")
     state_dir = mcp_state_dir(args)
     store = create_store(backend, state_dir)
+    if args.get("job_ref") is not None:
+        store.bind_job_ref(args["job_ref"], legacy_read=True)
     registry_path_arg = args.get("registry_path")
     try:
         registry_path = (
@@ -3509,6 +3520,8 @@ def run_reset_subgraph(args: JsonObject) -> JsonObject:
     backend = str(args.get("backend") or "sqlite")
     state_dir = mcp_state_dir(args)
     store = create_store(backend, state_dir)
+    if args.get("job_ref") is not None:
+        store.bind_job_ref(args["job_ref"])
     try:
         reset = store.reset_subgraph(
             job_id, task_ids, include_descendants=include_descendants
@@ -3598,22 +3611,8 @@ def _coerce_subprocess_text(value: object) -> str:
 
 def _terminate_launcher_tree(process: subprocess.Popen) -> None:
     """Stop the exact detached launcher tree after early identity failure."""
-    try:
-        if os.name == "nt":
-            from puppetmaster.win_process import kill_process_tree
-
-            if process.pid and kill_process_tree(process.pid):
-                return
-    except Exception:
-        pass
-    try:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-    except (OSError, ProcessLookupError):
-        pass
+    from puppetmaster.swarm_launch import terminate_launcher_tree
+    terminate_launcher_tree(process)
 
 
 def run_worker_cli(command: list[str], args: JsonObject) -> JsonObject:
@@ -3662,9 +3661,11 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     _append_budget_cli_flags(command, args)
     state_dir = str(mcp_state_dir(args))
     timeout_seconds = int(args.get("runner_timeout_seconds") or 1800)
+    reference_flags = ["--job-ref", json.dumps(args["job_ref"])] if args.get("job_ref") is not None else []
     try:
         process = subprocess.run(
-            [sys.executable, "-m", "puppetmaster", "--state-dir", state_dir] + command,
+            [sys.executable, "-m", "puppetmaster", "--state-dir", state_dir,
+             "--backend", str(args.get("backend") or "sqlite")] + reference_flags + command,
             cwd=cwd(args),
             env=launcher_environment(args),
             stdin=subprocess.DEVNULL,
@@ -4145,6 +4146,8 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
 
     state_dir = mcp_state_dir(args)
     store = create_store(backend, state_dir)
+    if args.get("job_ref") is not None:
+        store.bind_job_ref(args["job_ref"], legacy_read=True)
 
     items, cursor = artifact_feed_since(
         store, job_id, since=since, limit=limit, refs=refs,
@@ -4185,7 +4188,7 @@ def run_await_job(args: JsonObject) -> JsonObject:
     from puppetmaster.cli import await_job_state
     from puppetmaster.stitcher import Stitcher
 
-    job_id = require_string(args, "job_id")
+    job_id = require_job_id(args)
     requested_timeout = float(args.get("timeout_seconds") or 25.0)
     timeout_seconds, was_capped = _capped_block_seconds(requested_timeout)
     poll_interval = float(args.get("poll_interval_seconds") or 0.25)
@@ -4193,6 +4196,8 @@ def run_await_job(args: JsonObject) -> JsonObject:
 
     state_dir = mcp_state_dir(args)
     store = create_store(backend, state_dir)
+    if args.get("job_ref") is not None:
+        store.bind_job_ref(args["job_ref"], legacy_read=True)
 
     state = await_job_state(
         store,
@@ -4233,6 +4238,9 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     if command and command[0] != "run":
         _append_label_flag(command, args)
     state_dir = str(mcp_state_dir(args))
+    backend = str(args.get("backend") or "sqlite")
+    from puppetmaster.identity import prepare_launch
+    incarnation = prepare_launch(Path(state_dir), backend, args.get("job_ref"))
     run_dir = Path(state_dir) / "mcp-runs"
     run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
         run_dir, "mcp"
@@ -4255,6 +4263,10 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         "puppetmaster",
         "--state-dir",
         state_dir,
+        "--backend",
+        backend,
+        "--store-incarnation",
+        incarnation,
         "--emit-job-id-early",
     ]
     if launch_key and not (command and command[0] == "run"):
@@ -4276,6 +4288,7 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         stdout_handle.close()
         stderr_handle.close()
         raise
+    process._puppetmaster_session = True
     _track_async_process(process)
     stdout_handle.close()
     stderr_handle.close()
@@ -4286,16 +4299,17 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
             process,
             timeout_seconds=EARLY_JOB_ID_TIMEOUT_SECONDS,
         )
+        from puppetmaster.identity import make_ref
+        # The child attached the supervisor's incarnation and reports its job
+        # after creation. Bind that launch receipt, without reopening an
+        # actively written store through the source-stable observation reader.
+        # A replacement remains fenced by this original incarnation on use.
+        job_ref = make_ref(Path(state_dir), job_id, incarnation).as_dict()
     except BaseException:
         # The child was spawned but never reported a job id (startup crash or
         # parse timeout). Don't leave a detached full-edit agent running.
         _terminate_launcher_tree(process)
         raise
-    job_ref = {
-        "job_id": job_id,
-        "state_id": state_identity(state_dir),
-    }
-    backend = str(args.get("backend") or "sqlite")
     body = {
         "run_id": run_id,
         "job_id": job_id,
@@ -4451,10 +4465,16 @@ def job_schema(required: bool = False) -> JsonObject:
         "type": "object",
         "description": "Opaque continuation identity returned by an asynchronous start.",
         "properties": {
-            "job_id": {"type": "string"},
-            "state_id": {"type": "string"},
+            "job_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[\\x00-\\x7f]+$"},
+            "state_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[\\x00-\\x7f]+$"},
+            "version": {"type": "integer", "enum": [1, 2]},
+            "incarnation": {"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
         },
         "required": ["job_id", "state_id"],
+        "oneOf": [
+            {"required": ["version", "incarnation"], "properties": {"version": {"const": 2}}},
+            {"properties": {"version": {"const": 1}}, "not": {"required": ["incarnation"]}},
+        ],
     }
     if required:
         schema["anyOf"] = [{"required": ["job_id"]}, {"required": ["job_ref"]}]
@@ -5758,6 +5778,56 @@ def tool_error(message: str, payload: Optional[JsonObject] = None) -> JsonObject
 
 def error_response(request_id: Any, code: int, message: str) -> JsonObject:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def bounded_metadata_schema(*, changes=False, economics=False):
+    schema = job_schema(required=False)
+    props = schema['properties']
+    props['backend'] = {'type': 'string', 'enum': ['file', 'sqlite']}
+    if economics:
+        schema['required'] = ['job_ref']
+        props['job_ref']['required'] = ['job_id', 'state_id', 'version', 'incarnation']
+        props['job_ref']['properties']['version'] = {'const': 2}
+        props['expected_summary_revision'] = {'type': 'integer', 'minimum': 0, 'maximum': 9007199254740991}
+    else:
+        props.update(job_scope_schema_properties())
+        props.update({'cursor': {'type': 'string'}, 'status': {'type': 'string', 'maxLength': 64},
+                      'limit': {'type': 'integer', 'minimum': 1, 'maximum': 200},
+                      'max_scan': {'type': 'integer', 'minimum': 1, 'maximum': 1000},
+                      'max_bytes': {'type': 'integer', 'minimum': 1024, 'maximum': 262144}})
+        if changes:
+            props['after_revision'] = {'type': 'integer', 'minimum': 0, 'maximum': 9007199254740991}
+    return schema
+
+
+def _run_bounded_metadata(args, command):
+    from puppetmaster.models import JobRef, to_jsonable
+    from puppetmaster.state import resolve_metadata_state
+    ref = JobRef(**args['job_ref']) if args.get('job_ref') is not None else None
+    root = resolve_metadata_state(job_ref=ref, job_id=args.get('job_id'),
+                                  state_dir=args.get('state_dir'), cwd=Path(cwd(args)))
+    store = create_store(str(args.get('backend') or 'sqlite'), root)
+    if command == 'selected-economics':
+        result = store.get_selected_economics(ref, expected_summary_revision=args.get('expected_summary_revision'))
+    else:
+        kwargs = {name: args[name] for name in ('cursor', 'limit', 'max_scan', 'max_bytes',
+                  'status', 'origin', 'project_id', 'session_id') if name in args}
+        kwargs['job_ref'] = ref
+        result = (store.read_job_summary_changes(after_revision=args.get('after_revision', 0), **kwargs)
+                  if command == 'job-summary-changes' else store.list_job_summaries(**kwargs))
+    return {'content': [{'type': 'text', 'text': json.dumps(to_jsonable(result), ensure_ascii=True, separators=(',', ':'))}], 'isError': False}
+
+
+def run_job_summaries(args):
+    return _run_bounded_metadata(args, 'job-summaries')
+
+
+def run_job_summary_changes(args):
+    return _run_bounded_metadata(args, 'job-summary-changes')
+
+
+def run_selected_economics(args):
+    return _run_bounded_metadata(args, 'selected-economics')
 
 
 if __name__ == "__main__":
