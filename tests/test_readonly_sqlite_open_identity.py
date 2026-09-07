@@ -224,6 +224,108 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
                 worker.main('source.sqlite3')
         self.assertTrue(caught.exception.source_open_contention)
 
+    def test_windows_snapshot_sharing_denial_is_session_closed_and_retried(self):
+        before = [(1, 2, 3, 4, 5), None, None, None]
+        responses = []
+
+        class Source:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def fileno(self):
+                return 11
+
+            def read(self, size):
+                return b'\x00' * size
+
+        calls = {'count': 0}
+        native_path = type(Path())
+        run = worker.main
+
+        def stamps(_path):
+            calls['count'] += 1
+            if calls['count'] == 1:
+                return before
+            denied = PermissionError('Access is denied')
+            denied.winerror = 5
+            raise denied
+
+        def main(path, *, wal_snapshot=False):
+            if calls['count']:
+                return True
+            return run(path, wal_snapshot=wal_snapshot)
+
+        with patch.object(worker, 'stamps', side_effect=stamps), \
+                patch.object(worker, 'main', side_effect=main) as main_mock, \
+                patch.object(worker, 'open_windows_source', return_value=Source()), \
+                patch.object(worker, 'source_stamp', return_value=before[0]), \
+                patch.object(worker, 'emit', side_effect=responses.append), \
+                patch.object(worker, 'Path', native_path), \
+                patch.object(worker.os, 'name', 'nt'), \
+                patch.object(ctypes, 'WinDLL', return_value=SimpleNamespace(
+                    LockFileEx=lambda *args: True), create=True), \
+                patch.dict(sys.modules, msvcrt=SimpleNamespace(
+                    open_osfhandle=lambda handle, flags: handle,
+                    get_osfhandle=lambda fd: fd)), \
+                patch.object(worker.sys, 'stdin', io.StringIO(
+                    '{"open":"source.sqlite3"}\n')):
+            worker.serve('source.sqlite3')
+        self.assertEqual(main_mock.call_count, 2)
+        self.assertEqual(len(responses), 2)
+        self.assertTrue(responses[0]['source_open_contention'])
+        self.assertTrue(responses[0]['session_closed'])
+        self.assertIn('Access is denied', responses[0]['error'])
+        self.assertEqual(responses[1], {'rows': [], 'names': []})
+
+    def test_windows_snapshot_identity_failure_is_terminal(self):
+        failure = OSError('SQLite fd attestation: existing descriptors changed')
+        responses = []
+
+        class Source:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def fileno(self):
+                return 11
+
+            def read(self, size):
+                return b'\x00' * size
+
+        calls = {'count': 0}
+        native_path = type(Path())
+
+        def stamps(_path):
+            calls['count'] += 1
+            if calls['count'] == 1:
+                return [(1, 2, 3, 4, 5), None, None, None]
+            raise failure
+
+        with patch.object(worker, 'stamps', side_effect=stamps), \
+                patch.object(worker, 'main', wraps=worker.main) as main, \
+                patch.object(worker, 'open_windows_source', return_value=Source()), \
+                patch.object(worker, 'source_stamp', return_value=(1, 2, 3, 4, 5)), \
+                patch.object(worker, 'emit', side_effect=responses.append), \
+                patch.object(worker, 'Path', native_path), \
+                patch.object(worker.os, 'name', 'nt'), \
+                patch.object(ctypes, 'WinDLL', return_value=SimpleNamespace(
+                    LockFileEx=lambda *args: True), create=True), \
+                patch.dict(sys.modules, msvcrt=SimpleNamespace(
+                    open_osfhandle=lambda handle, flags: handle,
+                    get_osfhandle=lambda fd: fd)), \
+                patch.object(worker.sys, 'stdin', io.StringIO(
+                    '{"open":"source.sqlite3"}\n')):
+            worker.serve('source.sqlite3')
+        self.assertEqual(main.call_count, 1)
+        self.assertEqual(len(responses), 1)
+        self.assertNotIn('session_closed', responses[0])
+        self.assertIn('existing descriptors changed', responses[0]['error'])
+
     def test_windows_guard_closes_handle_if_crt_transfer_fails(self):
         closed = []
         def create(*args):

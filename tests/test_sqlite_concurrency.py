@@ -38,7 +38,13 @@ def _attach_claim_complete_worker(
     """Spawn-safe worker body: attach only, then claim/complete local tasks."""
     error_file = Path(error_path).open("w", encoding="utf-8")
     diagnostic_file = Path(diagnostic_path).open("w", encoding="utf-8")
-    faulthandler.dump_traceback_later(45, file=diagnostic_file)
+    diagnostic_worker = worker_id == "w-0"
+    if diagnostic_worker:
+        # One representative stack is enough to diagnose a shared attach
+        # stall. Arming every spawned process at the same instant creates a
+        # 32-writer traceback storm that can itself push healthy workers past
+        # the parent deadline on Windows.
+        faulthandler.dump_traceback_later(45, file=diagnostic_file)
     thread_errors: list[str] = []
     previous_hook = threading.excepthook
     threading.excepthook = lambda args: thread_errors.append(
@@ -60,7 +66,8 @@ def _attach_claim_complete_worker(
     except Exception:  # noqa: BLE001 — surface in the parent assert
         error_file.write(traceback.format_exc())
     finally:
-        faulthandler.cancel_dump_traceback_later()
+        if diagnostic_worker:
+            faulthandler.cancel_dump_traceback_later()
         threading.excepthook = previous_hook
         if thread_errors:
             error_file.write("\n".join(thread_errors))
@@ -148,7 +155,8 @@ class SqliteAttachEnsureTests(unittest.TestCase):
                 for thread in threads:
                     thread.join()
 
-            self.assertEqual(errors, [])
+            if errors:
+                self.fail("\n\n".join(str(error) for error in errors[:2]))
             self.assertEqual(scripts, [])
             self.assertEqual(metadata_inserts, [])
 

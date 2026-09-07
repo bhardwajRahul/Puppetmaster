@@ -158,6 +158,19 @@ def open_windows_source(path):
         raise
 
 
+def _retryable_windows_contention(exc):
+    if os.name == 'nt' and getattr(exc, 'winerror', None) in (5, 32, 33):
+        exc.source_open_contention = True
+    return exc
+
+
+def _stamps_after_open(path):
+    try:
+        return stamps(path)
+    except OSError as exc:
+        raise _retryable_windows_contention(exc)
+
+
 def descriptor_uri(fd):
     """Select a source descriptor URI; Linux additionally attests SQLite's fd."""
     expected = os.fstat(fd)
@@ -307,7 +320,7 @@ def main(path, *, wal_snapshot=False):
             except BlockingIOError:
                 emit(dict(kind='OperationalError', error='database is locked'))
                 return
-        after = stamps(path)
+        after = _stamps_after_open(path)
         if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
@@ -322,7 +335,7 @@ def main(path, *, wal_snapshot=False):
                       error='unable to open database: live sidecars; retry after checkpoint',
                       code=5))
             return
-        after = stamps(path)
+        after = _stamps_after_open(path)
         if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
@@ -344,7 +357,7 @@ def main(path, *, wal_snapshot=False):
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('BEGIN')
             c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
-            if not wal_snapshot and stamps(path) != before:
+            if not wal_snapshot and _stamps_after_open(path) != before:
                 emit(dict(kind='unavailable', error='unable to open database: source changed'))
                 return
             def unchanged():
