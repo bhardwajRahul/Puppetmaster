@@ -1470,6 +1470,15 @@ class SwarmStore(StoreContracts):
         # a per-edge file glob / SQLite SELECT on every claim sweep).
         tasks = self.list_tasks(job_id)
         task_map = {task.id: task for task in tasks}
+        if len(tasks) > 1:
+            # Workers otherwise stampede the first queued task, then repeat the
+            # same losing writer reservation for every task already claimed by
+            # a peer. A stable per-worker rotation spreads those first CAS
+            # attempts across the queue without changing eligibility or
+            # allowing a claim outside the store's atomic fence.
+            digest = hashlib.sha256(worker_id.encode("utf-8")).digest()
+            offset = int.from_bytes(digest[:8], "big") % len(tasks)
+            tasks = tasks[offset:] + tasks[:offset]
         for task in tasks:
             if task.status != TaskStatus.QUEUED:
                 continue
