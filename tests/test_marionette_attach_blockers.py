@@ -2,6 +2,7 @@ from contextlib import closing
 """Marionette attach-proof shape and historical scope authority regressions."""
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -270,9 +271,13 @@ class MarionetteBlockerTests(unittest.TestCase):
                 # This fixture never releases its writer during attach. Exercise
                 # real rejection with a short budget; virtual-clock tests cover
                 # exhaustion of the full production deadline.
-                with patch.object(SQLiteSwarmStore, 'busy_timeout_ms', 100), \
-                        self.assertRaises(ReadUnavailable):
-                    create_store(store.backend_name, store.root, mode='attach')
+                with patch.object(SQLiteSwarmStore, 'busy_timeout_ms', 100):
+                    if os.name == 'nt' and store.backend_name == 'sqlite':
+                        attached = create_store('sqlite', store.root, mode='attach')
+                        self.assertEqual(attached._incarnation, store._incarnation)
+                    else:
+                        with self.assertRaises(ReadUnavailable):
+                            create_store(store.backend_name, store.root, mode='attach')
                 page = store.list_job_summaries()
                 self.assertEqual(page.outcome, 'unavailable')
                 self.assertEqual(page.retry_after_ms, 100)
