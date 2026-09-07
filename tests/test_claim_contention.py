@@ -149,6 +149,45 @@ class ClaimContentionTests(unittest.TestCase):
                     store.claim_task(task.id, 'worker')
                 self.assertEqual(write.call_count, 1)
 
+    def test_file_claim_retries_after_projection_writer_admission_timeout(self):
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp))
+            job = store.create_job('projection admission')
+            task = Task(job_id=job.id, role='explore', instruction='test', adapter='local')
+            store.save_task(task)
+            from puppetmaster import projections
+            original = projections._reserve_writer
+            calls = 0
+
+            def reserve(connection, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise sqlite3.OperationalError('database is locked')
+                return original(connection, *args, **kwargs)
+
+            with patch.object(projections, '_reserve_writer', side_effect=reserve):
+                completed = WorkerRuntime(
+                    store, job.id, 'explore', 'worker', poll_seconds=.01
+                ).run_until_idle()
+            self.assertEqual(completed, 1)
+            claimed = store.get_task_by_id(task.id)
+            self.assertEqual(claimed.status, TaskStatus.COMPLETE)
+            self.assertEqual(claimed.attempts, 1)
+
+    def test_file_claim_does_not_swallow_nonlock_projection_failure(self):
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp))
+            job = store.create_job('projection failure')
+            task = Task(job_id=job.id, role='explore', instruction='test', adapter='local')
+            store.save_task(task)
+            error = sqlite3.OperationalError('permission denied')
+            with patch('puppetmaster.projections._reserve_writer', side_effect=error):
+                with self.assertRaises(sqlite3.OperationalError) as caught:
+                    store.claim_task(task.id, 'worker')
+            self.assertIs(caught.exception, error)
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.QUEUED)
+
     def test_short_lease_lock_survives_read_retry(self):
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp))
