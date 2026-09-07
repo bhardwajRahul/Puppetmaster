@@ -24,3 +24,6 @@ jobs:
       - name: Run crash-demo
         if: ${{ !cancelled() }}
         run: python -m puppetmaster crash-demo
+      - name: Run crash-recovery regression
+        if: ${{ !cancelled() }}
+        run: python -m unittest tests.test_puppetmaster.PuppetmasterTests.test_crash_recovery_demo_reclaims_abandoned_task -v

@@ -2463,6 +2463,67 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertEqual(implement_tasks[0].status, TaskStatus.COMPLETE)
             self.assertEqual(implement_tasks[0].attempts, 2)
 
+    def test_worker_exit_reports_durable_startup_traceback(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("diagnose a failed worker")
+            task_dir = store.job_dir(job.id) / "tasks"
+            (task_dir / "startup_error-worker-explore-4321.log").write_text(
+                "worker failed to start:\nPermissionError: sharing violation",
+                encoding="utf-8",
+            )
+            process = MagicMock(pid=4321, returncode=1)
+
+            error = Orchestrator(store)._worker_exit_error(
+                job.id, "explore", process
+            )
+
+            self.assertIn("worker 'explore' failed with exit code 1", str(error))
+            self.assertIn("PermissionError: sharing violation", str(error))
+
+    def test_worker_main_records_unexpected_system_exit(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime, main as worker_main
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("record a silent worker exit")
+            argv = [
+                "--state-dir", str(store.root), "--backend", "file",
+                "--job-id", job.id, "--role", "explore",
+                "--worker-id", "test-worker",
+            ]
+            with patch.object(WorkerRuntime, "run_until_idle", side_effect=SystemExit(1)):
+                with self.assertRaises(SystemExit) as raised:
+                    worker_main(argv)
+
+            self.assertEqual(raised.exception.code, 1)
+            error_file = store.job_dir(job.id) / "tasks" / "startup_error-test-worker.log"
+            self.assertIn("SystemExit: 1", error_file.read_text(encoding="utf-8"))
+            self.assertIn(
+                "worker.startup_failed",
+                [event["event"] for event in store.read_events(job.id)],
+            )
+
+    def test_worker_main_keeps_intentional_crash_exit_unlogged(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime, main as worker_main
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("simulate the documented crash")
+            argv = [
+                "--state-dir", str(store.root), "--backend", "file",
+                "--job-id", job.id, "--role", "implement",
+                "--worker-id", "crash-worker", "--crash-after-claim",
+            ]
+            with patch.object(WorkerRuntime, "run_until_idle", side_effect=SystemExit(77)):
+                with self.assertRaises(SystemExit) as raised:
+                    worker_main(argv)
+
+            self.assertEqual(raised.exception.code, 77)
+            self.assertFalse(
+                (store.job_dir(job.id) / "tasks" / "startup_error-crash-worker.log").exists()
+            )
+
     def test_worker_failure_marks_job_failed(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
@@ -27120,6 +27181,37 @@ class AuditFixTests(unittest.TestCase):
         runtime._heartbeat_until_stopped(run, "task_x", stop)
         self.assertTrue(stop.is_set())
         self.assertTrue(runtime._lease_lost.is_set())
+
+    def test_heartbeat_loop_survives_transient_sqlite_writer_contention(self) -> None:
+        import sqlite3
+
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        renewed = MagicMock()
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+            lease_seconds=30,
+            heartbeat_seconds=0.01,
+        )
+        stop = MagicMock()
+        stop.wait.side_effect = [False, False, True]
+
+        with patch.object(
+            runtime,
+            "_heartbeat_run_and_lease",
+            side_effect=[
+                sqlite3.OperationalError("database is locked"),
+                (MagicMock(), renewed),
+            ],
+        ) as heartbeat:
+            runtime._heartbeat_until_stopped(MagicMock(), "task_x", stop)
+
+        self.assertEqual(heartbeat.call_count, 2)
+        self.assertFalse(runtime._lease_lost.is_set())
 
     def test_heartbeat_loop_uses_heartbeat_interval_not_poll_interval(self) -> None:
         from puppetmaster.worker_runtime import WorkerRuntime

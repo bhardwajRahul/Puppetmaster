@@ -2334,10 +2334,15 @@ class SwarmStore(StoreContracts):
             try:
                 with connection(self, metadata_only=True) as c:
                     return read_identity(c, self.backend_name)
-            except sqlite3.OperationalError as exc:
-                transient = str(exc) == 'database is locked' or (
-                    isinstance(exc, ReadUnavailable) and any(reason in str(exc)
-                    for reason in ('source changed', 'active reader', 'live sidecars')))
+            except (sqlite3.OperationalError, ReadUnavailable) as exc:
+                transient = (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and str(exc) == 'database is locked'
+                ) or (
+                    isinstance(exc, ReadUnavailable)
+                    and any(reason in str(exc)
+                            for reason in ('source changed', 'active reader', 'live sidecars'))
+                )
                 if not transient or time.monotonic() >= deadline:
                     raise
                 time.sleep(.01)

@@ -1,6 +1,7 @@
 """Store incarnation identity, independent of the path-derived state identity."""
 from __future__ import annotations
 
+import threading
 from uuid import UUID, uuid4
 
 from puppetmaster.models import JobRef
@@ -9,6 +10,10 @@ from puppetmaster.state import state_identity
 
 class StoreIdentityError(ValueError):
     """Missing, corrupt, legacy or replaced identity; never implicitly rebind."""
+
+
+_launch_prepare_lock = threading.Lock()
+_prepared_launch_roots: set[str] = set()
 
 
 def read_identity(c, backend):
@@ -81,10 +86,36 @@ def reference_at(root, job_id, *, expected_incarnation=None, launch_binding=Fals
 def prepare_launch(root, backend, job_ref=None):
     """Supervisor bootstrap before detaching; the child must attach this identity."""
     from puppetmaster.store_factory import create_store
-    store = create_store(backend, root)
-    if job_ref is not None:
-        store.bind_job_ref(job_ref)
-    store.init()
-    # init captured this identity inside the supervisor transaction. Reopening
-    # a metadata reader here races other launchers and their live WAL.
-    return store._incarnation
+
+    def prepare():
+        store = create_store(backend, root)
+        if job_ref is not None:
+            store.bind_job_ref(job_ref)
+        root_key = str(store.root.resolve())
+        if (
+            backend == "sqlite"
+            and root_key in _prepared_launch_roots
+            and store.db_path.exists()
+        ):
+            connection = store._connect_with_lock_retry()
+            try:
+                version = store._assert_schema(connection)
+                if str(version) == str(store.schema_version):
+                    store._incarnation = read_identity(connection, "sqlite")
+                    return store._incarnation
+            finally:
+                connection.close()
+        store.init()
+        if backend == "sqlite":
+            _prepared_launch_roots.add(root_key)
+        # init captured this identity inside the supervisor transaction.
+        # Reopening a metadata reader here races other launchers and their WAL.
+        return store._incarnation
+
+    if backend == "sqlite":
+        # Detach calls can arrive concurrently in one MCP host. Ensure schema
+        # once per root and process (including trigger refresh after upgrades);
+        # followers validate identity without replaying DDL under a writer lock.
+        with _launch_prepare_lock:
+            return prepare()
+    return prepare()
