@@ -73,6 +73,18 @@ class PollAvailabilityTests(unittest.TestCase):
             readonly._cleanup.maintain(limit=len(readonly._cleanup.owners))
             self.assertIsNone(readonly._read_deadline.get())
 
+    def test_await_reuses_bound_reference_without_reopening(self):
+        with TemporaryDirectory() as root:
+            store = SQLiteSwarmStore(root)
+            job = store.create_job('bound reference')
+            store.update_job_status(job.id, JobStatus.CANCELLED)
+            expected = store.job_ref(job.id)
+            with patch.object(store, 'job_ref', side_effect=AssertionError('redundant reference read')):
+                state = commands_jobs.await_job_state(store, job.id, timeout_seconds=1)
+            self.assertEqual(state['job_ref'], expected.as_dict())
+            self.assertEqual(state['status'], 'cancelled')
+            self.assertTrue(state['terminal'])
+
     def test_four_child_bindings_and_awaits_survive_real_writer(self):
         script = r'''
 import sys
