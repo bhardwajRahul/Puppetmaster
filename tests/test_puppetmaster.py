@@ -10430,7 +10430,7 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_price_job_prices_pinned_run_from_usage(self) -> None:
         """A pinned run emits no ROUTING artifact, but its token usage + the
-        registry price of the model it ran on still yield a priced ledger."""
+        registry price yield only an API-equivalent valuation when billing is unknown."""
         from puppetmaster.cost import price_job
 
         registry = self._three_tier_registry()  # mid-model: $3 in / $15 out
@@ -10442,18 +10442,18 @@ class ModelRouterTests(unittest.TestCase):
             )
         ]
         cost = price_job(artifacts, registry)
-        self.assertEqual(cost.priced_tasks, 1)
-        self.assertEqual(cost.unpriced_tasks, 0)
-        self.assertAlmostEqual(cost.total_marginal_cost_usd, 18.0, places=6)
-        # Measured tokens -> measured cost bucket, not estimated.
-        self.assertAlmostEqual(cost.measured_cost_usd, 18.0, places=6)
-        self.assertEqual(cost.estimated_cost_usd, 0.0)
+        self.assertEqual(cost.priced_tasks, 0)
+        self.assertEqual(cost.unpriced_tasks, 1)
+        self.assertEqual(cost.total_marginal_cost_usd, 0)
+        self.assertEqual(cost.measured_cost_usd, 0)
+        self.assertEqual(cost.tasks[0].api_equivalent_cost_usd, 18)
         self.assertEqual(cost.by_model["mid-model"]["billing"], "unknown")
 
     def test_price_job_prefers_router_model_id_over_recorded_model(self) -> None:
         from puppetmaster.cost import price_job
 
-        registry = self._three_tier_registry()
+        from dataclasses import replace
+        registry = [replace(model, billing="api") for model in self._three_tier_registry()]
         artifacts = [
             self._routing_artifact("t1", model_id="frontier-model"),  # $15/$75
             self._usage_verification(
@@ -10470,7 +10470,8 @@ class ModelRouterTests(unittest.TestCase):
         from puppetmaster.cost import price_job
         from puppetmaster.models import Artifact, ArtifactType
 
-        registry = self._three_tier_registry()
+        from dataclasses import replace
+        registry = [replace(model, billing="api") for model in self._three_tier_registry()]
         artifacts = [
             Artifact(
                 job_id="job_x",
@@ -10515,7 +10516,8 @@ class ModelRouterTests(unittest.TestCase):
     def test_price_job_estimated_tokens_route_to_estimated_bucket(self) -> None:
         from puppetmaster.cost import price_job
 
-        registry = self._three_tier_registry()
+        from dataclasses import replace
+        registry = [replace(model, billing="api") for model in self._three_tier_registry()]
         artifacts = [
             self._usage_verification(
                 "t1", model="cheap-v1", tokens_in=1_000_000, tokens_out=0, estimated=True
@@ -10669,7 +10671,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.05, places=6)
         self.assertTrue(cost.tasks[0].priced)
 
-    def test_price_job_real_cost_usd_without_registry_spec_still_priced(self) -> None:
+    def test_price_job_real_cost_usd_without_registry_spec_is_unpriced(self) -> None:
         from puppetmaster.cost import price_job
 
         artifacts = [
@@ -10679,10 +10681,10 @@ class ModelRouterTests(unittest.TestCase):
             )
         ]
         cost = price_job(artifacts, self._three_tier_registry())
-        self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.05, places=6)
-        self.assertEqual(cost.priced_tasks, 1)
-        self.assertEqual(cost.unpriced_tasks, 0)
-        self.assertEqual(cost.tasks[0].billing, "reported")
+        self.assertEqual(cost.total_marginal_cost_usd, 0)
+        self.assertEqual(cost.priced_tasks, 0)
+        self.assertEqual(cost.unpriced_tasks, 1)
+        self.assertEqual(cost.tasks[0].billing, "unknown")
 
     def test_agentic_loop_usage_includes_cached_tokens_and_real_cost(self) -> None:
         from puppetmaster.adapters import agentic
@@ -11224,7 +11226,7 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_cost_command_prices_pinned_run_without_routing_artifacts(self) -> None:
         """End-to-end: a job with usage but no ROUTING artifacts no longer dead-ends
-        at '$0, didn't auto-route' — it reports actual measured spend."""
+        at '$0, didn't auto-route' — unknown billing retains only valuation."""
         from puppetmaster.model_registry import save_registry
         from puppetmaster.store_factory import create_store
 
@@ -11274,11 +11276,9 @@ class ModelRouterTests(unittest.TestCase):
             data = json.loads(stdout.getvalue())
             # No routing happened -> the pre-flight estimate is zero...
             self.assertEqual(data["total_estimated_cost_usd"], 0.0)
-            # ...but actual measured spend is priced from usage × registry price.
-            self.assertAlmostEqual(
-                data["actual_cost"]["total_marginal_cost_usd"], 18.0, places=6
-            )
-            self.assertEqual(data["actual_cost"]["priced_tasks"], 1)
+            self.assertIsNone(data["actual_cost"]["total_marginal_cost_usd"])
+            self.assertEqual(data["actual_cost"]["tasks"][0]["api_equivalent_cost_usd"], 18)
+            self.assertEqual(data["actual_cost"]["priced_tasks"], 0)
             # The task breakdown falls back to the priced-usage rows.
             self.assertEqual(len(data["tasks"]), 1)
             self.assertEqual(data["tasks"][0]["model_id"], "mid-model")

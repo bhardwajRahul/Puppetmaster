@@ -158,13 +158,14 @@ def freeze(receipt, artifacts):
         route = routes.get(task_id)
         billing = (route.payload or {}).get('billing') if route is not None else None
         priced = priced_rows.get(task_id)
-        if billing is None and priced and priced.get('billing') == 'plan':
-            billing = 'plan'
-        buckets['api_cost_usd'].append((cost if billing != 'plan' else None, 'measured'))
+        if billing not in ('api', 'plan', 'unknown'):
+            billing = priced.get('billing') if priced else None
+        buckets['api_cost_usd'].append((cost if billing == 'api' else None, 'measured'))
         buckets['plan_marginal_cost_usd'].append((0 if billing == 'plan' else None, 'estimated'))
         # Registry valuation is always an estimate, never an API charge.
-        equivalent = (priced.get('marginal_cost_usd') if priced and priced.get('priced')
-                      and billing != 'plan' and cost is None
+        equivalent = (priced.get('api_equivalent_cost_usd',
+                                 priced.get('marginal_cost_usd') if billing == 'api' else None) if priced
+                      and billing != 'plan' and (cost is None or billing != 'api')
                       and facts.get('tokens_in') is not None and facts.get('tokens_out') is not None else None)
         buckets['api_equivalent_cost_usd'].append((equivalent, 'estimated'))
     totals = {}

@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Optional
 
+from puppetmaster import model_registry
 from puppetmaster.model_registry import (
     ModelSpec,
     default_registry_path,
-    load_registry,
     registry_digest,
     resolve_model_pin,
     stamp_resolved_model_pin,
@@ -56,7 +56,7 @@ def load_bound_registry(payload: dict) -> tuple[Path, list[ModelSpec], str]:
         raise RegistryAuthorityError(
             f"task registry authority at {path} is missing registry_digest"
         )
-    registry = load_registry(path)
+    registry = model_registry.load_registry(path)
     actual = registry_digest(registry)
     if actual != expected:
         raise RegistryAuthorityError(
@@ -81,7 +81,7 @@ def resolve_and_bind_explicit_pin(
     if not source:
         return dict(payload or {})
     path = registry_path or registry_path_from_payload(payload, allow_default=True)
-    registry = load_registry(path)
+    registry = model_registry.load_registry(path)
     pin = resolve_model_pin(source, registry, adapter=adapter)
     if pin is None:
         raise RegistryAuthorityError(

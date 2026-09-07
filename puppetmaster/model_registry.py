@@ -1470,25 +1470,46 @@ def stamp_model_billing(
 ) -> dict:
     """Carry explicit billing only across the same resolved model identity."""
     merged = dict(payload or {})
-    billing = merged.get("billing")
-    previous_model = merged.get("router_model_id") or merged.get("model")
-    if spec is not None:
-        adapter = DISCOVERY_SOURCE_TO_ADAPTER.get(previous_adapter, previous_adapter)
-        needle = str(previous_model or "").strip()
-        eligible = [entry for entry in enabled_specs(
-            registry if registry is not None else [spec]
-        ) if adapter is None or entry.adapter == adapter]
-        # Billing authority requires a complete registered identity. Friendly
-        # selection's normalized suffix fallback cannot prove continuity.
-        matches = [entry for entry in eligible if entry.id == needle]
-        if not matches:
-            matches = [entry for entry in eligible
-                       if entry.adapter_model_name == needle]
-        if len(matches) != 1 or matches[0].id != spec.id:
-            billing = None
+    if spec is None:
+        merged["billing"] = merged.get("billing") if merged.get("billing") in ("plan", "api") else "unknown"
+        return merged
+    adapter = DISCOVERY_SOURCE_TO_ADAPTER.get(previous_adapter, previous_adapter)
+    authority = list(registry) if registry is not None else [spec]
+    original = next((entry for entry in authority if entry.id == spec.id), spec)
+    needle = str(merged.get("router_model_id") or merged.get("model") or "").strip()
+    eligible = [entry for entry in enabled_specs(authority)
+                if adapter is None or entry.adapter == adapter]
+    matches = [entry for entry in eligible if entry.id == needle]
+    if not matches:
+        matches = [entry for entry in eligible if entry.adapter_model_name == needle]
+    same = len(matches) == 1 and matches[0].id == spec.id
+    source = merged.get("billing_source")
+    explicit = same and merged.get("billing") in ("plan", "api") and source in (None, "explicit")
+    # Resolve override authority from the caller, then probe the launch payload.
+    merged = {**(spec.payload_defaults or {}), **merged}
+    billing = merged["billing"] if explicit else original.billing
+    source = "explicit" if explicit else "registry"
     if billing not in ("plan", "api"):
-        billing = getattr(spec, "billing", "unknown")
-    merged["billing"] = billing if billing in ("plan", "api") else "unknown"
+        from puppetmaster.platform_billing import detect_adapter_billing
+        try:
+            env = dict(os.environ)
+            if spec.adapter == "openai" and merged.get("openai_api_key"):
+                env["OPENAI_API_KEY"] = str(merged["openai_api_key"])
+            command_context = {}
+            if spec.adapter == "codex" and merged.get("executable"):
+                command_context["codex_command"] = merged["executable"]
+            status = detect_adapter_billing(spec.adapter, env=env, **command_context)
+            billing = status.billing if status.healthy else "unknown"
+            # API transports cannot consume a CLI subscription credential.
+            if spec.adapter in ("openai", "agentic") and billing == "plan":
+                billing = "unknown"
+            source = "launch_auth" if billing in ("plan", "api") else "inconclusive"
+        except Exception:
+            billing, source = "unknown", "inconclusive"
+    merged.update(billing=billing if billing in ("plan", "api") else "unknown",
+                  registry_billing=original.billing, billing_source=source)
+    # Persist only closed-vocabulary evidence, never detector text, paths or credentials.
+    merged["billing_evidence"] = [source + ":" + merged["billing"]]
     return merged
 
 
@@ -1504,9 +1525,7 @@ def stamp_resolved_model_pin(
     ``--model`` pin still gets catalog wire defaults without clobbering
     caller overrides such as an explicit ``--provider``.
     """
-    defaults = dict(pin.spec.payload_defaults or {})
     return {
-        **defaults,
         **stamp_model_billing(payload, pin.spec, registry=registry,
                               previous_adapter=pin.adapter),
         "model": pin.adapter_model_name,

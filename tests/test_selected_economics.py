@@ -181,6 +181,60 @@ class SelectedEconomicsTests(unittest.TestCase):
             self.assertEqual(estimated.totals.api_equivalent_cost_usd.state,'estimated')
             self.assertIsNone(estimated.totals.api_cost_usd.total)
 
+    def test_legacy_billing_reopen_matches_terminal_receipt(self):
+        from unittest.mock import patch
+        from puppetmaster.cost import build_cost_report, execution_billing_artifacts
+        from puppetmaster.models import Artifact, ArtifactType, Task, to_jsonable
+        from tests.test_cost_report import _registry
+
+        for store_type in (SwarmStore, SQLiteSwarmStore):
+            for billing in ('unknown', 'api', 'plan'):
+                for provenance in (None, 'unknown', 'api', 'plan', 'inconclusive'):
+                    with self.subTest(store=store_type.__name__, billing=billing,
+                                      provenance=provenance), TemporaryDirectory() as tmp:
+                        store = store_type(Path(tmp) / 'state')
+                        job = store.create_job('legacy reported cost')
+                        task = Task(job_id=job.id, role='explore', instruction='legacy',
+                                    payload={'model': 'mid-v1'})
+                        store.save_task(task)
+                        self.usage(store, job, task_id=task.id, cost=5)
+                        if provenance is not None:
+                            store.save_artifact(Artifact(job_id=job.id, task_id=task.id,
+                                type=ArtifactType.VERIFICATION, created_by='orchestrator',
+                                confidence=1, evidence=['execution billing'], payload={
+                                    'check': 'execution_billing', 'result': 'passed', 'model_id': 'mid-model',
+                                    'billing': provenance}))
+                        registry = [replace(_registry()[0], billing=billing)]
+                        with patch('puppetmaster.cost.load_registry', return_value=registry):
+                            store.update_job_status(job.id, JobStatus.COMPLETE)
+                        frozen = store.get_selected_economics(store.job_ref(job.id))
+                        reopened = store_type(Path(tmp) / 'state')
+                        selected = reopened.get_selected_economics(reopened.job_ref(job.id))
+                        self.assertEqual(selected, frozen)
+                        receipt = reopened.get_job(job.id).cost_receipt
+                        self.assertEqual(build_cost_report(reopened, job.id, []), receipt)
+                        self.assertEqual(to_jsonable(selected.totals),
+                                         receipt['bounded_economics']['totals'])
+                        effective = provenance if provenance in ('unknown', 'api', 'plan') else billing
+                        row = receipt['actual_cost']['tasks'][0]
+                        self.assertEqual(row['billing'], effective)
+                        expected = 5 if effective == 'api' else 0 if effective == 'plan' else None
+                        self.assertEqual(receipt['actual_cost']['total_marginal_cost_usd'], expected)
+                        api = selected.totals.api_cost_usd
+                        self.assertEqual((api.total, api.state),
+                                         (5, 'measured') if effective == 'api' else (None, 'unknown'))
+                        plan = selected.totals.plan_marginal_cost_usd
+                        self.assertEqual((plan.total, plan.state),
+                                         (0, 'estimated') if effective == 'plan' else (None, 'unknown'))
+                        equivalent = selected.totals.api_equivalent_cost_usd
+                        self.assertEqual((equivalent.total, equivalent.state),
+                                         (0.00006, 'estimated') if effective == 'unknown' else (None, 'unknown'))
+                        sources = execution_billing_artifacts(reopened.list_artifacts(job.id))
+                        if provenance is None:
+                            self.assertEqual(sources, {})
+                        else:
+                            self.assertEqual(sources[task.id].payload['billing'], provenance)
+
     def test_no_source_reads_and_constant_lookup_work(self):
         from contextlib import ExitStack
         from unittest.mock import patch

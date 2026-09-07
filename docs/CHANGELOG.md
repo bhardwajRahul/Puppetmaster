@@ -1,5 +1,6 @@
 ## v1.25.0 — 2026-09-06
 
+- Fix direct Codex billing provenance and preserve unknown registry valuations as API-equivalent estimates (#136, reported by @kbentonferguson).
 - Add persisted store incarnation UUIDs and strict v2 JobRefs. Fence stale continuations, scoped mutations, and completion; retain weak v1 read compatibility and legacy receipt decoding.
 - Bound nonmutating job summaries, change feeds, history reference pages, JSON metadata, and read retries. Isolated readers never initialize or migrate stores; unavailable reads preserve checkpoints. Keep display previews and delivery states in snapshots, changes, and tombstones.
 - Repair completion publication, task claims, and detached launches under contention. Retry transient reads and lock acquisition without replaying mutations; preserve launch identity and clean up failed starts.

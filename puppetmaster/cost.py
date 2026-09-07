@@ -74,6 +74,7 @@ class TaskCost:
     priced: bool
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    api_equivalent_cost_usd: Optional[float] = None
 
 
 @dataclass
@@ -339,7 +340,8 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
     Persisted execution billing (with final routing taking precedence) overrides
     registry defaults even when the model is no longer registered. Legacy
     artifacts without billing retain registry behavior.
-    Per-task precedence: effective ``billing="plan"`` → $0 marginal; else positive artifact
+    Per-task precedence: effective ``billing="plan"`` → $0 marginal;
+    unknown billing → unpriced marginal cost with API-equivalent valuation; else positive artifact
     ``real_cost_usd`` → that reported value; else matching registry model →
     tokens × registry prices (cache-read discount + output multiplier);
     else unpriced (aggregate unknown, not $0). Measured vs estimated
@@ -362,7 +364,7 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
         route = final_routes.get(task_id)
         effective_billing = (route.payload or {}).get("billing") if route else None
         if effective_billing not in ("plan", "api", "unknown"):
-            effective_billing = getattr(spec, "billing", None)
+            effective_billing = getattr(spec, "billing", "unknown")
         model_id = (spec.id if spec is not None else
                     routing_models.get(task_id) or record["model"] or "<unknown>")
         tokens_in = record["tokens_in"]
@@ -385,6 +387,8 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
             billing = effective_billing
             cost = 0.0
             priced = True
+        elif effective_billing == "unknown":
+            billing, cost, priced = "unknown", 0.0, False
         elif real_cost_f > 0:
             cost = real_cost_f
             priced = True
@@ -412,6 +416,8 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
             cache_read_tokens=record.get("cache_read_tokens", 0),
             cache_write_tokens=record.get("cache_write_tokens", 0),
         )
+        if spec is not None:
+            result.tasks[-1] = replace(result.tasks[-1], api_equivalent_cost_usd=round(nominal_cost, 6))
     return _finalize_job_cost(result)
 
 
@@ -639,7 +645,7 @@ def build_current_registry_cost_report(
 def price_job_from_artifacts(artifacts: Iterable[Artifact]) -> JobCost:
     """Price from persisted artifacts only — no current registry rates.
 
-    Provider-reported ``real_cost_usd`` stays known. A final ROUTING
+    Provider-reported ``real_cost_usd`` stays known only with API billing provenance. A final ROUTING
     artifact with ``billing=plan`` is a known plan-billed zero. API usage
     without an artifact price stays honestly unpriced.
     """
@@ -660,8 +666,10 @@ def price_job_from_artifacts(artifacts: Iterable[Artifact]) -> JobCost:
             billing = "plan"
             cost = 0.0
             priced = True
+        elif route_payload.get("billing") != "api":
+            billing, cost, priced = "unknown", 0.0, False
         elif real_cost_f > 0:
-            billing = "reported"
+            billing = "api"
             cost = real_cost_f
             priced = True
         else:
