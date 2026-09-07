@@ -81,7 +81,9 @@ class MetadataContentionTests(unittest.TestCase):
                         c._opened = False
                         failed.append(c)
                         clock[0] += .1 if outcome == 'unproven' else .01
-                        error = dict(kind='unavailable', error='unable to open database: active reader; sidecars may be missing')
+                        error = dict(kind='unavailable',
+                                     error='unable to open database: active reader; sidecars may be missing',
+                                     session_closed=True)
                         if outcome != 'unproven':
                             error['code'] = 5
                         with patch.object(c.responses, 'get', return_value=json.dumps(error)):

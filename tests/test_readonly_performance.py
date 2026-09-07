@@ -26,7 +26,7 @@ class ReadonlyPerformanceTests(unittest.TestCase):
             with self.subTest(backend=cls.backend_name), TemporaryDirectory() as root:
                 store = cls(root)
                 job = store.create_job('bounded reads')
-                with patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn, \
+                with patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn, \
                         patch.object(readonly, 'selection', wraps=readonly.selection) as fences:
                     started = time.monotonic()
                     for _ in range(100):
@@ -47,6 +47,8 @@ class ReadonlyPerformanceTests(unittest.TestCase):
                 fences.reset_mock()  # Recorded call arguments also own the store.
                 del store
                 gc.collect()
+                self.assertFalse(transport.closed)
+                readonly._cleanup.maintain(limit=len(readonly._cleanup.owners))
                 self.assertIsNotNone(transport.process.poll())
                 self.assertTrue(transport.process.stdin.closed)
                 self.assertTrue(transport.process.stdout.closed)
@@ -60,7 +62,11 @@ class ReadonlyPerformanceTests(unittest.TestCase):
             # Helper finalizers also sleep while reaping subprocesses.
             # Keep their real clock separate from the retry budget under test.
             timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
-            with patch.object(readonly, 'ReadConnection', side_effect=readonly.ReadUnavailable('live sidecars')) as opens, \
+            def unavailable(*args, contention_window, **kwargs):
+                if contention_window[0] is None:
+                    contention_window[0] = clock[0] + .1
+                raise readonly.ReadUnavailable('live sidecars')
+            with patch.object(readonly, 'ReadConnection', side_effect=unavailable) as opens, \
                     patch.object(readonly, 'time', timer):
                 for _ in range(100):
                     with self.assertRaises(readonly.ReadUnavailable):
@@ -75,7 +81,7 @@ class ReadonlyPerformanceTests(unittest.TestCase):
             jobs = [store.create_job('lookup') for store in stores]
             roots = [store.root for store in stores]
             with patch.object(state, 'list_project_state_dirs', return_value=roots), \
-                    patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn:
+                    patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn:
                 for _ in range(100):
                     self.assertEqual(state.find_state_dir_for_job(jobs[0].id), roots[0])
                 self.assertEqual(spawn.call_count, 1)

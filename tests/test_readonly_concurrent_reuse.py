@@ -9,7 +9,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import sqlite3
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from puppetmaster import readonly
 from puppetmaster.sqlite_store import SQLiteSwarmStore
@@ -101,7 +101,7 @@ class ConcurrentReuseTests(unittest.TestCase):
                     barrier.wait(timeout=5)
                 return result
 
-            def transport(path):
+            def transport(path, deadline=None):
                 if path.parent == stores[0].root:
                     starting.set()
                     if not proceed.wait(timeout=5):
@@ -131,6 +131,8 @@ class ConcurrentReuseTests(unittest.TestCase):
             self.assertFalse(transports[0].busy.locked())
             stores.clear()
             gc.collect()
+            self.assertFalse(transports[0].closed)
+            readonly._cleanup.maintain(limit=len(readonly._cleanup.owners))
             self.assertTrue(transports[0].closed)
 
     def test_busy_slot_times_out_without_spawning_or_closing_owner(self):
@@ -170,13 +172,15 @@ class ConcurrentReuseTests(unittest.TestCase):
                 clock[0] += seconds
 
             timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
+            error = sqlite3.OperationalError('database is locked')
+            error.session_closed = True
             with patch.object(store._readonly_slot, 'busy', DelayedLock()), \
                     patch.object(readonly, 'time', timer), \
                     patch.object(readonly.ReadConnection, '_receive',
-                                 side_effect=sqlite3.OperationalError('database is locked')):
+                                 side_effect=error):
                 with self.assertRaisesRegex(sqlite3.OperationalError, 'database is locked'):
                     readonly.connect(store, reuse=True)
-            self.assertAlmostEqual(clock[0], .1)
+            self.assertAlmostEqual(clock[0], .18)
             self.assertFalse(lock.locked())
 
     def test_failed_start_releases_slot_and_failed_response_reaps_once(self):
@@ -196,12 +200,12 @@ class ConcurrentReuseTests(unittest.TestCase):
                 with patch.object(readonly.ReadConnection, '_receive', side_effect=readonly.ReadTimeout('failed')):
                     with self.assertRaises(readonly.ReadTimeout):
                         readonly.connect(store, reuse=True)
-                close.assert_called_once_with(old)
+                close.assert_called_once_with(old, deadline=ANY)
                 self.assertIsNone(store._readonly_slot.transport)
                 self.assertFalse(store._readonly_slot.busy.locked())
                 with readonly.connect(store, reuse=True) as replacement:
                     self.assertIsNot(replacement.transport, old)
-                close.assert_called_once_with(old)
+                close.assert_called_once_with(old, deadline=ANY)
             self.assertIsNotNone(old.process.poll())
 
 

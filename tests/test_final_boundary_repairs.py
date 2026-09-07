@@ -197,15 +197,22 @@ class FinalBoundaryRepairs(unittest.TestCase):
                     transports = []
 
                     class Transport:
-                        def __init__(self, path):
+                        def __init__(self, path, deadline=None):
                             self.closed = False
+                            self.pid = readonly.os.getpid()
                             self.busy = threading.Lock()
                             self.process = SimpleNamespace(stdin=io.StringIO())
                             self.responses = SimpleNamespace(get=lambda timeout: json.dumps(
-                                dict(kind='OperationalError', error='contended', code=code)))
+                                dict(kind='OperationalError', error='contended', code=code,
+                                     session_closed=True)))
+                            self.token = readonly._cleanup.register(
+                                self, readonly.source_stamp(path)[:2])
                             transports.append(self)
 
-                        def close(self):
+                        def ready(self, deadline):
+                            pass
+
+                        def close(self, deadline=None):
                             self.closed = True
 
                     def sleep(seconds):
@@ -231,19 +238,32 @@ class FinalBoundaryRepairs(unittest.TestCase):
                     transports = []
 
                     class Transport:
-                        def __init__(self, path):
+                        def __init__(self, path, deadline=None):
                             self.closed = False
                             self.pid = readonly.os.getpid()
                             self.busy = threading.Lock()
                             self.process = SimpleNamespace(stdin=io.StringIO())
-                            error = (dict(kind='unavailable', error=
-                                'unable to open database: active reader; sidecars may be missing')
-                                if not transports else
-                                dict(kind='OperationalError', error='contended', code=code))
-                            self.responses = SimpleNamespace(get=lambda timeout: json.dumps(error))
+                            responses = [
+                                dict(kind='unavailable',
+                                     error='unable to open database: active reader; sidecars may be missing',
+                                     session_closed=True),
+                                dict(kind='OperationalError', error='contended', code=code,
+                                     session_closed=True),
+                            ]
+                            calls = [0]
+                            def get(timeout):
+                                result = responses[min(calls[0], 1)]
+                                calls[0] += 1
+                                return json.dumps(result)
+                            self.responses = SimpleNamespace(get=get)
+                            self.token = readonly._cleanup.register(
+                                self, readonly.source_stamp(path)[:2])
                             transports.append(self)
 
-                        def close(self):
+                        def ready(self, deadline):
+                            pass
+
+                        def close(self, deadline=None):
                             self.closed = True
 
                     def sleep(seconds):
@@ -257,7 +277,7 @@ class FinalBoundaryRepairs(unittest.TestCase):
                     self.assertEqual(raised.exception.sqlite_errorcode, code)
                     self.assertAlmostEqual(clock[0], budget)
                     self.assertLessEqual(clock[0], budget)
-                    self.assertEqual(len(transports), 2)
+                    self.assertEqual(len(transports), 1)
                     for transport in transports:
                         self.assertTrue(transport.closed)
                         self.assertFalse(transport.busy.locked())

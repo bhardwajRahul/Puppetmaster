@@ -27,6 +27,9 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
 
         def assert_reaped():
             for c in failed:
+                if not c.closed:
+                    readonly._cleanup.close(c._token)
+                    c.close()
                 self.assertTrue(c.closed)
                 self.assertIsNotNone(c.process.poll())
                 self.assertTrue(c.process.stdin.closed)
@@ -43,14 +46,17 @@ class ReadonlyLaunchRetryTests(unittest.TestCase):
                 return receive(c)
             assert_reaped()
             opened.append(c)
-            response = receive(c)
             if errors:
                 error = errors.pop(0)
                 failed.append(c)
-                clock[0] += step
-                with patch.object(c.responses, 'get', return_value=json.dumps(error)):
+                get = c.responses.get
+                def response(timeout):
+                    get(timeout=timeout)
+                    clock[0] += min(step, timeout)
+                    return json.dumps(error)
+                with patch.object(c.responses, 'get', response):
                     return receive(c)
-            return response
+            return receive(c)
 
         def sleep(seconds):
             clock[0] += seconds

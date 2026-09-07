@@ -61,3 +61,13 @@ def replacement_blocked(operation):
             raise
         return True
     return False
+
+
+class ProtocolTransport:
+    """Deterministic open/query responses after a successful helper handshake."""
+    def __init__(self, path):
+        from puppetmaster import readonly
+        self.token = readonly._cleanup.register(self, (str(path),))
+
+    def ready(self, deadline):
+        pass

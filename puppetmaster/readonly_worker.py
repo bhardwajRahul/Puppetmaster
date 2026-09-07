@@ -288,15 +288,9 @@ def main(path):
             query.type, query.start, query.length = fcntl.F_WRLCK, 1073741826, 510
             answer = Lock.from_buffer_copy(fcntl.fcntl(source, fcntl.F_GETLK, bytes(query)))
             if answer.type != fcntl.F_UNLCK:
-                source.seek(18)
-                journal = source.read(2)
-                # This classifies retry only; reading still requires the lock
-                # and the checkpoint proof below. Missing WAL sidecars stay unavailable.
-                retryable = (answer.type == fcntl.F_WRLCK or journal == b'\x01\x01' or
-                             (before[1] is not None and before[2] is not None))
                 emit(dict(kind='OperationalError' if answer.type == fcntl.F_WRLCK else 'unavailable',
                           error='database is locked' if answer.type == fcntl.F_WRLCK else 'unable to open database: active reader; sidecars may be missing',
-                          code=5 if retryable else None))  # SQLITE_BUSY, also on Python before 3.11.
+                          code=5))  # SQLITE_BUSY, also on Python before 3.11.
                 return
             try:
                 fcntl.lockf(source, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB, 510, 1073741826)
@@ -311,7 +305,12 @@ def main(path):
             return
         header = source.read(100)
         if not checkpointed_sidecars(path, before, header[18:20]):
-            emit(dict(kind='unavailable', error='unable to open database: live sidecars; retry after checkpoint'))
+            # A validated WAL/index with uncheckpointed frames is concrete
+            # write contention, even if the writer dropped its byte-range lock
+            # between the lock probe and this checkpoint proof.
+            emit(dict(kind='unavailable',
+                      error='unable to open database: live sidecars; retry after checkpoint',
+                      code=5))
             return
         after = stamps(path)
         if after != before:
@@ -390,21 +389,47 @@ def main(path):
             c.close()
 
 
-if __name__ == '__main__':
-    try:
-        path = sys.argv[1]
-        while True:
-            released = main(path)
-            # main has closed SQLite and the locking fd before retry/release.
-            # Failed opens already emitted their error; the parent either
-            # terminates us or requests another bounded, fully fenced open.
-            if released:
-                emit(dict(rows=[], names=[]))
+def serve(path=None):
+    global emit
+    output = emit
+    if path is None:
+        output(dict(ready=True))
+    while True:
+        if path is None:
             request = sys.stdin.readline(1024 * 1024 + 1)
             if not request or len(request) > 1024 * 1024:
-                break
+                return
             path = json.loads(request)['open']
-    except OSError as exc:
-        emit(dict(kind='unavailable', error='unable to open database: source changed or unavailable: ' + str(exc)))
-    except sqlite3.Error as exc:
-        emit(dict(kind=type(exc).__name__, error=str(exc), code=getattr(exc, 'sqlite_errorcode', None)))
+        pending = []
+        opened = False
+
+        def session_output(message):
+            nonlocal opened
+            if 'journal' in message:
+                opened = True
+            if not opened and 'error' in message:
+                pending.append(message)
+            else:
+                output(message)
+
+        emit = session_output
+        try:
+            try:
+                released = main(path)
+            except OSError as exc:
+                output(dict(kind='unavailable', error='unable to open database: source changed or unavailable: ' + str(exc)))
+                return
+            except sqlite3.Error as exc:
+                output(dict(kind=type(exc).__name__, error=str(exc), code=getattr(exc, 'sqlite_errorcode', None)))
+                return
+        finally:
+            emit = output
+        for message in pending:
+            output(dict(message, session_closed=True))
+        if released:
+            output(dict(rows=[], names=[]))
+        path = None
+
+
+if __name__ == '__main__':
+    serve(None if sys.argv[1] == '--ready' else sys.argv[1])

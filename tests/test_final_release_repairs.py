@@ -89,10 +89,10 @@ class FinalReleaseRepairs(unittest.TestCase):
                 with damaged_sidecars(holder, supervisor.db_path):
                     with self.assertRaises(readonly.ReadUnavailable) as caught:
                         readonly.connect(supervisor, timeout=.5, attach_binding=True)
-                    # Windows cannot query the conflicting lock type, but does
-                    # confirm contention. POSIX identifies a missing-WAL reader.
-                    self.assertEqual(getattr(caught.exception, 'sqlite_errorcode', None),
-                                     5 if sys.platform == 'win32' else None)
+                    # Both lock APIs confirm a live conflicting reader. The
+                    # missing sidecars still prevent a read, but the retry
+                    # classification remains SQLITE_BUSY.
+                    self.assertEqual(getattr(caught.exception, 'sqlite_errorcode', None), 5)
             finally:
                 holder.close()
             holder = sqlite3.connect(supervisor.db_path)

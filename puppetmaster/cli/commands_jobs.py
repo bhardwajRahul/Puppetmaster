@@ -56,7 +56,9 @@ from puppetmaster.mcp_registry import (
     summarize as registry_summarize,
 )
 from puppetmaster.models import is_terminal_job_status
+from puppetmaster.identity import make_ref
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.readonly import ReadUnavailable, read_deadline
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.state import (
     find_state_dir_for_job,
@@ -71,9 +73,12 @@ from puppetmaster.workers import WorkerSpec
 from puppetmaster.cli.helpers import _registry_path_from_args
 
 
-def read_job_state(store, job_id: str, *, timed_out: bool = False) -> dict:
+def read_job_state(store, job_id: str, *, timed_out: bool = False, stall_after_seconds=None) -> dict:
     """Return the canonical non-blocking state payload for one durable job."""
-    _reap_quietly(store)
+    if stall_after_seconds is None:
+        _reap_quietly(store)
+    else:
+        _reap_quietly(store, stall_after_seconds=stall_after_seconds)
     job = store.get_job(job_id)
     snapshot = (
         store.status_snapshot(job_id, compact=True)
@@ -99,6 +104,7 @@ def await_job_state(
     *,
     timeout_seconds: float = 0.0,
     poll_interval_seconds: float = 0.25,
+    stall_after_seconds=None,
 ) -> dict:
     """Block until ``job_id`` reaches a terminal state or the timeout elapses.
 
@@ -110,19 +116,32 @@ def await_job_state(
     poll = max(0.05, poll_interval_seconds)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     cursor = 0
+    reference = getattr(store, '_legacy_read_ref', None)
+    if reference is None and getattr(store, '_incarnation', None) is not None:
+        reference = make_ref(store.root, job_id, store._incarnation)
+    state = dict(job_id=job_id, job_ref=reference.as_dict() if reference is not None else None, status='unavailable', terminal=False,
+                 timed_out=False, completed_at=None)
     while True:
-        state = read_job_state(store, job_id)
+        try:
+            with read_deadline(deadline):
+                state = read_job_state(store, job_id, stall_after_seconds=stall_after_seconds)
+        except ReadUnavailable:
+            if deadline is not None and time.monotonic() >= deadline:
+                return {**state, "timed_out": True}
+            time.sleep(poll if deadline is None else min(poll, max(0, deadline - time.monotonic())))
+            continue
         if state["terminal"]:
             return state
         if deadline is not None and time.monotonic() >= deadline:
             return {**state, "timed_out": True}
-        block = poll if deadline is None else max(0.05, min(poll * 4, deadline - time.monotonic()))
-        events = store.wait_for_events(
-            job_id,
-            since=cursor,
-            timeout_seconds=max(0.05, block),
-            poll_interval=poll,
-        )
+        block = poll if deadline is None else max(0, min(poll * 4, deadline - time.monotonic()))
+        try:
+            with read_deadline(deadline):
+                events = store.wait_for_events(
+                    job_id, since=cursor, timeout_seconds=block, poll_interval=poll)
+        except ReadUnavailable:
+            time.sleep(poll if deadline is None else min(poll, max(0, deadline - time.monotonic())))
+            continue
         # Advance the cursor past the events we just observed. Without this the
         # cursor stayed at 0, so once any event existed wait_for_events returned
         # immediately every iteration and the loop hot-spun (re-reading the
@@ -132,7 +151,7 @@ def await_job_state(
             if isinstance(event_id, int) and event_id > cursor:
                 cursor = event_id
 
-def _reap_quietly(store) -> list[dict]:
+def _reap_quietly(store, *, stall_after_seconds=None) -> list[dict]:
     """Run the stalled-job reaper, swallowing any failure.
 
     Wired into read-side commands (status/jobs/wait) so a dead-but-"running"
@@ -141,7 +160,8 @@ def _reap_quietly(store) -> list[dict]:
     try:
         from puppetmaster.liveness import reap_stalled_jobs
 
-        return reap_stalled_jobs(store)
+        kwargs = {} if stall_after_seconds is None else {'stall_after_seconds': stall_after_seconds}
+        return reap_stalled_jobs(store, **kwargs)
     except Exception:
         return []
 
@@ -252,27 +272,11 @@ def _run_wait_command(args, store) -> int:
     """Block until a job reaches a terminal state, running the reaper between
     checks so a stalled job is detected (not waited on forever). Exits non-zero
     when the job did not complete cleanly."""
-    poll = max(0.05, args.poll_interval_seconds)
-    deadline = (
-        time.monotonic() + args.timeout_seconds if args.timeout_seconds > 0 else None
-    )
-    while True:
-        try:
-            from puppetmaster.liveness import reap_stalled_jobs
-
-            reap_stalled_jobs(store, stall_after_seconds=args.stall_after_seconds)
-        except Exception:
-            pass
-        job = store.get_job(args.job_id)
-        status = str(job.status)
-        terminal = is_terminal_job_status(job.status)
-        if terminal:
-            timed_out = False
-            break
-        if deadline is not None and time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(poll)
+    state = await_job_state(
+        store, args.job_id, timeout_seconds=args.timeout_seconds,
+        poll_interval_seconds=args.poll_interval_seconds,
+        stall_after_seconds=args.stall_after_seconds)
+    status, terminal, timed_out = state['status'], state['terminal'], state['timed_out']
 
     summary = ""
     if args.summary and status in {"complete", "stalled"}:
@@ -282,15 +286,7 @@ def _run_wait_command(args, store) -> int:
         else:
             summary = Stitcher(store).preview(args.job_id)
 
-    payload = {
-        "job_id": args.job_id,
-        "status": status,
-        "terminal": terminal,
-        "timed_out": timed_out,
-        "completed_at": job.completed_at,
-        "budget_policy": dataclasses.asdict(job.budget_policy) if job.budget_policy else None,
-        "delivery": store.status_snapshot(args.job_id, compact=True).get("delivery"),
-    }
+    payload = state
     if args.json:
         print(json.dumps({**payload, "summary": summary}, indent=2, default=str))
     elif timed_out:

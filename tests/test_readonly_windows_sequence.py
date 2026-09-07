@@ -1,4 +1,5 @@
 """Native metadata interleavings, without requiring a Windows test host."""
+from tests.readonly_fixtures import ProtocolTransport
 import ctypes
 import json
 import queue
@@ -89,11 +90,12 @@ class WindowsSequenceTests(unittest.TestCase):
             store.busy_timeout_ms = 0
             clock = [0.0]
             waits = []
-            class Transport:
-                def __init__(self, path):
+            class Transport(ProtocolTransport):
+                def __init__(self, path, deadline=None):
+                    super().__init__(path)
                     import threading
                     self.busy = threading.Lock()
-                    self.process = SimpleNamespace()
+                    self.process = SimpleNamespace(stdin=__import__('io').StringIO())
                     self.responses = SimpleNamespace(get=self.get)
                     self.closed = False
                     clock[0] += .2  # Windows startup exceeds the former 100 ms.
@@ -101,9 +103,9 @@ class WindowsSequenceTests(unittest.TestCase):
                     waits.append(timeout)
                     if timeout < .2:
                         raise queue.Empty()
-                    return json.dumps(dict(kind='unavailable', code=5,
+                    return json.dumps(dict(session_closed=True, kind='unavailable', code=5,
                         error='unable to open database: active reader; sidecars may be missing'))
-                def close(self):
+                def close(self, deadline=None):
                     self.closed = True
             with patch.object(readonly, '_Transport', Transport), \
                     patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0])), \
@@ -112,7 +114,9 @@ class WindowsSequenceTests(unittest.TestCase):
                     store.attach()
             self.assertTrue(_is_sqlite_lock_error(caught.exception))
             self.assertEqual(caught.exception.sqlite_errorcode, 5)
-            self.assertEqual(waits, [5.0] * 5)
+            self.assertEqual(len(waits), 5)
+            for timeout in waits:
+                self.assertAlmostEqual(timeout, 4.8)
             self.assertEqual(store.lock_error_count, 5)
             self.assertEqual([call.args for call in backoff.call_args_list],
                              [(0,), (1,), (2,), (3,)])
@@ -126,24 +130,27 @@ class WindowsSequenceTests(unittest.TestCase):
             store.busy_timeout_ms = 0
             waits = []
             transports = []
-            class Transport:
-                def __init__(self, path):
+            class Transport(ProtocolTransport):
+                def __init__(self, path, deadline=None):
+                    super().__init__(path)
                     import threading
                     self.busy = threading.Lock()
-                    self.process = SimpleNamespace()
+                    self.process = SimpleNamespace(stdin=__import__('io').StringIO())
                     self.responses = SimpleNamespace(get=self.get)
                     self.closed = False
                     transports.append(self)
                 def get(self, timeout):
                     waits.append(timeout)
                     raise queue.Empty()
-                def close(self):
+                def close(self, deadline=None):
                     self.closed = True
             with patch.object(readonly, '_Transport', Transport), \
                     patch.object(store, '_sleep_lock_backoff') as backoff:
                 with self.assertRaisesRegex(readonly.ReadUnavailable, 'reader timed out'):
                     store.attach()
-            self.assertEqual(waits, [5.0])
+            self.assertEqual(len(waits), 1)
+            self.assertGreater(waits[0], 4.9)
+            self.assertLessEqual(waits[0], 5.0)
             self.assertEqual(len(transports), 1)
             self.assertTrue(transports[0].closed)
             backoff.assert_not_called()

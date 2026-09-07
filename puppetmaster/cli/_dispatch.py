@@ -626,7 +626,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.store_incarnation is not None:
         from puppetmaster.identity import read_identity, StoreIdentityError
         from puppetmaster.projections import connection
-        with connection(store, metadata_only=True) as c:
+        with connection(store, metadata_only=True, launch_binding=True) as c:
             if read_identity(c, store.backend_name) != args.store_incarnation:
                 raise StoreIdentityError("store replaced between launch and child attach")
         store._incarnation = args.store_incarnation

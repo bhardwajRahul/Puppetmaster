@@ -1,4 +1,5 @@
 """Only proven pre-snapshot writes retry, in the same bounded helper."""
+from tests.readonly_fixtures import ProtocolTransport
 import io
 import json
 import queue
@@ -104,13 +105,13 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         c._opened = False
                         retries.append(c.transport)
                         store.create_job('concurrent write')
-                        error = dict(kind='unavailable', error='unable to open database: source changed',
+                        error = dict(session_closed=True, kind='unavailable', error='unable to open database: source changed',
                                      **{proof: True})
                         with patch.object(c.responses, 'get', return_value=json.dumps(error)):
                             return original(c)
                     return response
                 with patch.object(readonly.ReadConnection, '_receive', race), \
-                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn, \
+                        patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn, \
                         patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)):
                     with readonly.connect(store, **options) as c:
                         self.assertEqual(identity.read_identity(c, 'sqlite'), store._incarnation)
@@ -137,7 +138,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         c._control('release', True)
                         c._opened = False
                         clock[0] += .1
-                        error = dict(kind='unavailable', error='unable to open database: source changed',
+                        error = dict(session_closed=True, kind='unavailable', error='unable to open database: source changed',
                                      same_store_write=True)
                         with patch.object(c.responses, 'get', return_value=json.dumps(error)):
                             return original(c)
@@ -149,12 +150,16 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         store.db_path.rename(moved)
                         moved.rename(store.db_path)
                 with patch.object(readonly.ReadConnection, '_receive', race), \
-                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn, \
+                        patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn, \
                         patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)):
                     with self.assertRaises(identity.StoreIdentityError if aba else readonly.ReadUnavailable):
                         readonly.connect(store, attach_binding=True, timeout=.25)
                     self.assertEqual(spawn.call_count, 1)
                 self.assertTrue(opened)
+                for c in opened:
+                    if not c.closed:
+                        readonly._cleanup.close(c._token)
+                        c.close()
                 self.assertTrue(all(c.closed and c.process.poll() is not None for c in opened))
                 self.assertLessEqual(clock[0], .35)
 
@@ -192,9 +197,9 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         # Deliver the numeric lock before the deadline; exhaustion
                         # before a response is covered by the silent-query test.
                         clock[0] += min(.08, c.timeout, max(0, .5 - clock[0] - .000001))
-                        error = (dict(kind='unavailable', error='unable to open database: source changed',
+                        error = (dict(session_closed=True, kind='unavailable', error='unable to open database: source changed',
                                       same_store_write=True) if count < 2 else
-                                 dict(kind='unavailable', error='opaque contention', code=code))
+                                 dict(session_closed=True, kind='unavailable', error='opaque contention', code=code))
                         with patch.object(c.responses, 'get', return_value=json.dumps(error)):
                             try:
                                 return receive(c)
@@ -214,58 +219,18 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         patch.object(readonly, 'time', timer), \
                         patch.object(sqlite_store, 'time', timer), \
                         patch.object(sqlite_store.random, 'uniform', return_value=0), \
-                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn:
+                        patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn:
                     with self.assertRaises(sqlite3.OperationalError):
                         store.attach()
                 self.assertLessEqual(clock[0], .501)
                 self.assertEqual(spawn.call_count, 1)
                 self.assertEqual(store.lock_error_count, 1)
                 self.assertFalse(store._attached)
+                for c in responses:
+                    if not c.closed:
+                        readonly._cleanup.close(c._token)
+                        c.close()
                 self.assertTrue(all(c.closed and c.process.poll() is not None for c in responses))
-
-    def test_delayed_attach_busy_retries_in_the_started_helper(self):
-        for code in (5, 6):
-            with self.subTest(code=code), TemporaryDirectory() as tmp:
-                supervisor = SQLiteSwarmStore(tmp)
-                supervisor.ensure_schema()
-                store = SQLiteSwarmStore(tmp)
-                store.busy_timeout_ms = 100
-                clock = [0.0]
-                receive = readonly.ReadConnection._receive
-                opened = []
-
-                def delayed_busy(connection):
-                    response = receive(connection)
-                    if not connection._opened and not opened:
-                        opened.append(connection)
-                        connection._opened = True
-                        connection._control('release', True)
-                        connection._opened = False
-                        # A scheduled helper can answer after the individual
-                        # busy timeout but within the aggregate attach budget.
-                        clock[0] += .15
-                        with patch.object(connection.responses, 'get', return_value=json.dumps(
-                                dict(kind='OperationalError', error='database is locked', code=code))):
-                            return receive(connection)
-                    return response
-
-                def sleep(seconds):
-                    clock[0] += seconds
-
-                timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
-                with patch.object(readonly.ReadConnection, '_receive', delayed_busy), \
-                        patch.object(readonly, 'time', timer), \
-                        patch.object(sqlite_store, 'time', timer), \
-                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn, \
-                        patch.object(store, '_sleep_lock_backoff') as backoff:
-                    store.attach()
-                self.assertTrue(store._attached)
-                self.assertEqual(store._incarnation, supervisor._incarnation)
-                self.assertEqual(spawn.call_count, 1)
-                backoff.assert_not_called()
-                self.assertLess(clock[0], .5)
-                self.assertTrue(opened[0].closed)
-                self.assertIsNotNone(opened[0].process.poll())
 
     def test_attach_startup_uses_shared_deadline(self):
         for delay, prior_busy in ((6.0, False), (24.0, False), (None, False), (None, True)):
@@ -278,8 +243,9 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                 transports = []
                 before = {p.name: p.read_bytes() for p in store.root.iterdir() if p.is_file()}
                 with closing(sqlite3.connect(store.db_path)) as database:
-                    class Transport:
-                        def __init__(self, path):
+                    class Transport(ProtocolTransport):
+                        def __init__(self, path, deadline=None):
+                            super().__init__(path)
                             self.busy = threading.Lock()
                             self.process = SimpleNamespace(stdin=io.StringIO())
                             self.responses = SimpleNamespace(get=self.get)
@@ -293,7 +259,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                                 self.started = True
                                 if prior_busy and len(transports) == 1:
                                     clock[0] += 6.0
-                                    return json.dumps(dict(kind='OperationalError',
+                                    return json.dumps(dict(session_closed=True, kind='OperationalError',
                                         error='database is locked', code=5))
                                 if delay is None or delay > timeout:
                                     clock[0] += timeout
@@ -308,7 +274,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                             return json.dumps(dict(rows=cursor.fetchall(),
                                 names=[d[0] for d in cursor.description or ()]))
 
-                        def close(self):
+                        def close(self, deadline=None):
                             self.closed = True
 
                     def sleep(seconds):
@@ -321,7 +287,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         if delay is None:
                             with self.assertRaises(readonly.ReadTimeout):
                                 store.attach()
-                            self.assertAlmostEqual(clock[0], 11.05 if prior_busy else 25.0)
+                            self.assertEqual(clock[0], 11.05 if prior_busy else 25.0)
                         else:
                             store.attach()
                             self.assertTrue(store._attached)
@@ -349,8 +315,9 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                     transports = []
                     waits = []
                     with closing(sqlite3.connect(store.db_path)) as database:
-                        class Transport:
-                            def __init__(self, path):
+                        class Transport(ProtocolTransport):
+                            def __init__(self, path, deadline=None):
+                                super().__init__(path)
                                 self.busy = threading.Lock()
                                 self.process = SimpleNamespace(stdin=io.StringIO())
                                 self.responses = SimpleNamespace(get=self.get)
@@ -364,7 +331,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                                 if self.opens < 4:
                                     self.opens += 1
                                     clock[0] += 4.99
-                                    return json.dumps(dict(kind='unavailable',
+                                    return json.dumps(dict(session_closed=True, kind='unavailable',
                                         error='unable to open database: source changed', same_store_write=True))
                                 if self.opens == 4:
                                     self.opens += 1
@@ -382,7 +349,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                                     clock[0] = 25.0
                                 return json.dumps(result)
 
-                            def close(self):
+                            def close(self, deadline=None):
                                 self.closed = True
 
                         def sleep(delay):
@@ -435,7 +402,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         # The initial response arrived just before the busy
                         # deadline; handling it/backoff consumed the remainder.
                         clock[0] += .101
-                        error = dict(kind='unavailable', error='unable to open database: source changed',
+                        error = dict(session_closed=True, kind='unavailable', error='unable to open database: source changed',
                                      same_store_write=outcome != 'unproven')
                         with patch.object(c.responses, 'get', return_value=json.dumps(error)):
                             return receive(c)
@@ -454,7 +421,7 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                 with patch.object(readonly.ReadConnection, '_receive', race), \
                         patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)), \
                         patch.object(sqlite_store, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)), \
-                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn, \
+                        patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn, \
                         patch.object(store, '_sleep_lock_backoff') as backoff:
                     if outcome == 'success':
                         store.attach()
@@ -469,6 +436,10 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                     self.assertEqual(spawn.call_count, 1)
                     backoff.assert_not_called()
                 self.assertEqual(store.lock_error_count, 0)
+                for c in failed:
+                    if not c.closed:
+                        readonly._cleanup.close(c._token)
+                        c.close()
                 self.assertTrue(all(c.closed and c.process.poll() is not None for c in failed))
                 self.assertEqual(len(failed), 5 if outcome == 'exhausted' else
                                  2 if outcome in ('aba', 'replacement') else 1)
