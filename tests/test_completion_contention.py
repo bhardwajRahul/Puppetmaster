@@ -26,6 +26,18 @@ class CompletionContentionTests(unittest.TestCase):
                        completed_at=now_iso())
         return task, run
 
+    def test_empty_reconciliation_does_not_reserve_sqlite_writer(self):
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp))
+            job = store.create_job('empty completion journal')
+            with patch.object(
+                store,
+                '_completion_scope',
+                side_effect=AssertionError('reserved writer for empty journal'),
+            ) as completion_scope:
+                store.reconcile_completions(job.id)
+            completion_scope.assert_not_called()
+
     def test_simultaneous_completions(self):
         for backend in (SwarmStore, SQLiteSwarmStore):
             for mode in ('different', 'duplicate', 'conflict'):
