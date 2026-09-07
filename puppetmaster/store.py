@@ -3376,7 +3376,7 @@ class SwarmStore(StoreContracts):
         job_dir = self._assert_safe_job_dir(job_id)
         from puppetmaster.projections import connection
         self.init()
-        with connection(self) as c:
+        with connection(self, write=True) as c:
             c.execute("INSERT OR IGNORE INTO projection_pending VALUES(?)", (str(job_dir),))
         if job_dir.exists():
             for path in sorted(job_dir.rglob("*"), reverse=True):
@@ -3615,7 +3615,7 @@ class SwarmStore(StoreContracts):
         if projected:
             self.init()
             marker = str(path) + ":" + new_id("write")
-            with connection(self) as c:
+            with connection(self, write=True) as c:
                 c.execute("INSERT INTO projection_pending VALUES(?)", (marker,))
         if projected and file_kind(path) == 'job':
             from puppetmaster.selected_economics import check_receipt_replacement
@@ -3630,7 +3630,7 @@ class SwarmStore(StoreContracts):
                     c.execute("DELETE FROM projection_pending WHERE path=?", (marker,))
             except ContractConflict:
                 # Rejection preceded rename; there is no pending source write.
-                with connection(self) as c:
+                with connection(self, write=True) as c:
                     c.execute("DELETE FROM projection_pending WHERE path=?", (marker,))
                 raise
             return

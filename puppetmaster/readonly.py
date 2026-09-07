@@ -19,6 +19,8 @@ import weakref
 from pathlib import Path
 from subprocess import Popen as ReaderProcess
 
+from puppetmaster.readonly_worker import source_stamp
+
 
 class ReadUnavailable(sqlite3.OperationalError):
     retry_after_ms = 100
@@ -29,8 +31,7 @@ def _source_stamp(store):
     result = []
     for source in (store.root, *(Path(str(path) + suffix) for suffix in ('', '-wal', '-shm', '-journal'))):
         try:
-            st = source.stat()
-            result.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+            result.append(source_stamp(source))
         except FileNotFoundError:
             result.append(None)
     return tuple(result)
@@ -127,7 +128,7 @@ class ReadConnection:
     in_transaction = True
     row_factory = sqlite3.Row
 
-    def __init__(self, store, timeout, *, reuse=False, attach_binding=False):
+    def __init__(self, store, timeout, *, reuse=False, attach_binding=False, launch_binding=False):
         self.store = store
         self.selected = selection(store)
         self._opened = False
@@ -135,6 +136,7 @@ class ReadConnection:
         self._authorizer = self._progress = self._trace = None
         self.timeout = max(0.001, timeout)
         open_deadline = time.monotonic() + self.timeout
+        write_deadline = open_deadline if attach_binding or launch_binding else min(open_deadline, time.monotonic() + (0.1 if reuse else 1.0))
         path = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
         try:
             weakref.ref(store)
@@ -158,6 +160,10 @@ class ReadConnection:
         self.process = self.transport.process
         self.responses = self.transport.responses
         try:
+            try:
+                retry_source = source_stamp(path)
+            except FileNotFoundError:
+                retry_source = None
             stamp = _source_stamp(store) if reuse else None
             if reuse:
                 self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
@@ -169,18 +175,24 @@ class ReadConnection:
                     self.source_journal_mode = self._receive()['journal']
                     break
                 except sqlite3.OperationalError as exc:
-                    if not attach_binding or not _locked(exc):
+                    write_race = getattr(exc, 'same_store_write', False)
+                    topology_race = attach_binding and getattr(exc, 'launch_topology_change', False)
+                    if not (write_race or topology_race or attach_binding and _locked(exc)):
                         raise
-                    remaining = open_deadline - time.monotonic()
+                    retry_deadline = write_deadline if write_race else open_deadline
+                    remaining = retry_deadline - time.monotonic()
                     if remaining <= 0:
                         raise
                     # Retry in the same descriptor owner, after main() has
                     # closed its failed session. Do not fork a startup herd.
-                    time.sleep(min(.05, remaining))
-                    remaining = open_deadline - time.monotonic()
+                    time.sleep(min(.01 if write_race else .05, remaining))
+                    remaining = retry_deadline - time.monotonic()
                     if remaining <= 0:
                         raise
                     self._fence()
+                    current_source = source_stamp(path)
+                    _metadata_fence(retry_source, current_source)
+                    retry_source = current_source
                     self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
                     self.process.stdin.flush()
             self._opened = True
@@ -220,6 +232,9 @@ class ReadConnection:
                 error = (ReadUnavailable if kind == 'unavailable' else
                          sqlite3.OperationalError if kind == 'OperationalError' else sqlite3.DatabaseError)(result['error'])
                 error.launch_topology_change = result.get('launch_topology_change') is True
+                error.same_store_write = (kind == 'unavailable' and
+                    result['error'] == 'unable to open database: source changed' and
+                    result.get('same_store_write') is True)
                 if result.get('code') is not None:
                     error.sqlite_errorcode = result['code']
                 raise error
@@ -289,6 +304,13 @@ def _locked(exc):
             str(exc) in ('database is locked', 'database table is locked', 'database schema is locked'))
 
 
+def _metadata_fence(before, after):
+    from puppetmaster.identity import StoreIdentityError
+    if (before is not None and after is not None and
+            before[2:4] == after[2:4] and before[4] != after[4]):
+        raise StoreIdentityError('store source metadata changed during binding')
+
+
 def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_binding=False):
     from puppetmaster.identity import StoreIdentityError
     if selection(store) != store._read_selection:
@@ -307,15 +329,13 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
         if launch_source is not None:
             current_source = _source_stamp(store)[1]
             # Rename ABA changes ctime without a database write.
-            if (current_source is not None and current_source[3] == launch_source[3] and
-                    current_source[4] != launch_source[4]):
-                raise StoreIdentityError('store source metadata changed during launch binding')
+            _metadata_fence(launch_source, current_source)
             launch_source = current_source
         if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
             raise ReadUnavailable('unable to open database: source changed')
         try:
             connection = ReadConnection(store, max(0, deadline - time.monotonic()) if timeout > 0 else 0.1,
-                                        reuse=reuse, attach_binding=attach_binding)
+                                        reuse=reuse, attach_binding=attach_binding, launch_binding=launch_binding)
             if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
                 connection._abort()
                 raise ReadUnavailable('unable to open database: source changed')

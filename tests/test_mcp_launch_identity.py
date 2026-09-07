@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
+from readonly_fixtures import file_bytes
 
 from puppetmaster import identity, mcp_server, readonly
 from puppetmaster.models import JobRef
@@ -20,7 +21,7 @@ from puppetmaster.store_factory import create_store
 
 def fingerprint(root):
     return {str(p.relative_to(root)): (p.stat().st_ino, p.stat().st_mtime_ns,
-            hashlib.sha256(p.read_bytes()).hexdigest())
+            hashlib.sha256(file_bytes(p)).hexdigest())
             for p in root.rglob('*') if p.is_file()}
 
 

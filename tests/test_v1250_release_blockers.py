@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
+from readonly_fixtures import replacement_blocked
 
 from puppetmaster.attempts import ExecutionAttempt, UsageObservation
 from puppetmaster.contracts import EffectReceipt, ContractConflict, immutable_digest
@@ -154,18 +155,23 @@ class ReleaseBlockerTests(unittest.TestCase):
             store._save_completion(job.id, record)
             original = identity.read_identity
             swapped = []
+            protected = []
+            def replace_store():
+                store.root.rename(store.root.parent / 'old')
+                type(store)(store.root).init()
 
             def swap_after_read(c, backend):
                 value = original(c, backend)
                 if not swapped:
                     swapped.append(True)
-                    store.root.rename(store.root.parent / 'old')
-                    successor = type(store)(store.root)
-                    successor.init()
+                    protected.append(replacement_blocked(replace_store))
                 return value
 
             with patch('puppetmaster.identity.read_identity', side_effect=swap_after_read):
                 self.assertEqual(store.get_completion_receipt(ref, run.id).intent_digest, 'a' * 64)
+            self.assertEqual(protected, [sys.platform == 'win32'])
+            if protected == [True]:
+                replace_store()
             with self.assertRaises(StoreIdentityError):
                 store.get_completion_receipt(ref, run.id)
 

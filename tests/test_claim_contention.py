@@ -164,6 +164,43 @@ class ClaimContentionTests(unittest.TestCase):
                 claimed = store.claim_task(task.id, 'worker', lease_seconds=1)
             self.assertEqual(claimed.attempts, 1)
 
+    def test_projection_marker_waits_before_identity_read_and_file_write(self):
+        from puppetmaster import identity
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp))
+            job = store.create_job('projection contention')
+            task = Task(job_id=job.id, role='explore', instruction='pending', adapter='local')
+            waiting = threading.Event()
+            validated = threading.Event()
+            original = identity.read_identity
+            def observed(c, backend):
+                validated.set()
+                return original(c, backend)
+            def save():
+                waiting.set()
+                store.save_task(task)
+            blocker = sqlite3.connect(store.root / 'metadata.sqlite3')
+            try:
+                blocker.execute('BEGIN IMMEDIATE')
+                with patch.object(identity, 'read_identity', side_effect=observed), ThreadPoolExecutor(1) as pool:
+                    result = pool.submit(save)
+                    try:
+                        self.assertTrue(waiting.wait(1))
+                        self.assertFalse(validated.wait(.1))
+                        self.assertFalse((store.job_dir(job.id) / 'tasks' / (task.id + '.json')).exists())
+                    finally:
+                        blocker.rollback()
+                    result.result(timeout=5)
+            finally:
+                blocker.close()
+            self.assertTrue(validated.is_set())
+            self.assertEqual(store.get_task_by_id(task.id), task)
+            from puppetmaster.projections import connection
+            with connection(store) as c:
+                self.assertEqual(c.execute('SELECT count(*) FROM projection_pending').fetchone()[0], 0)
+                self.assertEqual(c.execute("SELECT count(*) FROM projection_current WHERE kind='task' AND id=?",
+                                           (task.id,)).fetchone()[0], 1)
+
     def test_simultaneous_inline_claims_and_completions(self):
         for iteration in range(int(os.environ.get('CLAIM_STRESS_ITERATIONS', '1'))):
             for store, job, task in self.stores():

@@ -282,7 +282,7 @@ def install_source_triggers(c):
 
 
 @contextmanager
-def connection(store, *, metadata_only=False, launch_binding=False):
+def connection(store, *, metadata_only=False, launch_binding=False, write=False):
     if metadata_only:
         from puppetmaster.readonly import connect, selection
         from puppetmaster.identity import StoreIdentityError
@@ -311,6 +311,10 @@ def connection(store, *, metadata_only=False, launch_binding=False):
         c.row_factory = sqlite3.Row
         try:
             with c:
+                if write:
+                    # Reserve the writer before identity reads: a deferred
+                    # read-to-write upgrade cannot wait behind another writer.
+                    c.execute("BEGIN IMMEDIATE")
                 if store._incarnation is not None:
                     from puppetmaster.identity import read_identity, StoreIdentityError
                     if read_identity(c, "file") != store._incarnation:

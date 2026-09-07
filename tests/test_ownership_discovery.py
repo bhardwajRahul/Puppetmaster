@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
+from readonly_fixtures import damaged_sidecars
 
 from puppetmaster import readonly, state
 from puppetmaster.adapters._prompts import with_prewalk_plan
@@ -113,15 +114,9 @@ class OwnershipDiscoveryTests(unittest.TestCase):
             writer.execute('INSERT INTO jobs VALUES (?, ?)', (self.job.id, '{}'))
             writer.commit()
             sidecars = [Path(str(self.other.db_path) + suffix) for suffix in ('-wal', '-shm')]
-            hidden = [p.with_suffix('.hidden' + p.suffix) for p in sidecars]
-            for source, destination in zip(sidecars, hidden):
-                source.rename(destination)
-            try:
+            with damaged_sidecars(writer, self.other.db_path):
                 self.assertEqual(self.resolve(), self.owner.root)
                 self.assertTrue(all(not p.exists() for p in sidecars))
-            finally:
-                for source, destination in zip(hidden, sidecars):
-                    source.rename(destination)
 
     def test_changed_requested_source_is_not_rescued_by_membership(self):
         connect = readonly.connect

@@ -24,6 +24,38 @@ from types import SimpleNamespace
 
 
 class Issue136Tests(unittest.TestCase):
+    def test_missing_home_does_not_block_custom_command_or_probe_ambient_auth(self):
+        from puppetmaster.platform_billing import auth_context
+        with patch.object(Path, 'home', side_effect=RuntimeError('Could not determine home directory')):
+            context = auth_context(env={})
+            self.assertIsNone(context.home)
+            command = [r'C:\Program Files\node.exe', r'C:\tools\codex.js']
+            with patch('puppetmaster.platform_billing._default_runner',
+                       return_value=(0, 'Logged in using API key SECRET', '')) as run:
+                status = detect_codex_billing(context=context, codex_command=command)
+                self.assertEqual(status.billing, 'api')
+                self.assertNotIn('SECRET', str(status))
+                self.assertEqual(run.call_args.args[0], command + ['login', 'status'])
+            with patch('puppetmaster.platform_billing._read_codex_auth',
+                       side_effect=AssertionError('no ambient auth without home')):
+                status = detect_codex_billing(context=context, run=lambda _: (127, '', ''))
+                self.assertEqual(status.billing, 'unknown')
+                self.assertFalse(status.healthy)
+
+    def test_explicit_auth_home_works_without_process_home(self):
+        with TemporaryDirectory() as tmp, patch.object(Path, 'home', side_effect=RuntimeError('no home')):
+            home = Path(tmp)
+            (home / 'auth.json').write_text('{"auth_mode":"apikey"}')
+            status = detect_codex_billing(env={'CODEX_HOME': tmp}, run=lambda _: self.fail('unneeded probe'))
+            self.assertEqual(status.billing, 'api')
+            for env, given_home in (({}, Path('.')), ({'CODEX_HOME': '~/.codex'}, None),
+                                    ({'HOME': '.', 'USERPROFILE': '.'}, None)):
+                with patch('puppetmaster.platform_billing._read_codex_auth',
+                           side_effect=AssertionError('relative or ambient auth path')):
+                    status = detect_codex_billing(env=env, home=given_home, run=lambda _: (127, '', ''))
+                    self.assertEqual(status.billing, 'unknown')
+                    self.assertFalse(status.healthy)
+
     def test_direct_and_routed_persist_and_reopen(self):
         for backend in (SwarmStore, SQLiteSwarmStore):
             for billing in ('plan', 'api', 'unknown'):
@@ -88,7 +120,7 @@ class Issue136Tests(unittest.TestCase):
                     store = backend(Path(tmp) / 'state')
                     store.init()
                     job = store.create_job('inspect')
-                    with patch.dict(os.environ, {'CODEX_HOME': tmp}, clear=True), patch(
+                    with patch.dict(os.environ, {'CODEX_HOME': tmp, 'HOME': tmp, 'USERPROFILE': tmp}, clear=True), patch(
                         'puppetmaster.platform_billing._default_runner', side_effect=auth_status
                     ) as run, patch(
                         'puppetmaster.platform_billing.detect_adapter_billing_cached',

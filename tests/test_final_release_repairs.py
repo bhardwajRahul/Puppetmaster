@@ -1,3 +1,4 @@
+from contextlib import closing
 """Final release regressions: real producer payloads and read-only receipts."""
 import json
 import sqlite3
@@ -13,6 +14,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
+
+from readonly_fixtures import damaged_sidecars
 
 from puppetmaster import readonly
 from puppetmaster.adapters import CodexAdapter, StreamedProcess
@@ -79,37 +82,31 @@ class FinalReleaseRepairs(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             supervisor = SQLiteSwarmStore(tmp)
             supervisor.ensure_schema()
-            holder = subprocess.Popen([sys.executable, '-c', '''
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
-c.execute('BEGIN')
-c.execute('SELECT * FROM metadata').fetchall()
-print('locked', flush=True)
-sys.stdin.readline()
-c.close()
-''', str(supervisor.db_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-            self.addCleanup(lambda: holder.poll() is None and holder.kill())
-            self.assertEqual(holder.stdout.readline().strip(), 'locked')
-            sidecars = [Path(str(supervisor.db_path) + suffix) for suffix in ('-wal', '-shm')]
-            hidden = [path.with_suffix(path.suffix + '.hidden') for path in sidecars]
-            for source, target in zip(sidecars, hidden):
-                source.rename(target)
+            holder = sqlite3.connect(supervisor.db_path)
             try:
-                with self.assertRaises(readonly.ReadUnavailable) as caught:
-                    readonly.connect(supervisor, timeout=.1, attach_binding=True)
-                self.assertIsNone(getattr(caught.exception, 'sqlite_errorcode', None))
+                holder.execute('BEGIN')
+                holder.execute('SELECT * FROM metadata').fetchall()
+                with damaged_sidecars(holder, supervisor.db_path):
+                    with self.assertRaises(readonly.ReadUnavailable) as caught:
+                        readonly.connect(supervisor, timeout=.5, attach_binding=True)
+                    # Windows cannot query the conflicting lock type, but does
+                    # confirm contention. POSIX identifies a missing-WAL reader.
+                    self.assertEqual(getattr(caught.exception, 'sqlite_errorcode', None),
+                                     5 if sys.platform == 'win32' else None)
             finally:
-                for source, target in zip(hidden, sidecars):
-                    source.rename(target)
+                holder.close()
+            holder = sqlite3.connect(supervisor.db_path)
+            holder.execute('BEGIN')
+            holder.execute('SELECT * FROM metadata').fetchall()
             clock = [0.0]
             released = []
             def sleep(delay):
                 clock[0] += max(delay, .3)
                 if clock[0] > 1.2 and not released:
                     released.append(True)
-                    holder.communicate('\n', timeout=5)
+                    holder.close()
             worker = SQLiteSwarmStore(tmp)
-            with patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)), \
+            with closing(holder), patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)), \
                     patch.object(worker, 'ensure_schema', side_effect=AssertionError('worker DDL')):
                 worker.attach()
             self.assertTrue(released)

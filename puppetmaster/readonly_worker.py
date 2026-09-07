@@ -8,11 +8,67 @@ import time
 from pathlib import Path
 
 
-_WINDOWS = os.name == 'nt'
-
-
 def stamp(st):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def source_stamp(path=None, *, fd=None):
+    """Use ChangeTime on Windows, where stat's ctime can mean CreationTime.
+
+    Only Windows opens a temporary metadata descriptor here: closing an fd on
+    POSIX could release another connection's process-wide SQLite locks.
+    """
+    if os.name != 'nt':
+        return stamp(os.stat(path) if fd is None else os.fstat(fd))
+    import msvcrt
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [('creation', ctypes.c_longlong), ('access', ctypes.c_longlong),
+                    ('write', ctypes.c_longlong), ('change', ctypes.c_longlong),
+                    ('attributes', wintypes.DWORD)]
+    # FILE_BASIC_INFO.ChangeTime includes renames, unlike CreationTime.
+    # https://learn.microsoft.com/windows/win32/api/winbase/ns-winbase-file_basic_info
+    query = kernel.GetFileInformationByHandleEx
+    query.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    query.restype = wintypes.BOOL
+    owned = fd is None
+    if owned:
+        create = kernel.CreateFileW
+        create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                           ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        create.restype = wintypes.HANDLE
+        # Attributes only, shared read/write/delete, including directories.
+        handle = create(str(path), 0x80, 7, None, 3, 0x02000000, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        except BaseException:
+            close = kernel.CloseHandle
+            close.argtypes = (wintypes.HANDLE,)
+            close.restype = wintypes.BOOL
+            close(handle)
+            raise
+    try:
+        st = os.fstat(fd)
+        info = BasicInfo()
+        if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        epoch = 116444736000000000
+        return (st.st_dev, st.st_ino, st.st_size,
+                (info.write - epoch) * 100, (info.change - epoch) * 100)
+    finally:
+        if owned:
+            os.close(fd)
+
+
+def same_store_write(before, after):
+    # A changed size/mtime on the same file proves a pre-snapshot write race.
+    # Windows can publish size before LastWriteTime on a live writer handle.
+    # ctime-only drift (rename ABA/permissions) never earns a retry.
+    return (before is not None and after is not None and
+            before[:2] == after[:2] and before[2:4] != after[2:4])
 
 
 def emit(value):
@@ -23,8 +79,7 @@ def stamps(path):
     result = []
     for suffix in ('', '-wal', '-shm', '-journal'):
         try:
-            st = os.stat(str(path) + suffix)
-            result.append(stamp(st))
+            result.append(source_stamp(str(path) + suffix))
         except FileNotFoundError:
             result.append(None)
     return result
@@ -78,16 +133,10 @@ def main(path):
         source = path.open('rb')
         exclusive = False
     with source:
-        descriptor = os.fstat(source.fileno())
-        descriptor_before = stamp(descriptor)
-        # CPython 3.12 Windows stat uses CreationTime for ctime, while
-        # fstat uses ChangeTime. Bind in the path's time domain, then keep
-        # the complete descriptor stamp (including ChangeTime) for its fence.
-        bound_stamp = descriptor_before
-        if _WINDOWS and hasattr(descriptor, 'st_birthtime_ns'):
-            bound_stamp = descriptor_before[:4] + (descriptor.st_birthtime_ns,)
-        if bound_stamp != before[0]:
-            emit(dict(kind='unavailable', error='unable to open database: source changed'))
+        descriptor_before = source_stamp(fd=source.fileno())
+        if descriptor_before != before[0]:
+            emit(dict(kind='unavailable', error='unable to open database: source changed',
+                      same_store_write=same_store_write(before[0], descriptor_before)))
             return
         if os.name == 'nt':
             import msvcrt
@@ -107,7 +156,8 @@ def main(path):
             # SQLite's shared range excludes live connections without writing.
             # https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-lockfileex
             if not lock(msvcrt.get_osfhandle(source.fileno()), 3, 0, 510, 0, ctypes.byref(overlapped)):
-                emit(dict(kind='OperationalError', error='database is locked'))
+                emit(dict(kind='unavailable',
+                          error='unable to open database: active reader; sidecars may be missing', code=5))
                 return
         else:
             import fcntl
@@ -144,7 +194,8 @@ def main(path):
         after = stamps(path)
         if after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
-                      launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
+                      launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
+                      same_store_write=same_store_write(before[0], after[0])))
             return
         header = source.read(100)
         if not checkpointed_sidecars(path, before, header[18:20]):
@@ -165,8 +216,7 @@ def main(path):
                 emit(dict(kind='unavailable', error='unable to open database: source changed'))
                 return
             def unchanged():
-                st = os.fstat(source.fileno())
-                return stamp(st) == descriptor_before
+                return source_stamp(fd=source.fileno()) == descriptor_before
             emit(dict(journal='wal' if header[18:20] == b'\x02\x02' else 'delete'))
             def event(name, args):
                 emit(dict(event=name, args=args))

@@ -1,3 +1,4 @@
+from contextlib import closing
 """Scoped metadata wrappers preserve tombstones and snapshot failure envelopes."""
 import hashlib
 import io
@@ -150,7 +151,7 @@ class FinalVetoRepairsTests(unittest.TestCase):
             cursor = first['next_cursor']
             checkpoint = first['revision']
             database = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
-            with sqlite3.connect(str(database), timeout=0) as locked:
+            with closing(sqlite3.connect(str(database), timeout=0)) as locked, locked:
                 locked.execute('PRAGMA journal_mode=DELETE')
                 locked.execute('BEGIN EXCLUSIVE')
                 kwargs = dict(after_revision=checkpoint)

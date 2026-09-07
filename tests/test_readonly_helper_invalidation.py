@@ -12,6 +12,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
 
+from readonly_fixtures import damaged_sidecars
+
 from puppetmaster import readonly, state
 from puppetmaster.identity import StoreIdentityError
 from puppetmaster.sqlite_store import SQLiteSwarmStore
@@ -115,6 +117,7 @@ class HelperInvalidationTests(unittest.TestCase):
                 path = self.store.db_path
                 old = path.with_suffix('.old')
                 def replace():
+                    self.transport.close()
                     path.rename(old)
                     if aba:
                         old.rename(path)
@@ -138,18 +141,11 @@ class HelperInvalidationTests(unittest.TestCase):
             writer.commit()
             for missing in (False, True):
                 with self.subTest(missing=missing):
-                    sidecars = [Path(str(self.store.db_path) + suffix) for suffix in ('-wal', '-shm')]
-                    hidden = [p.with_suffix(p.suffix + '.hidden') for p in sidecars]
-                    if missing:
-                        for source, target in zip(sidecars, hidden):
-                            source.rename(target)
-                    try:
+                    from contextlib import nullcontext
+                    damage = damaged_sidecars(writer, self.store.db_path) if missing else nullcontext()
+                    with damage:
                         with self.assertRaises(readonly.ReadUnavailable):
                             state.state_owns_job(self.store.root, 'wal_job', _reader=self.reader)
-                    finally:
-                        if missing:
-                            for source, target in zip(hidden, sidecars):
-                                source.rename(target)
         self.assertTrue(state.state_owns_job(self.store.root, 'wal_job', _reader=self.reader))
 
 

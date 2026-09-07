@@ -2,6 +2,9 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+import sys
+
+from readonly_fixtures import replacement_blocked
 
 from puppetmaster.models import JobStatus
 from puppetmaster.sqlite_store import SQLiteSwarmStore
@@ -632,15 +635,26 @@ const f = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
         for store in self.stores():
             job=store.create_job('replace')
             ref=store.job_ref(job.id)
-            def replace_store(current, selected, c, **kwargs):
-                validate(current,selected,c,**kwargs)
-                root=store.root
-                root.rename(root.parent/'previous')
-                replacement=type(store)(root)
-                replacement.create_job('replacement')
-            with patch('puppetmaster.identity.validate',side_effect=replace_store):
-                with self.assertRaises(StoreIdentityError):
-                    store.get_selected_economics(ref)
+            baseline = store.get_selected_economics(ref)
+            protected = []
+            def replace_store():
+                root = store.root
+                root.rename(root.parent / 'previous')
+                type(store)(root).create_job('replacement')
+            def replace_after_validation(current, selected, c, **kwargs):
+                validate(current, selected, c, **kwargs)
+                protected.append(replacement_blocked(replace_store))
+            with patch('puppetmaster.identity.validate', side_effect=replace_after_validation):
+                if sys.platform == 'win32':
+                    self.assertEqual(store.get_selected_economics(ref), baseline)
+                    self.assertEqual(protected, [True])
+                else:
+                    with self.assertRaises(StoreIdentityError):
+                        store.get_selected_economics(ref)
+            if protected == [True]:
+                replace_store()
+            with self.assertRaises(StoreIdentityError):
+                store.get_selected_economics(ref)
 
     def test_change_rows_match_current_after_other_entities(self):
         from puppetmaster.models import Task, to_jsonable

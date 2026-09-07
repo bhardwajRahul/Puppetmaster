@@ -7,10 +7,12 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
+from readonly_fixtures import damaged_sidecars
 
 from puppetmaster import readonly
 from puppetmaster.identity import StoreIdentityError
@@ -55,9 +57,11 @@ class ReadonlyPerformanceTests(unittest.TestCase):
             clock = [0.0]
             def sleep(seconds):
                 clock[0] += seconds
+            # Helper finalizers also sleep while reaping subprocesses.
+            # Keep their real clock separate from the retry budget under test.
+            timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
             with patch.object(readonly, 'ReadConnection', side_effect=readonly.ReadUnavailable('live sidecars')) as opens, \
-                    patch.object(readonly.time, 'monotonic', side_effect=lambda: clock[0]), \
-                    patch.object(readonly.time, 'sleep', side_effect=sleep):
+                    patch.object(readonly, 'time', timer):
                 for _ in range(100):
                     with self.assertRaises(readonly.ReadUnavailable):
                         readonly.connect(store, reuse=True)
@@ -93,17 +97,11 @@ class ReadonlyPerformanceTests(unittest.TestCase):
                     writer.execute("INSERT INTO jobs(id,data) VALUES('new_job','{}')")
                     writer.commit()
                     sidecars = [Path(str(store.db_path) + suffix) for suffix in ('-wal', '-shm')]
-                    hidden = [path.with_name(path.name + '.hidden') for path in sidecars]
-                    for source, target in zip(sidecars, hidden):
-                        source.rename(target)
-                    try:
+                    with damaged_sidecars(writer, store.db_path):
                         with self.assertRaises(readonly.ReadUnavailable):
                             state.resolve_job_state(job_id='new_job', default_dir=store.root)
                         self.assertIsNone(state.find_state_dir_for_job('new_job'))
                         self.assertTrue(all(not path.exists() for path in sidecars))
-                    finally:
-                        for source, target in zip(hidden, sidecars):
-                            source.rename(target)
                 self.assertEqual(state.find_state_dir_for_job('new_job'), store.root)
 
     def test_missing_source_identity_does_not_retry_contention(self):

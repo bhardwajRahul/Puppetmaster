@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
+from readonly_fixtures import damaged_sidecars, file_bytes
 
 from puppetmaster.identity import StoreIdentityError
 from puppetmaster.projections import connection
@@ -23,7 +24,7 @@ from puppetmaster.store_factory import create_store
 def fingerprint(root):
     paths = [root] + sorted(root.rglob('*')) if root.exists() else []
     return {str(p.relative_to(root)): (
-        hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None,
+        hashlib.sha256(file_bytes(p)).hexdigest() if p.is_file() else None,
         p.stat().st_mode, p.stat().st_ino, p.stat().st_size,
         p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in paths}
 
@@ -300,22 +301,21 @@ class MarionetteBlockerTests(unittest.TestCase):
                 with closing(sqlite3.connect(path)) as writer:
                     writer.execute('PRAGMA journal_mode=WAL')
                     writer.execute('BEGIN IMMEDIATE')
-                    # Damage is test setup only; the reader must not repair it.
-                    for suffix in missing:
-                        Path(str(path) + suffix).unlink()
-                    before = locked_fingerprint(store.root)
-                    with self.assertRaises((ReadUnavailable, SqliteSchemaError)):
-                        create_store(store.backend_name, store.root, mode='attach')
-                    page = store.list_job_summaries(limit=1, cursor=first.next_cursor)
-                    self.assertEqual(page.outcome, 'unavailable')
-                    self.assertEqual(page.next_cursor, first.next_cursor)
-                    self.assertEqual(page.retry_after_ms, 100)
-                    page = store.read_job_summary_changes(after_revision=0, limit=1, cursor=changes.next_cursor)
-                    self.assertEqual(page.outcome, 'unavailable')
-                    self.assertEqual(page.revision, 0)
-                    self.assertEqual(page.next_cursor, changes.next_cursor)
-                    self.assertFalse(page.items)
-                    self.assertEqual(locked_fingerprint(store.root), before)
+                    with damaged_sidecars(writer, path, missing):
+                        # Damage is test setup only; the reader must not repair it.
+                        before = locked_fingerprint(store.root)
+                        with self.assertRaises((ReadUnavailable, SqliteSchemaError)):
+                            create_store(store.backend_name, store.root, mode='attach')
+                        page = store.list_job_summaries(limit=1, cursor=first.next_cursor)
+                        self.assertEqual(page.outcome, 'unavailable')
+                        self.assertEqual(page.next_cursor, first.next_cursor)
+                        self.assertEqual(page.retry_after_ms, 100)
+                        page = store.read_job_summary_changes(after_revision=0, limit=1, cursor=changes.next_cursor)
+                        self.assertEqual(page.outcome, 'unavailable')
+                        self.assertEqual(page.revision, 0)
+                        self.assertEqual(page.next_cursor, changes.next_cursor)
+                        self.assertFalse(page.items)
+                        self.assertEqual(locked_fingerprint(store.root), before)
 
     def test_wal_disappears_during_reader_open_is_unavailable(self):
         from contextlib import closing
@@ -326,13 +326,19 @@ class MarionetteBlockerTests(unittest.TestCase):
                 writer.execute('BEGIN IMMEDIATE')
                 writer.commit()
                 from puppetmaster.readonly import ReaderProcess
+                damage = damaged_sidecars(writer, path, ('-shm',))
+                entered = []
                 def changing(*args, **kwargs):
-                    sidecar = Path(str(path) + '-shm')
-                    if sidecar.exists():
-                        sidecar.unlink()
+                    if not entered:
+                        damage.__enter__()
+                        entered.append(True)
                     return ReaderProcess(*args, **kwargs)
-                with patch('puppetmaster.readonly.ReaderProcess', side_effect=changing):
-                    page = store.read_job_summary_changes(after_revision=7)
+                try:
+                    with patch('puppetmaster.readonly.ReaderProcess', side_effect=changing):
+                        page = store.read_job_summary_changes(after_revision=7)
+                finally:
+                    if entered:
+                        damage.__exit__(None, None, None)
                 self.assertEqual(page.outcome, 'unavailable')
                 self.assertEqual(page.revision, 7)
                 self.assertEqual(page.reason, 'read_snapshot_unavailable')

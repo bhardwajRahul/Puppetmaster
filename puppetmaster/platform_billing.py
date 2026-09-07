@@ -67,7 +67,7 @@ class AuthContext:
     """
 
     env: Mapping[str, str]
-    home: Path
+    home: Optional[Path]
     label: str = "process"
 
 
@@ -77,11 +77,23 @@ def auth_context(
     home: Optional[Path] = None,
     label: str = "process",
 ) -> AuthContext:
-    return AuthContext(
-        env=env if env is not None else os.environ,
-        home=home if home is not None else Path.home(),
-        label=label,
-    )
+    effective_env = env if env is not None else os.environ
+    if home is None:
+        if env is None:
+            try:
+                home = Path.home()
+            except (RuntimeError, OSError):
+                pass
+        else:
+            candidate = (effective_env.get("USERPROFILE") if os.name == "nt"
+                         else effective_env.get("HOME"))
+            if not candidate and os.name == "nt" and effective_env.get("HOMEPATH"):
+                candidate = effective_env.get("HOMEDRIVE", "") + effective_env["HOMEPATH"]
+            if candidate and Path(candidate).is_absolute():
+                home = Path(candidate)
+    if home is not None and not home.is_absolute():
+        home = None
+    return AuthContext(env=effective_env, home=home, label=label)
 
 
 def _default_runner(command: list[str], *, env: Optional[Mapping[str, str]] = None) -> "tuple[int, str, str]":
@@ -305,11 +317,16 @@ def detect_claude_billing(
     )
 
 
-def _codex_auth_path(env: Mapping[str, str], home: Path) -> tuple[Path, str]:
+def _codex_auth_path(env: Mapping[str, str], home: Optional[Path]) -> tuple[Optional[Path], str]:
     codex_home = env.get("CODEX_HOME")
     if codex_home:
-        return Path(codex_home).expanduser() / "auth.json", "$CODEX_HOME/auth.json"
-    return home / ".codex" / "auth.json", "~/.codex/auth.json"
+        path = Path(codex_home)
+        if path.parts and path.parts[0] == "~":
+            path = home.joinpath(*path.parts[1:]) if home is not None else None
+        elif codex_home.startswith("~"):
+            path = None
+        return (path / "auth.json" if path is not None else None), "$CODEX_HOME/auth.json"
+    return (home / ".codex" / "auth.json" if home is not None else None), "~/.codex/auth.json"
 
 
 def _read_codex_auth(path: Path, label: str) -> "Optional[BillingStatus]":
@@ -375,7 +392,7 @@ def detect_codex_billing(
                                  else ctx.env.get("CODEX_COMMAND") or "codex"))
     if command == ["codex"]:
         auth_path, auth_label = _codex_auth_path(ctx.env, ctx.home)
-        from_file = _read_codex_auth(auth_path, auth_label)
+        from_file = _read_codex_auth(auth_path, auth_label) if auth_path is not None else None
         if from_file is not None:
             return replace(from_file, evidence=[*from_file.evidence, f"auth_context:{ctx.label}"])
     command.extend(["login", "status"])

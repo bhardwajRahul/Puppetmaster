@@ -16,6 +16,8 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
 
+from readonly_fixtures import damaged_sidecars, replacement_blocked
+
 from puppetmaster import identity, mcp_server, readonly
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 
@@ -37,16 +39,15 @@ class LaunchStabilizationTests(unittest.TestCase):
         c = sqlite3.connect(self.store.db_path, check_same_thread=False)
         c.execute("INSERT INTO jobs(id,data) VALUES('concurrent','{}')")
         c.commit()
-        pairs = [(Path(str(self.store.db_path) + s), self.root / ('hidden' + s))
-                 for s in ('-wal', '-shm')]
-        if hidden:
-            for source, target in pairs:
-                source.rename(target)
+        damage = damaged_sidecars(c, self.store.db_path) if hidden else None
+        if damage:
+            damage.__enter__()
         def close():
-            if hidden:
-                for source, target in pairs:
-                    target.rename(source)
-            c.close()
+            try:
+                if damage:
+                    damage.__exit__(None, None, None)
+            finally:
+                c.close()
         return close
 
     def test_real_writer_and_missing_sidecars_stabilize(self):
@@ -102,14 +103,26 @@ print(json.dumps({p.name: [p.stat().st_ino, p.stat().st_mtime_ns,
 
     def test_replacement_during_bind_cannot_return_old_snapshot(self):
         validate = self.store.validate_job_ref
-        def replaced(*args, **kwargs):
-            ref = validate(*args, **kwargs)
+        protected = []
+        def replace_store():
             self.root.rename(self.root.with_name('old'))
             SQLiteSwarmStore(self.root).create_job('replacement')
+        def replaced(*args, **kwargs):
+            ref = validate(*args, **kwargs)
+            protected.append(replacement_blocked(replace_store))
             return ref
         with patch.object(self.store, 'validate_job_ref', side_effect=replaced):
-            with self.assertRaises(identity.StoreIdentityError):
-                self.store.job_ref(self.job.id, _launch_binding=True)
+            if sys.platform == 'win32':
+                self.assertEqual(self.store.job_ref(self.job.id, _launch_binding=True).incarnation,
+                                 self.incarnation)
+                self.assertEqual(protected, [True])
+            else:
+                with self.assertRaises(identity.StoreIdentityError):
+                    self.store.job_ref(self.job.id, _launch_binding=True)
+        if protected == [True]:
+            replace_store()
+        with self.assertRaises(identity.StoreIdentityError):
+            self.store.job_ref(self.job.id, _launch_binding=True)
 
     def test_worker_proves_sidecar_change_but_rejects_main_file_aba(self):
         script = """
@@ -128,7 +141,13 @@ def changed(path):
             Path(str(path) + '-journal').unlink()
         else:
             moved = path.with_suffix('.old')
-            path.rename(moved)
+            try:
+                path.rename(moved)
+            except PermissionError as exc:
+                if sys.platform != 'win32' or exc.winerror not in (5, 32):
+                    raise
+                print('{"replacement_blocked": true}')
+                raise SystemExit(0)
             moved.rename(path)
     return stamps(path)
 globals_['stamps'] = changed
@@ -141,6 +160,9 @@ main(path)
                 result = subprocess.check_output([sys.executable, '-c', script,
                     str(worker), str(self.store.db_path), change], text=True)
                 response = json.loads(result)
+                if change == 'aba' and sys.platform == 'win32':
+                    self.assertEqual(response, {'replacement_blocked': True})
+                    continue
                 self.assertEqual(response['error'], 'unable to open database: source changed')
                 self.assertEqual(response['launch_topology_change'], change == 'sidecar')
 

@@ -1,5 +1,6 @@
 """Attach contention must not turn lock retries into interpreter startup storms."""
 import hashlib
+import json
 import sqlite3
 import sys
 import threading
@@ -38,7 +39,7 @@ class AttachReaderContentionTests(unittest.TestCase):
                 try:
                     return receive(connection)
                 except Exception as exc:
-                    if str(exc) == 'database is locked':
+                    if readonly._locked(exc):
                         with mutex:
                             collided.add(threading.get_ident())
                             if len(collided) == count:
@@ -78,11 +79,17 @@ class AttachReaderContentionTests(unittest.TestCase):
                     return receive(connection)
                 except sqlite3.OperationalError:
                     if not replaced:
+                        held.close()
+                        # Wait for the failed helper to release its source fd.
+                        connection.process.stdin.write(json.dumps({'open': str(store.db_path)}) + '\n')
+                        connection.process.stdin.flush()
+                        receive(connection)
+                        connection._control('release', True)
                         store.root.rename(Path(root) / 'old')
                         SQLiteSwarmStore(store.root).ensure_schema()
                         replaced.append(True)
                     raise
-            with readonly.connect(store), \
+            with readonly.connect(store) as held, \
                     patch.object(readonly.ReadConnection, '_receive', observed), \
                     patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn:
                 with self.assertRaises(StoreIdentityError):
@@ -103,7 +110,7 @@ class AttachReaderContentionTests(unittest.TestCase):
                     return process
                 started = time.monotonic()
                 with patch.object(readonly, 'ReaderProcess', tracked):
-                    with self.assertRaisesRegex(sqlite3.OperationalError, 'database is locked|reader timed out'):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, 'database is locked|active reader|reader timed out'):
                         readonly.connect(store, timeout=.3, attach_binding=True)
                 self.assertLess(time.monotonic() - started, 2)
                 self.assertEqual(len(processes), 1)
