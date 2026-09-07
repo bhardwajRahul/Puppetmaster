@@ -82,6 +82,10 @@ class LaunchConflictError(ValueError):
     """A launch key was reused for a different normalized request."""
 
 
+class ProjectionWriteAdmissionError(sqlite3.OperationalError):
+    """The file projection writer was unavailable before a source mutation."""
+
+
 class ResetSubgraphResult(list):
     """Task list from ``reset_subgraph`` plus superseded artifact ids.
 
@@ -1409,7 +1413,13 @@ class SwarmStore(StoreContracts):
         worker_id: Optional[str] = None,
     ) -> bool:
         claim_snapshot = self._task_claim_snapshot(task)
-        if not self._save_task_if_matches(task_id, claim_snapshot, claimed):
+        try:
+            if not self._save_task_if_matches(task_id, claim_snapshot, claimed):
+                return False
+        except ProjectionWriteAdmissionError:
+            # The durable task file has not changed. Treat unavailable
+            # projection admission like a lost claim so run_until_idle can
+            # retry from fresh state instead of killing the worker.
             return False
         return True
 
@@ -3629,8 +3639,15 @@ class SwarmStore(StoreContracts):
         if projected:
             self.init()
             marker = str(path) + ":" + new_id("write")
-            with connection(self, write=True) as c:
-                c.execute("INSERT INTO projection_pending VALUES(?)", (marker,))
+            try:
+                with connection(self, write=True) as c:
+                    c.execute("INSERT INTO projection_pending VALUES(?)", (marker,))
+            except sqlite3.OperationalError as exc:
+                from puppetmaster.readonly import _locked
+
+                if not _locked(exc):
+                    raise
+                raise ProjectionWriteAdmissionError(str(exc)) from exc
         if projected and file_kind(path) == 'job':
             from puppetmaster.selected_economics import check_receipt_replacement
             from puppetmaster.contracts import ContractConflict
