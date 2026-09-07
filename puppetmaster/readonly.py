@@ -127,13 +127,14 @@ class ReadConnection:
     in_transaction = True
     row_factory = sqlite3.Row
 
-    def __init__(self, store, timeout, *, reuse=False):
+    def __init__(self, store, timeout, *, reuse=False, attach_binding=False):
         self.store = store
         self.selected = selection(store)
         self._opened = False
         self.closed = False
         self._authorizer = self._progress = self._trace = None
         self.timeout = max(0.001, timeout)
+        open_deadline = time.monotonic() + self.timeout
         path = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
         try:
             weakref.ref(store)
@@ -161,7 +162,27 @@ class ReadConnection:
             if reuse:
                 self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
                 self.process.stdin.flush()
-            self.source_journal_mode = self._receive()['journal']
+            while True:
+                if attach_binding:
+                    self.timeout = max(.001, open_deadline - time.monotonic())
+                try:
+                    self.source_journal_mode = self._receive()['journal']
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not attach_binding or not _locked(exc):
+                        raise
+                    remaining = open_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    # Retry in the same descriptor owner, after main() has
+                    # closed its failed session. Do not fork a startup herd.
+                    time.sleep(min(.05, remaining))
+                    remaining = open_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    self._fence()
+                    self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
+                    self.process.stdin.flush()
             self._opened = True
         except BaseException as exc:
             self._abort()
@@ -262,6 +283,12 @@ class ReadConnection:
         self.close()
 
 
+def _locked(exc):
+    code = getattr(exc, 'sqlite_errorcode', None)
+    return ((isinstance(code, int) and (code & 0xff) in (5, 6)) if code is not None else
+            str(exc) in ('database is locked', 'database table is locked', 'database schema is locked'))
+
+
 def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_binding=False):
     from puppetmaster.identity import StoreIdentityError
     if selection(store) != store._read_selection:
@@ -288,7 +315,7 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
             raise ReadUnavailable('unable to open database: source changed')
         try:
             connection = ReadConnection(store, max(0, deadline - time.monotonic()) if timeout > 0 else 0.1,
-                                        reuse=reuse)
+                                        reuse=reuse, attach_binding=attach_binding)
             if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
                 connection._abort()
                 raise ReadUnavailable('unable to open database: source changed')
@@ -305,8 +332,7 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
             # Codes are authoritative; old Python/our advisory lock protocol
             # can omit them, so accept only SQLite's exact lock messages then.
             code = getattr(exc, 'sqlite_errorcode', None)
-            locked = (isinstance(code, int) and (code & 0xff) in (5, 6)) if code is not None else str(exc) in (
-                'database is locked', 'database table is locked', 'database schema is locked')
+            locked = _locked(exc)
             unavailable = isinstance(exc, ReadUnavailable) and any(
                 reason in str(exc) for reason in ('live sidecars', 'active reader'))
             launch_transient = launch_binding and (code is None or locked) and isinstance(exc, ReadUnavailable) and (

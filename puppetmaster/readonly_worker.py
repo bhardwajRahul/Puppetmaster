@@ -202,9 +202,13 @@ def main(path):
 if __name__ == '__main__':
     try:
         path = sys.argv[1]
-        while main(path):
-            # main has closed SQLite and the locking fd before acknowledging.
-            emit(dict(rows=[], names=[]))
+        while True:
+            released = main(path)
+            # main has closed SQLite and the locking fd before retry/release.
+            # Failed opens already emitted their error; the parent either
+            # terminates us or requests another bounded, fully fenced open.
+            if released:
+                emit(dict(rows=[], names=[]))
             request = sys.stdin.readline(1024 * 1024 + 1)
             if not request or len(request) > 1024 * 1024:
                 break
