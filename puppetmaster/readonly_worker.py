@@ -220,11 +220,9 @@ def attest_linux_database(before, source_fd):
         raise OSError('SQLite fd attestation: missing, ambiguous, or foreign main descriptor')
 
 
-def main(path, *, checkpoint_snapshot=False):
+def main(path, *, wal_snapshot=False):
     path = Path(path)
-    checkpoint_snapshot = bool(checkpoint_snapshot and os.name == 'nt')
-    def relevant(snapshot):
-        return snapshot[0] if checkpoint_snapshot else snapshot
+    wal_snapshot = bool(wal_snapshot and os.name == 'nt')
     before = stamps(path)
     if before[0] is None:
         emit(dict(kind='unavailable', error='unable to open database: source missing'))
@@ -246,15 +244,16 @@ def main(path, *, checkpoint_snapshot=False):
         # Probe before locking: closing any descriptor for this inode releases
         # this process's POSIX record locks. /dev/fd stat on macOS describes a
         # device node, so validate an opened descriptor instead.
-        uri = (path.resolve().as_uri() + '?mode=ro&immutable=1' if os.name == 'nt'
+        uri = (path.resolve().as_uri() + ('?mode=ro' if wal_snapshot else '?mode=ro&immutable=1') if os.name == 'nt'
                else descriptor_uri(source.fileno()))
         descriptor_before = source_stamp(fd=source.fileno())
-        if descriptor_before != before[0]:
+        if ((descriptor_before[:2] if wal_snapshot else descriptor_before) !=
+                (before[0][:2] if wal_snapshot else before[0])):
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       same_store_write=same_store_write(before[0], descriptor_before)))
             return
         if os.name == 'nt':
-            if not checkpoint_snapshot:
+            if not wal_snapshot:
                 import msvcrt
                 from ctypes import wintypes
                 class Overlapped(ctypes.Structure):
@@ -276,7 +275,7 @@ def main(path, *, checkpoint_snapshot=False):
                                 before[2] is not None)
                     emit(dict(kind='unavailable',
                               error='unable to open database: active reader; sidecars may be missing',
-                              code=5, checkpoint_snapshot=snapshot))
+                              code=5, wal_snapshot=snapshot))
                     return
         else:
             import fcntl
@@ -305,13 +304,13 @@ def main(path, *, checkpoint_snapshot=False):
                 emit(dict(kind='OperationalError', error='database is locked'))
                 return
         after = stamps(path)
-        if relevant(after) != relevant(before):
+        if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
                       same_store_write=same_store_write(before[0], after[0])))
             return
         header = source.read(100)
-        if not checkpoint_snapshot and not checkpointed_sidecars(path, before, header[18:20]):
+        if not wal_snapshot and not checkpointed_sidecars(path, before, header[18:20]):
             # A validated WAL/index with uncheckpointed frames is concrete
             # write contention, even if the writer dropped its byte-range lock
             # between the lock probe and this checkpoint proof.
@@ -320,7 +319,7 @@ def main(path, *, checkpoint_snapshot=False):
                       code=5))
             return
         after = stamps(path)
-        if relevant(after) != relevant(before):
+        if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
             return
@@ -341,13 +340,13 @@ def main(path, *, checkpoint_snapshot=False):
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('BEGIN')
             c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
-            after = stamps(path)
-            if relevant(after) != relevant(before):
+            if not wal_snapshot and stamps(path) != before:
                 emit(dict(kind='unavailable', error='unable to open database: source changed'))
                 return
             def unchanged():
                 current = source_stamp(fd=source.fileno())
-                return current == descriptor_before
+                return (current[:2] == descriptor_before[:2] if wal_snapshot
+                        else current == descriptor_before)
             emit(dict(journal='wal' if header[18:20] == b'\x02\x02' else 'delete'))
             def event(name, args):
                 emit(dict(event=name, args=args))
@@ -401,7 +400,7 @@ def main(path, *, checkpoint_snapshot=False):
 def serve(path=None):
     global emit
     output = emit
-    checkpoint_snapshot = False
+    wal_snapshot = False
     if path is None:
         output(dict(ready=True))
     while True:
@@ -411,7 +410,7 @@ def serve(path=None):
                 return
             request = json.loads(request)
             path = request['open']
-            checkpoint_snapshot = request.get('checkpoint_snapshot') is True
+            wal_snapshot = request.get('wal_snapshot') is True
         pending = []
         opened = False
 
@@ -427,7 +426,7 @@ def serve(path=None):
         emit = session_output
         try:
             try:
-                released = main(path, checkpoint_snapshot=checkpoint_snapshot)
+                released = main(path, wal_snapshot=wal_snapshot)
             except OSError as exc:
                 output(dict(kind='unavailable', error='unable to open database: source changed or unavailable: ' + str(exc)))
                 return
@@ -441,7 +440,7 @@ def serve(path=None):
         if released:
             output(dict(rows=[], names=[]))
         path = None
-        checkpoint_snapshot = False
+        wal_snapshot = False
 
 
 if __name__ == '__main__':

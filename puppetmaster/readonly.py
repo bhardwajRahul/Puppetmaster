@@ -1,8 +1,8 @@
 """Fenced, non-mutating SQLite reads in an isolated descriptor owner.
 
 No database copies. Ordinary reads reject live sidecars. After Windows proves
-an active WAL cohort, worker attach may validate the checkpointed main file as
-an unlocked immutable snapshot under a deny-delete source handle. Isolation
+an active WAL cohort, worker attach may join its existing WAL snapshot under a
+deny-delete source handle. Isolation
 matters: closing *any* source fd in the caller could release locks held by
 another SQLite connection in that process.
 """
@@ -402,7 +402,7 @@ class ReadConnection:
         try:
             retry_error = None
             stamp = None
-            checkpoint_snapshot = False
+            wal_snapshot = False
             if not reuse:
                 self.transport.ready(admission_expiry)
             _cleanup.recover(self.selected[1], admission_expiry)
@@ -427,7 +427,7 @@ class ReadConnection:
                 retry_source = None
             stamp = _source_stamp(store) if reuse else None
             self.process.stdin.write(json.dumps(dict(
-                open=str(path), checkpoint_snapshot=checkpoint_snapshot)) + '\n')
+                open=str(path), wal_snapshot=wal_snapshot)) + '\n')
             self.process.stdin.flush()
             retry_error = None
             while True:
@@ -471,9 +471,9 @@ class ReadConnection:
                     # closed its failed session. Do not fork a startup herd.
                     if not getattr(exc, 'session_closed', False):
                         raise
-                    checkpoint_snapshot = (checkpoint_snapshot or
+                    wal_snapshot = (wal_snapshot or
                         attach_binding and os.name == 'nt' and
-                        getattr(exc, 'checkpoint_snapshot', False))
+                        getattr(exc, 'wal_snapshot', False))
                     self._release_permit()
                     time.sleep(min(.01 if write_race else .05, remaining))
                     remaining = retry_deadline - time.monotonic()
@@ -488,7 +488,7 @@ class ReadConnection:
                         retry_error = exc
                     response_deadline = retry_deadline
                     self.process.stdin.write(json.dumps(dict(
-                        open=str(path), checkpoint_snapshot=checkpoint_snapshot)) + '\n')
+                        open=str(path), wal_snapshot=wal_snapshot)) + '\n')
                     self.process.stdin.flush()
             self._opened = True
             self.timeout = .1 if timeout <= 0 else timeout
@@ -564,7 +564,7 @@ class ReadConnection:
                 error.same_store_write = (kind == 'unavailable' and
                     result['error'] == 'unable to open database: source changed' and
                     result.get('same_store_write') is True)
-                error.checkpoint_snapshot = result.get('checkpoint_snapshot') is True
+                error.wal_snapshot = result.get('wal_snapshot') is True
                 if result.get('code') is not None:
                     error.sqlite_errorcode = result['code']
                 raise error

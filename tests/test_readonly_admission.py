@@ -556,6 +556,9 @@ class AdmissionTests(unittest.TestCase):
                 ReaderAdmission(alias, time.monotonic() + 1).release()
 
     def test_outer_readmission_obeys_existing_ordinary_window(self):
+        import io
+        import json
+        import queue
         import threading
         import weakref
         from types import SimpleNamespace
@@ -566,22 +569,41 @@ class AdmissionTests(unittest.TestCase):
                 cleanup = readonly.CleanupRegistry()
                 now = [0.0]
                 deadlines = []
+                class Transport:
+                    def __init__(self, path, deadline=None):
+                        self.closed = False
+                        self.calls = 0
+                        self.busy = threading.Lock()
+                        self.process = SimpleNamespace(stdin=io.StringIO())
+                        self.responses = SimpleNamespace(get=self.get)
+                        self.token = cleanup.register(self, readonly.selection(store)[1])
+
+                    def ready(self, deadline):
+                        pass
+
+                    def get(self, timeout):
+                        self.calls += 1
+                        if self.calls == 1:
+                            return json.dumps(dict(session_closed=True, kind='unavailable',
+                                error='unable to open database: live sidecars'))
+                        now[0] += timeout
+                        raise queue.Empty()
+
+                    def close(self, deadline=None):
+                        self.closed = True
+
                 original = readonly.ReaderAdmission
                 def admission(path, deadline, **kwargs):
                     deadlines.append(deadline)
-                    if len(deadlines) == 2:
-                        now[0] = deadline
-                        raise readonly.ReadTimeout('reader timed out')
                     return original(path, deadline, **kwargs)
                 timer = SimpleNamespace(monotonic=lambda: now[0],
                     sleep=lambda delay: now.__setitem__(0, now[0] + delay))
                 with patch.object(readonly, '_cleanup', cleanup), \
                         patch.object(readonly, '_reuse_slots', weakref.WeakValueDictionary()), \
                         patch.object(readonly, '_reuse_lock', threading.Lock()), \
+                        patch.object(readonly, '_Transport', Transport), \
                         patch.object(readonly, 'time', timer), \
-                        patch.object(readonly, 'ReaderAdmission', admission), \
-                        patch.object(readonly.ReadConnection, '_receive',
-                                     side_effect=readonly.ReadUnavailable('live sidecars')):
+                        patch.object(readonly, 'ReaderAdmission', admission):
                     with self.assertRaises(readonly.ReadTimeout):
                         readonly.connect(store, reuse=reuse)
                 self.assertEqual(deadlines, [5, window])

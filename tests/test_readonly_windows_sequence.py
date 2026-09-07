@@ -160,13 +160,13 @@ class WindowsSequenceTests(unittest.TestCase):
             self.assertEqual(store.lock_error_count, 0)
             self.assertFalse(store._attached)
 
-    def test_windows_attach_retries_active_wal_as_immutable_checkpoint(self):
+    def test_windows_attach_retries_only_after_active_wal_proof(self):
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(tmp)
             store.ensure_schema()
             replies = iter([
                 json.dumps(dict(session_closed=True, kind='unavailable', code=5,
-                    checkpoint_snapshot=True,
+                    wal_snapshot=True,
                     error='unable to open database: active reader; sidecars may be missing')),
                 json.dumps(dict(journal='wal')),
             ])
@@ -199,7 +199,7 @@ class WindowsSequenceTests(unittest.TestCase):
                 connection = readonly.ReadConnection(
                     store, 1, attach_binding=True, attach_deadline=time.monotonic() + 1)
             requests = [json.loads(line) for line in connection.process.stdin.getvalue().splitlines()]
-            self.assertEqual([request['checkpoint_snapshot'] for request in requests], [False, True])
+            self.assertEqual([request['wal_snapshot'] for request in requests], [False, True])
             connection.close()
 
 
