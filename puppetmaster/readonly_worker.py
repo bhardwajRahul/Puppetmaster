@@ -231,7 +231,11 @@ def main(path, *, wal_snapshot=False):
     # source bytes are written. This excludes new WAL openers during the read,
     # so our lock cannot strand a writer's final checkpoint/sidecar cleanup.
     if os.name == 'nt':
-        source = open_windows_source(path)
+        try:
+            source = open_windows_source(path)
+        except OSError as exc:
+            exc.source_open_contention = getattr(exc, 'winerror', None) in (5, 32, 33)
+            raise
         exclusive = True
     else:
         try:
@@ -425,11 +429,20 @@ def serve(path=None):
 
         emit = session_output
         try:
+            released = False
             try:
                 released = main(path, wal_snapshot=wal_snapshot)
             except OSError as exc:
-                output(dict(kind='unavailable', error='unable to open database: source changed or unavailable: ' + str(exc)))
-                return
+                response = dict(
+                    kind='unavailable',
+                    error='unable to open database: source changed or unavailable: ' + str(exc),
+                    source_open_contention=getattr(exc, 'source_open_contention', False),
+                )
+                if response['source_open_contention']:
+                    emit(response)
+                else:
+                    output(response)
+                    return
             except sqlite3.Error as exc:
                 output(dict(kind=type(exc).__name__, error=str(exc), code=getattr(exc, 'sqlite_errorcode', None)))
                 return
