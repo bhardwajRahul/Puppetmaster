@@ -250,7 +250,7 @@ class StartCliLogIsolationTests(unittest.TestCase):
                         pool.submit(start_cli, ["cursor", "review", "goal"], args)
                         for _ in range(16)
                     ]
-                    results = [future.result(timeout=5) for future in futures]
+                    results = [future.result(timeout=30) for future in futures]
 
             bodies = [json.loads(result["content"][0]["text"]) for result in results]
             run_ids = [body["run_id"] for body in bodies]

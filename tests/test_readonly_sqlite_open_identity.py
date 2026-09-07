@@ -133,6 +133,47 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(fd)
 
+    def test_windows_live_attach_keeps_delete_guard_without_exclusive_lock(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'source.sqlite3'
+            with closing(sqlite3.connect(path)) as c, c:
+                c.execute('CREATE TABLE sample(value)')
+                c.execute("INSERT INTO sample VALUES ('A')")
+            before = worker.stamp(path.stat())
+            responses, lock_calls = [], []
+            real_connect = sqlite3.connect
+
+            def create(name, access, share, security, disposition, flags, template):
+                self.assertEqual(share, 3)
+                return os.open(name, os.O_RDONLY | getattr(os, 'O_BINARY', 0))
+
+            def lock(*args):
+                lock_calls.append(args)
+                return True
+
+            def stamp(path=None, *, fd=None):
+                value = worker.stamp(os.stat(path) if fd is None else os.fstat(fd))
+                return value[:2] + before[2:]
+
+            kernel = SimpleNamespace(CreateFileW=create, LockFileEx=lock)
+            with patch.object(worker, 'emit', side_effect=responses.append), \
+                    patch.object(worker.sys, 'stdin', io.StringIO(
+                        '{"sql":"SELECT value FROM sample","parameters":[]}\n')), \
+                    patch.object(worker.sqlite3, 'connect', wraps=real_connect) as connect, \
+                    patch.object(worker, 'os', SimpleNamespace(
+                        name='nt', O_RDONLY=os.O_RDONLY, O_BINARY=0,
+                        fdopen=os.fdopen, close=os.close)), \
+                    patch.object(worker, 'source_stamp', side_effect=stamp), \
+                    patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+                    patch.dict(sys.modules, msvcrt=SimpleNamespace(
+                        open_osfhandle=lambda handle, flags: handle,
+                        get_osfhandle=lambda fd: fd)):
+                worker.main(path, wal_snapshot=True)
+
+            self.assertEqual(lock_calls, [])
+            self.assertEqual(connect.call_args.args[0], path.resolve().as_uri() + '?mode=ro')
+            self.assertEqual(responses[-1]['rows'], [('A',)])
+
     @unittest.skipUnless(os.name == 'nt', 'requires native Windows delete sharing')
     def test_native_windows_second_open_aba_is_blocked(self):
         responses, bound, _, _ = self.race()

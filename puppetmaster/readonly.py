@@ -1,9 +1,10 @@
 """Fenced, non-mutating SQLite reads in an isolated descriptor owner.
 
-No database copies. Live sidecars are explicitly unavailable. The helper holds
-SQLite's shared lock range while an immutable connection reads the checkpointed
-source. Isolation matters: closing *any* source fd in the caller could release
-locks held by another SQLite connection in that process.
+No database copies. Ordinary reads reject live sidecars. Windows worker attach
+uses SQLite's read-only WAL snapshot under a deny-delete source handle so a
+running swarm cannot starve new workers. Isolation matters: closing *any* source
+fd in the caller could release locks held by another SQLite connection in that
+process.
 """
 from __future__ import annotations
 
@@ -424,7 +425,8 @@ class ReadConnection:
             except FileNotFoundError:
                 retry_source = None
             stamp = _source_stamp(store) if reuse else None
-            self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
+            self.process.stdin.write(json.dumps(dict(
+                open=str(path), wal_snapshot=attach_binding and os.name == 'nt')) + '\n')
             self.process.stdin.flush()
             retry_error = None
             while True:
@@ -481,7 +483,8 @@ class ReadConnection:
                     if write_race or locked:
                         retry_error = exc
                     response_deadline = retry_deadline
-                    self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
+                    self.process.stdin.write(json.dumps(dict(
+                        open=str(path), wal_snapshot=attach_binding and os.name == 'nt')) + '\n')
                     self.process.stdin.flush()
             self._opened = True
             self.timeout = .1 if timeout <= 0 else timeout

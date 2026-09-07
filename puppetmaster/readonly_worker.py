@@ -220,8 +220,9 @@ def attest_linux_database(before, source_fd):
         raise OSError('SQLite fd attestation: missing, ambiguous, or foreign main descriptor')
 
 
-def main(path):
+def main(path, *, wal_snapshot=False):
     path = Path(path)
+    wal_snapshot = bool(wal_snapshot and os.name == 'nt')
     before = stamps(path)
     if before[0] is None:
         emit(dict(kind='unavailable', error='unable to open database: source missing'))
@@ -243,34 +244,36 @@ def main(path):
         # Probe before locking: closing any descriptor for this inode releases
         # this process's POSIX record locks. /dev/fd stat on macOS describes a
         # device node, so validate an opened descriptor instead.
-        uri = (path.resolve().as_uri() + '?mode=ro&immutable=1' if os.name == 'nt'
+        uri = (path.resolve().as_uri() + ('?mode=ro' if wal_snapshot else '?mode=ro&immutable=1') if os.name == 'nt'
                else descriptor_uri(source.fileno()))
         descriptor_before = source_stamp(fd=source.fileno())
-        if descriptor_before != before[0]:
+        if ((descriptor_before[:2] if wal_snapshot else descriptor_before) !=
+                (before[0][:2] if wal_snapshot else before[0])):
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       same_store_write=same_store_write(before[0], descriptor_before)))
             return
         if os.name == 'nt':
-            import msvcrt
-            from ctypes import wintypes
-            class Overlapped(ctypes.Structure):
-                _fields_ = [('internal', ctypes.c_size_t), ('internal_high', ctypes.c_size_t),
-                            ('offset', wintypes.DWORD), ('offset_high', wintypes.DWORD),
-                            ('event', wintypes.HANDLE)]
-            overlapped = Overlapped()
-            overlapped.offset = 1073741826
-            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-            lock = kernel.LockFileEx
-            lock.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
-                             wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(Overlapped))
-            lock.restype = wintypes.BOOL
-            # LockFileEx permits GENERIC_READ handles. Exclusively reserving
-            # SQLite's shared range excludes live connections without writing.
-            # https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-lockfileex
-            if not lock(msvcrt.get_osfhandle(source.fileno()), 3, 0, 510, 0, ctypes.byref(overlapped)):
-                emit(dict(kind='unavailable',
-                          error='unable to open database: active reader; sidecars may be missing', code=5))
-                return
+            if not wal_snapshot:
+                import msvcrt
+                from ctypes import wintypes
+                class Overlapped(ctypes.Structure):
+                    _fields_ = [('internal', ctypes.c_size_t), ('internal_high', ctypes.c_size_t),
+                                ('offset', wintypes.DWORD), ('offset_high', wintypes.DWORD),
+                                ('event', wintypes.HANDLE)]
+                overlapped = Overlapped()
+                overlapped.offset = 1073741826
+                kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+                lock = kernel.LockFileEx
+                lock.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                                 wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(Overlapped))
+                lock.restype = wintypes.BOOL
+                # LockFileEx permits GENERIC_READ handles. Exclusively reserving
+                # SQLite's shared range excludes live connections without writing.
+                # https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-lockfileex
+                if not lock(msvcrt.get_osfhandle(source.fileno()), 3, 0, 510, 0, ctypes.byref(overlapped)):
+                    emit(dict(kind='unavailable',
+                              error='unable to open database: active reader; sidecars may be missing', code=5))
+                    return
         else:
             import fcntl
             if sys.platform == 'darwin':
@@ -298,13 +301,13 @@ def main(path):
                 emit(dict(kind='OperationalError', error='database is locked'))
                 return
         after = stamps(path)
-        if after != before:
+        if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
                       same_store_write=same_store_write(before[0], after[0])))
             return
         header = source.read(100)
-        if not checkpointed_sidecars(path, before, header[18:20]):
+        if not wal_snapshot and not checkpointed_sidecars(path, before, header[18:20]):
             # A validated WAL/index with uncheckpointed frames is concrete
             # write contention, even if the writer dropped its byte-range lock
             # between the lock probe and this checkpoint proof.
@@ -313,7 +316,7 @@ def main(path):
                       code=5))
             return
         after = stamps(path)
-        if after != before:
+        if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
             return
@@ -334,11 +337,13 @@ def main(path):
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('BEGIN')
             c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
-            if stamps(path) != before:
+            if not wal_snapshot and stamps(path) != before:
                 emit(dict(kind='unavailable', error='unable to open database: source changed'))
                 return
             def unchanged():
-                return source_stamp(fd=source.fileno()) == descriptor_before
+                current = source_stamp(fd=source.fileno())
+                return (current[:2] == descriptor_before[:2] if wal_snapshot
+                        else current == descriptor_before)
             emit(dict(journal='wal' if header[18:20] == b'\x02\x02' else 'delete'))
             def event(name, args):
                 emit(dict(event=name, args=args))
@@ -392,6 +397,7 @@ def main(path):
 def serve(path=None):
     global emit
     output = emit
+    wal_snapshot = False
     if path is None:
         output(dict(ready=True))
     while True:
@@ -399,7 +405,9 @@ def serve(path=None):
             request = sys.stdin.readline(1024 * 1024 + 1)
             if not request or len(request) > 1024 * 1024:
                 return
-            path = json.loads(request)['open']
+            request = json.loads(request)
+            path = request['open']
+            wal_snapshot = request.get('wal_snapshot') is True
         pending = []
         opened = False
 
@@ -415,7 +423,7 @@ def serve(path=None):
         emit = session_output
         try:
             try:
-                released = main(path)
+                released = main(path, wal_snapshot=wal_snapshot)
             except OSError as exc:
                 output(dict(kind='unavailable', error='unable to open database: source changed or unavailable: ' + str(exc)))
                 return
@@ -429,6 +437,7 @@ def serve(path=None):
         if released:
             output(dict(rows=[], names=[]))
         path = None
+        wal_snapshot = False
 
 
 if __name__ == '__main__':

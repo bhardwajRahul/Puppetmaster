@@ -290,9 +290,8 @@ class SQLiteSwarmStore(SwarmStore):
 
     def _assert_schema(self, connection: sqlite3.Connection) -> str:
         from puppetmaster.readonly import ReadTimeout
-        # Attach holds an exclusive advisory lock across validation. Batch the
-        # fixed schema checks to avoid serializing eight IPC round trips per
-        # worker when many processes attach to the same store.
+        # Batch the fixed schema checks into one snapshot to avoid serializing
+        # eight IPC round trips per worker when many processes attach at once.
         try:
             row = connection.execute(
                 "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value, "
