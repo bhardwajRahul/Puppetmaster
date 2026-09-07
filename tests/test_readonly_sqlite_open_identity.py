@@ -194,6 +194,36 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, 'sharing violation'):
                 worker.open_windows_source('source.sqlite3')
 
+    def test_windows_guard_sharing_denial_closes_session_and_reuses_helper(self):
+        denied = PermissionError('Access is denied')
+        denied.winerror = 5
+        denied.source_open_contention = True
+        responses = []
+        with patch.object(worker, 'main', side_effect=(denied, True)) as main, \
+                patch.object(worker, 'emit', side_effect=responses.append), \
+                patch.object(worker.os, 'name', 'nt'), \
+                patch.object(worker.sys, 'stdin', io.StringIO(
+                    '{"open":"source.sqlite3"}\n')):
+            worker.serve('source.sqlite3')
+        self.assertTrue(responses[0]['source_open_contention'])
+        self.assertTrue(responses[0]['session_closed'])
+        self.assertIn('Access is denied', responses[0]['error'])
+        self.assertEqual(responses[1], {'rows': [], 'names': []})
+        self.assertEqual(main.call_count, 2)
+
+    def test_only_windows_guard_open_marks_sharing_denial_as_contention(self):
+        denied = PermissionError('Access is denied')
+        denied.winerror = 5
+        native_path = type(Path())
+        with patch.object(worker, 'Path', native_path), \
+                patch.object(worker, 'stamps', return_value=[
+                (1, 2, 3, 4, 5), None, None, None]), \
+                patch.object(worker, 'open_windows_source', side_effect=denied), \
+                patch.object(worker.os, 'name', 'nt'):
+            with self.assertRaises(PermissionError) as caught:
+                worker.main('source.sqlite3')
+        self.assertTrue(caught.exception.source_open_contention)
+
     def test_windows_guard_closes_handle_if_crt_transfer_fails(self):
         closed = []
         def create(*args):

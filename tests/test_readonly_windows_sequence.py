@@ -202,6 +202,50 @@ class WindowsSequenceTests(unittest.TestCase):
             self.assertEqual([request['wal_snapshot'] for request in requests], [False, True])
             connection.close()
 
+    def test_windows_attach_retries_transient_guard_open_denial(self):
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            replies = iter([
+                json.dumps(dict(
+                    session_closed=True,
+                    kind='unavailable',
+                    error='unable to open database: source changed or unavailable: '
+                          '[WinError 5] Access is denied.',
+                    source_open_contention=True,
+                )),
+                json.dumps(dict(journal='delete')),
+            ])
+
+            class Permit:
+                def release(self):
+                    pass
+
+            class Transport:
+                def __init__(self, path, deadline=None):
+                    self.closed = False
+                    self.busy = threading.Lock()
+                    self.process = SimpleNamespace(stdin=io.StringIO())
+                    self.responses = SimpleNamespace(get=lambda timeout: next(replies))
+                    self.token = readonly._cleanup.register(self, readonly.selection(store)[1])
+
+                def ready(self, deadline):
+                    pass
+
+                def close(self, deadline=None):
+                    self.closed = True
+
+            with patch.object(readonly, '_Transport', Transport), \
+                    patch.object(readonly, 'ReaderAdmission', return_value=Permit()), \
+                    patch.object(readonly, 'source_stamp', return_value=(1, 2, 3, 4, 5)), \
+                    patch.object(readonly, '_source_stamp', return_value=(
+                        (1, 2, 3, 4, 5), None, None, None, None, None)):
+                connection = readonly.ReadConnection(
+                    store, 1, attach_binding=True, attach_deadline=time.monotonic() + 1)
+            requests = connection.process.stdin.getvalue().splitlines()
+            self.assertEqual(len(requests), 2)
+            connection.close()
+
 
 if __name__ == '__main__':
     unittest.main()

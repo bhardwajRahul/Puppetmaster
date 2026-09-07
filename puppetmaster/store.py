@@ -2600,6 +2600,8 @@ class SwarmStore(StoreContracts):
         return receipt
 
     def reconcile_completions(self, job_id: str) -> None:
+        if not any(not record["done"] for record in self._completion_records(job_id)):
+            return
         with self._completion_scope(job_id) as acquired:
             if not acquired:
                 return

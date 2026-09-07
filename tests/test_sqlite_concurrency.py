@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import os
+import faulthandler
 import json
+import os
 import sqlite3
 import sys
 import threading
+import time
 import traceback
 
 _HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +36,8 @@ def _attach_claim_complete_worker(
     state_dir: str, job_id: str, worker_id: str, error_path: str
 ) -> None:
     """Spawn-safe worker body: attach only, then claim/complete local tasks."""
+    error_file = Path(error_path).open("w", encoding="utf-8")
+    faulthandler.dump_traceback_later(45, file=error_file)
     thread_errors: list[str] = []
     previous_hook = threading.excepthook
     threading.excepthook = lambda args: thread_errors.append(
@@ -53,14 +57,15 @@ def _attach_claim_complete_worker(
         )
         runtime.run_until_idle()
     except Exception:  # noqa: BLE001 — surface in the parent assert
-        Path(error_path).write_text(
-            traceback.format_exc(), encoding="utf-8"
-        )
+        error_file.write(traceback.format_exc())
     finally:
+        faulthandler.cancel_dump_traceback_later()
         threading.excepthook = previous_hook
         if thread_errors:
-            with Path(error_path).open("a", encoding="utf-8") as output:
-                output.write("\n".join(thread_errors))
+            error_file.write("\n".join(thread_errors))
+        error_file.close()
+        if Path(error_path).stat().st_size == 0:
+            Path(error_path).unlink()
 
 
 class SqliteAttachEnsureTests(unittest.TestCase):
@@ -806,12 +811,20 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
                 process.start()
 
             errors: list[str] = []
+            deadline = time.monotonic() + 60
             for process, error_path in processes:
-                process.join(timeout=60)
+                process.join(timeout=max(0, deadline - time.monotonic()))
+            timed_out = [(process, error_path) for process, error_path in processes
+                         if process.is_alive()]
+            for process, _ in timed_out:
+                process.terminate()
+            for process, error_path in timed_out:
+                process.join(timeout=5)
+                errors.append(f"timeout:{error_path.name}")
                 if process.is_alive():
-                    process.terminate()
+                    process.kill()
                     process.join(timeout=5)
-                    errors.append(f"timeout:{error_path.name}")
+            for process, error_path in processes:
                 if process.exitcode not in (0, None):
                     errors.append(f"exit:{error_path.name}={process.exitcode}")
                 if error_path.is_file():

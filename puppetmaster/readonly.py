@@ -453,14 +453,17 @@ class ReadConnection:
                 except sqlite3.OperationalError as exc:
                     write_race = getattr(exc, 'same_store_write', False)
                     topology_race = attach_binding and getattr(exc, 'launch_topology_change', False)
+                    source_open_contention = (
+                        attach_binding and getattr(exc, 'source_open_contention', False)
+                    )
                     locked = _locked(exc)
                     unavailable = isinstance(exc, ReadUnavailable) and any(
                         reason in str(exc) for reason in ('live sidecars', 'active reader'))
                     launch_transient = launch_binding and _launch_transient(exc)
-                    if not (write_race or topology_race or locked or
+                    if not (write_race or topology_race or source_open_contention or locked or
                             (launch_transient if launch_binding else unavailable)):
                         raise
-                    candidate = (write_deadline if write_race or topology_race or locked and not launch_binding
+                    candidate = (write_deadline if write_race or topology_race or source_open_contention or locked and not launch_binding
                                  else open_deadline if launch_transient or locked and launch_binding
                                  else ordinary_deadline)
                     retry_deadline = candidate if retry_deadline is None else min(retry_deadline, candidate)
@@ -561,6 +564,7 @@ class ReadConnection:
                          sqlite3.OperationalError if kind == 'OperationalError' else sqlite3.DatabaseError)(result['error'])
                 error.session_closed = result.get('session_closed') is True
                 error.launch_topology_change = result.get('launch_topology_change') is True
+                error.source_open_contention = result.get('source_open_contention') is True
                 error.same_store_write = (kind == 'unavailable' and
                     result['error'] == 'unable to open database: source changed' and
                     result.get('same_store_write') is True)
