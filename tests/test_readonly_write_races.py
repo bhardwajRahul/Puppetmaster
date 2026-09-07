@@ -54,6 +54,13 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                 store.ensure_schema()
                 original = readonly.ReadConnection._receive
                 retries = []
+                # Startup, release, and the fixture write must not consume the
+                # reuse mode's 100 ms budget before its synthetic error arrives.
+                # Advance retry backoff deterministically; deadline/ABA behavior
+                # is exercised separately below.
+                clock = [0.0]
+                def sleep(delay):
+                    clock[0] += delay
                 count = 1 if options.get('reuse') else 2
                 def race(c):
                     response = original(c)
@@ -71,10 +78,12 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                             return original(c)
                     return response
                 with patch.object(readonly.ReadConnection, '_receive', race), \
-                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn:
+                        patch.object(readonly, 'ReaderProcess', wraps=readonly.ReaderProcess) as spawn, \
+                        patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)):
                     with readonly.connect(store, **options) as c:
                         self.assertEqual(identity.read_identity(c, 'sqlite'), store._incarnation)
                         self.assertEqual(c.execute('SELECT count(*) FROM jobs').fetchone()[0], count)
+                        self.assertEqual(len(retries), count)
                         self.assertTrue(all(t is c.transport for t in retries))
                     self.assertEqual(spawn.call_count, 1)
                 if getattr(store, '_readonly_transport', None):
