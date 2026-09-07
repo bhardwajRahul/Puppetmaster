@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
@@ -77,7 +77,7 @@ class WindowsSequenceTests(unittest.TestCase):
                     patch.object(store, '_sleep_lock_backoff') as backoff:
                 with self.assertRaisesRegex(readonly.ReadUnavailable, 'source changed'):
                     store.attach()
-            connect.assert_called_once_with(attach_binding=True)
+            connect.assert_called_once_with(attach_binding=True, attach_deadline=ANY)
             backoff.assert_not_called()
             self.assertFalse(store._attached)
 

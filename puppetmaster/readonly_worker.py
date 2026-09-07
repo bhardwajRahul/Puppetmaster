@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import sqlite3
+import stat
 import sys
 import time
 from pathlib import Path
@@ -27,7 +28,8 @@ def source_stamp(path=None, *, fd=None):
         _fields_ = [('creation', ctypes.c_longlong), ('access', ctypes.c_longlong),
                     ('write', ctypes.c_longlong), ('change', ctypes.c_longlong),
                     ('attributes', wintypes.DWORD)]
-    # FILE_BASIC_INFO.ChangeTime includes renames, unlike CreationTime.
+    # ChangeTime tracks metadata updates, unlike CreationTime, but is not a
+    # rename counter. Windows replacement safety uses deny-delete sharing.
     # https://learn.microsoft.com/windows/win32/api/winbase/ns-winbase-file_basic_info
     query = kernel.GetFileInformationByHandleEx
     query.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
@@ -125,6 +127,99 @@ def checkpointed_sidecars(path, before, journal):
     return number(16, 20) == number(96, 100)
 
 
+def open_windows_source(path):
+    """Pin the selected file across SQLite's independent pathname open/read."""
+    import msvcrt
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    # GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING.
+    # Omitting FILE_SHARE_DELETE excludes rename/replacement until close, even
+    # when an A->B->A round trip would leave ChangeTime unchanged. Existing
+    # DELETE handles make this open fail too; never fall back to a shared open.
+    handle = create(str(path), 0x80000000, 3, None, 3, 0, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        close = kernel.CloseHandle
+        close.argtypes = (wintypes.HANDLE,)
+        close.restype = wintypes.BOOL
+        close(handle)
+        raise
+    try:
+        return os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def descriptor_uri(fd):
+    """Select a source descriptor URI; Linux additionally attests SQLite's fd."""
+    expected = os.fstat(fd)
+    for namespace in ('/proc/self/fd', '/dev/fd'):
+        candidate = Path(namespace) / str(fd)
+        try:
+            probe = os.open(candidate, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            actual = os.fstat(probe)
+        finally:
+            os.close(probe)
+        if (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino):
+            # Do not resolve(): that would restore the original pathname race.
+            # main runs the checkpoint proof before opening this immutable URI,
+            # which prevents SQLite from consulting namespace sidecars.
+            return candidate.as_uri() + '?mode=ro&immutable=1'
+    raise OSError('no usable SQLite descriptor namespace')
+
+
+def linux_fd_snapshot():
+    """Inventory live descriptors without opening/closing any database fd.
+
+    Keep scandir alive while inspecting entries, so its own fd cannot be
+    recycled into SQLite's main fd between enumeration and fstat. Only the
+    procfs directory descriptors are omitted. Any disappearing entry fails
+    closed; this private helper has one thread and no other SQLite connection.
+    """
+    directory = '/proc/self/fd'
+    proc = os.stat(directory)
+    result = {}
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            fd = int(entry.name)
+            current = os.fstat(fd)
+            if (stat.S_ISDIR(current.st_mode) and
+                    (current.st_dev, current.st_ino) == (proc.st_dev, proc.st_ino)):
+                continue
+            result[fd] = (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode))
+    return result
+
+
+def attest_linux_database(before, source_fd):
+    """Prove the sole new descriptor belongs to the validated main database.
+
+    SQLite's built-in immutable Unix VFS opens main during connect and keeps
+    that fd until close. No queries/callbacks run between the snapshots. An
+    extra descriptor (even another fd for A), a missing fd, or reuse of an
+    existing number for a different identity makes attribution ambiguous.
+    Do not select a matching A fd out of several: SQLite might be using B.
+    """
+    after = linux_fd_snapshot()
+    if any(after.get(fd) != identity for fd, identity in before.items()):
+        raise OSError('SQLite fd attestation: existing descriptors changed')
+    opened = [identity for fd, identity in after.items() if fd not in before]
+    source = os.fstat(source_fd)
+    expected = (source.st_dev, source.st_ino, stat.S_IFREG)
+    if not stat.S_ISREG(source.st_mode) or opened != [expected]:
+        raise OSError('SQLite fd attestation: missing, ambiguous, or foreign main descriptor')
+
+
 def main(path):
     path = Path(path)
     before = stamps(path)
@@ -134,13 +229,22 @@ def main(path):
     # A writable descriptor is used only for an exclusive advisory lock. No
     # source bytes are written. This excludes new WAL openers during the read,
     # so our lock cannot strand a writer's final checkpoint/sidecar cleanup.
-    try:
-        source = path.open('rb' if os.name == 'nt' else 'r+b')
+    if os.name == 'nt':
+        source = open_windows_source(path)
         exclusive = True
-    except PermissionError:
-        source = path.open('rb')
-        exclusive = False
+    else:
+        try:
+            source = path.open('r+b')
+            exclusive = True
+        except PermissionError:
+            source = path.open('rb')
+            exclusive = False
     with source:
+        # Probe before locking: closing any descriptor for this inode releases
+        # this process's POSIX record locks. /dev/fd stat on macOS describes a
+        # device node, so validate an opened descriptor instead.
+        uri = (path.resolve().as_uri() + '?mode=ro&immutable=1' if os.name == 'nt'
+               else descriptor_uri(source.fileno()))
         descriptor_before = source_stamp(fd=source.fileno())
         if descriptor_before != before[0]:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
@@ -214,8 +318,19 @@ def main(path):
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
             return
-        c = sqlite3.connect(path.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)
+        linux = os.name != 'nt' and sys.platform.startswith('linux')
+        opened_before = linux_fd_snapshot() if linux else None
+        c = sqlite3.connect(uri, uri=True)
         try:
+            if linux:
+                attest_linux_database(opened_before, source.fileno())
+            elif os.name != 'nt':
+                # Some Unix VFS builds resolve /proc/self/fd symlinks back to
+                # a replaceable pathname. Such an open is not descriptor-bound.
+                # Never expose rows or retry against the source name in that case.
+                filename = c.execute('PRAGMA database_list').fetchone()[2]
+                if Path(filename).as_uri() + '?mode=ro&immutable=1' != uri:
+                    raise OSError('SQLite resolved the descriptor to a pathname')
             c.execute('PRAGMA foreign_keys=ON')
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('BEGIN')

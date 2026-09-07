@@ -2456,8 +2456,7 @@ class SwarmStore(StoreContracts):
             raise ValueError("SQLite projections are transactional")
         from puppetmaster.projections import connection, project_file
         self.init()
-        with connection(self) as c:
-            c.execute("BEGIN IMMEDIATE")
+        with connection(self, write=True) as c:
             c.execute("""INSERT INTO projection_changes(kind,job_id,id,status,sha256,stamp,deleted,
                 task_count,artifact_count,binding,task_id,artifact_type,scope)
                 SELECT kind,job_id,id,status,sha256,'legacy_unknown',1,
@@ -3385,8 +3384,7 @@ class SwarmStore(StoreContracts):
                 elif path.is_dir():
                     path.rmdir()
             job_dir.rmdir()
-        with connection(self) as c:
-            c.execute("BEGIN IMMEDIATE")
+        with connection(self, write=True) as c:
             c.execute("""INSERT INTO projection_changes(kind,job_id,id,status,sha256,stamp,deleted,task_count,artifact_count)
                 SELECT kind,job_id,id,status,sha256,'known',1,task_count,artifact_count
                 FROM projection_current WHERE job_id=?""", (job_id,))
@@ -3621,8 +3619,7 @@ class SwarmStore(StoreContracts):
             from puppetmaster.selected_economics import check_receipt_replacement
             from puppetmaster.contracts import ContractConflict
             try:
-                with connection(self) as c:
-                    c.execute("BEGIN IMMEDIATE")
+                with connection(self, write=True) as c:
                     if path.exists():
                         check_receipt_replacement(self.read_json(path), to_jsonable(value))
                     self._write_json_file(path, value)
@@ -3636,10 +3633,9 @@ class SwarmStore(StoreContracts):
             return
         self._write_json_file(path, value)
         if projected:
-            with connection(self) as c:
+            with connection(self, write=True) as c:
                 # Read back under the index writer lock: a competing rename may
                 # have won, so indexing our caller's value would be stale.
-                c.execute("BEGIN IMMEDIATE")
                 project_file(c, path, self.read_json(path))
                 c.execute("DELETE FROM projection_pending WHERE path=?", (marker,))
 

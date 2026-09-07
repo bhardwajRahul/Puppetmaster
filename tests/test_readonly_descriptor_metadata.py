@@ -59,7 +59,59 @@ class DescriptorMetadataTests(unittest.TestCase):
             moved.rename(path)
             after = worker.source_stamp(path)
             self.assertEqual(before[:4], after[:4])
-            self.assertNotEqual(before[4], after[4])
+            # A completed rename round trip preserves the selected file. Native
+            # ChangeTime need not advance for every operation; it is a fence,
+            # not an operation counter.
+            with path.open('rb') as source:
+                self.assertEqual(after, worker.source_stamp(fd=source.fileno()))
+
+    def test_equal_change_time_preserves_identity_and_descriptor_fences(self):
+        for race in ('round_trip', 'replacement', 'replacement_aba'):
+            with self.subTest(race=race), TemporaryDirectory() as directory:
+                path = Path(directory) / 'source.sqlite3'
+                with closing(sqlite3.connect(path)) as c, c:
+                    c.execute('CREATE TABLE sample(value)')
+                    c.execute('INSERT INTO sample VALUES(1)')
+                replacement = path.with_suffix('.replacement')
+                replacement.write_bytes(path.read_bytes())
+                original_stamp, original_stamps = worker.source_stamp, worker.stamps
+                before = original_stamp(path)
+                def fixed_time(path=None, *, fd=None):
+                    stamp = original_stamp(path, fd=fd)
+                    # Make all timestamps and sizes equal: only identity can
+                    # distinguish the replacement from the selected file.
+                    return stamp[:2] + before[2:]
+                first = [True]
+                old = path.with_suffix('.old')
+                def swap(selected):
+                    result = original_stamps(selected)
+                    if first[0]:
+                        first[0] = False
+                        path.rename(old)
+                        if race in ('round_trip', 'replacement_aba'):
+                            old.rename(path)
+                        else:
+                            replacement.rename(path)
+                    return result
+                def descriptor(path_arg=None, *, fd=None):
+                    result = fixed_time(path_arg, fd=fd)
+                    if fd is not None and race == 'replacement_aba':
+                        # Model an acquired B descriptor after the pathname has
+                        # returned to A, without requiring Windows delete-sharing.
+                        return original_stamp(replacement)[:2] + before[2:]
+                    return result
+                responses = []
+                with patch.object(worker, 'source_stamp', side_effect=descriptor), \
+                        patch.object(worker, 'stamps', side_effect=swap), \
+                        patch.object(worker, 'emit', side_effect=responses.append), \
+                        patch.object(worker.sys, 'stdin', io.StringIO(
+                            '{"sql":"SELECT value FROM sample","parameters":[]}\n')):
+                    worker.main(path)
+                if race == 'round_trip':
+                    self.assertEqual(responses[-1]['rows'], [(1,)])
+                else:
+                    self.assertEqual(responses[-1]['kind'], 'unavailable')
+                    self.assertNotIn('rows', responses[-1])
 
     def test_descriptor_changes_remain_unavailable(self):
         for change_at in (2, 3):  # Before SQL and before returning its rows.

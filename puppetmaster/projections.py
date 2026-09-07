@@ -10,6 +10,7 @@ import json
 from puppetmaster.bounded_json import loads as metadata_json_loads
 import secrets
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -281,6 +282,25 @@ def install_source_triggers(c):
         c.execute("INSERT INTO projection_meta VALUES('display_economics_version','1')")
 
 
+def _reserve_writer(c, timeout=5.0):
+    """Retry only lock acquisition, within one budget, before any effects."""
+    from puppetmaster.readonly import _locked
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            c.execute(f"PRAGMA busy_timeout={int(min(.1, remaining) * 1000)}")
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                if not _locked(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(.01, max(0.0, deadline - time.monotonic())))
+    finally:
+        c.execute("PRAGMA busy_timeout=5000")
+
+
 @contextmanager
 def connection(store, *, metadata_only=False, launch_binding=False, write=False):
     if metadata_only:
@@ -314,7 +334,7 @@ def connection(store, *, metadata_only=False, launch_binding=False, write=False)
                 if write:
                     # Reserve the writer before identity reads: a deferred
                     # read-to-write upgrade cannot wait behind another writer.
-                    c.execute("BEGIN IMMEDIATE")
+                    _reserve_writer(c)
                 if store._incarnation is not None:
                     from puppetmaster.identity import read_identity, StoreIdentityError
                     if read_identity(c, "file") != store._incarnation:

@@ -132,17 +132,24 @@ class ReadConnection:
     in_transaction = True
     row_factory = sqlite3.Row
 
-    def __init__(self, store, timeout, *, reuse=False, attach_binding=False, launch_binding=False):
+    def __init__(self, store, timeout, *, reuse=False, attach_binding=False, launch_binding=False,
+                 attach_deadline=None):
         self.store = store
         self.selected = selection(store)
         self._opened = False
         self.closed = False
         self._authorizer = self._progress = self._trace = None
+        self._attach_deadline = attach_deadline if attach_binding else None
         # A zero SQLite busy budget still permits one bounded helper response.
         # Interpreter startup is not evidence of database lock contention.
         self.timeout = 5.0 if timeout <= 0 else max(0.001, timeout)
         open_deadline = time.monotonic() + max(0, timeout)
         write_deadline = open_deadline if attach_binding or launch_binding else min(open_deadline, time.monotonic() + (0.1 if reuse else 1.0))
+        if attach_binding and attach_deadline is not None:
+            open_deadline = min(open_deadline, attach_deadline)
+            write_deadline = attach_deadline
+        response_deadline = open_deadline
+        initial_response = True
         path = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
         try:
             weakref.ref(store)
@@ -175,15 +182,21 @@ class ReadConnection:
                 self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
                 self.process.stdin.flush()
             while True:
-                if attach_binding and timeout > 0:
-                    self.timeout = max(.001, open_deadline - time.monotonic())
+                if timeout > 0:
+                    # Interpreter startup shares the whole attach budget. Once
+                    # the helper responds, retries keep their shorter waits.
+                    if initial_response and attach_deadline is not None:
+                        self.timeout = attach_deadline - time.monotonic()
+                    else:
+                        self.timeout = min(timeout, response_deadline - time.monotonic())
+                initial_response = False
                 try:
                     self.source_journal_mode = self._receive()['journal']
                     break
                 except sqlite3.OperationalError as exc:
                     write_race = getattr(exc, 'same_store_write', False)
                     topology_race = attach_binding and getattr(exc, 'launch_topology_change', False)
-                    if not (write_race or topology_race or attach_binding and _locked(exc)):
+                    if not (write_race or topology_race or (attach_binding or not launch_binding) and _locked(exc)):
                         raise
                     retry_deadline = write_deadline if write_race else open_deadline
                     remaining = retry_deadline - time.monotonic()
@@ -199,11 +212,11 @@ class ReadConnection:
                     current_source = source_stamp(path)
                     _metadata_fence(retry_source, current_source)
                     retry_source = current_source
+                    response_deadline = retry_deadline
                     self.process.stdin.write(json.dumps(dict(open=str(path))) + '\n')
                     self.process.stdin.flush()
             self._opened = True
-            if timeout <= 0:
-                self.timeout = .1
+            self.timeout = .1 if timeout <= 0 else timeout
         except BaseException as exc:
             self._abort()
             if (reuse and isinstance(exc, ReadUnavailable) and
@@ -219,8 +232,13 @@ class ReadConnection:
 
     def _receive(self):
         while True:
+            timeout = self.timeout
+            if self._attach_deadline is not None:
+                timeout = min(timeout, self._attach_deadline - time.monotonic())
+            if timeout <= 0:
+                raise ReadTimeout('unable to open database: reader timed out')
             try:
-                line = self.responses.get(timeout=self.timeout)
+                line = self.responses.get(timeout=timeout)
             except queue.Empty as exc:
                 raise ReadTimeout('unable to open database: reader timed out') from exc
             if not self._opened:
@@ -319,15 +337,19 @@ def _metadata_fence(before, after):
         raise StoreIdentityError('store source metadata changed during binding')
 
 
-def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_binding=False):
+def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_binding=False,
+            attach_deadline=None):
     from puppetmaster.identity import StoreIdentityError
     if selection(store) != store._read_selection:
         raise StoreIdentityError('store removed or replaced since selection; explicitly reopen')
     started = time.monotonic()
     deadline = started + max(0, timeout)
+    if attach_binding and attach_deadline is not None:
+        deadline = min(deadline, attach_deadline)
     if launch_binding:
         reuse = False
-    # Ordinary reads keep their short availability window.
+    # Unproven availability errors keep their short window. Confirmed
+    # SQLite contention may use the caller budget, before any SQL is exposed.
     unavailable_deadline = min(deadline, started + (0.1 if reuse else 1.0))
     refresh_stamp = None
     launch_source = _source_stamp(store)[1] if launch_binding else None
@@ -336,14 +358,18 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
             raise StoreIdentityError('store removed or replaced since selection; explicitly reopen')
         if launch_source is not None:
             current_source = _source_stamp(store)[1]
-            # Rename ABA changes ctime without a database write.
+            # Reject observed metadata-only drift; ctime is not an operation counter.
             _metadata_fence(launch_source, current_source)
             launch_source = current_source
         if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
             raise ReadUnavailable('unable to open database: source changed')
         try:
-            connection = ReadConnection(store, max(.001, deadline - time.monotonic()) if timeout > 0 else 0,
-                                        reuse=reuse, attach_binding=attach_binding, launch_binding=launch_binding)
+            remaining = deadline - time.monotonic()
+            if timeout > 0 and remaining <= 0:
+                raise ReadTimeout('unable to open database: reader timed out')
+            connection = ReadConnection(store, (remaining if attach_binding else max(.001, remaining)) if timeout > 0 else 0,
+                                        reuse=reuse, attach_binding=attach_binding, launch_binding=launch_binding,
+                                        attach_deadline=attach_deadline)
             if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
                 connection._abort()
                 raise ReadUnavailable('unable to open database: source changed')
@@ -370,7 +396,7 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
                  getattr(exc, 'launch_topology_change', False)))
             if launch_binding:
                 unavailable = launch_transient
-            retry_deadline = (deadline if launch_transient or locked and (launch_binding or attach_binding)
+            retry_deadline = (deadline if launch_transient or locked
                               else unavailable_deadline)
             if not (locked or unavailable) or time.monotonic() >= retry_deadline:
                 raise

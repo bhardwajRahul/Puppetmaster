@@ -243,10 +243,13 @@ class SQLiteSwarmStore(SwarmStore):
             # on attach() and fail closed instead of racing DDL.
             self.ensure_schema()
             return
+        # All helper attempts and lock backoffs share this availability budget.
+        timeout = self.busy_timeout_ms / 1000.0
+        attach_deadline = time.monotonic() + timeout * _SQLITE_LOCK_RETRY_ATTEMPTS if timeout > 0 else None
         for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
             connection = None
             try:
-                connection = self._connect_readonly(attach_binding=True)
+                connection = self._connect_readonly(attach_binding=True, attach_deadline=attach_deadline)
                 self._assert_schema(connection)
                 from puppetmaster.identity import read_identity, StoreIdentityError
                 version = connection.execute("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key='schema_version'").fetchone()[0]
@@ -273,19 +276,27 @@ class SQLiteSwarmStore(SwarmStore):
                     self._record_lock_error()
                 if attempt + 1 == _SQLITE_LOCK_RETRY_ATTEMPTS:
                     raise
-                self._sleep_lock_backoff(attempt)
+                if attach_deadline is None:
+                    self._sleep_lock_backoff(attempt)
+                else:
+                    if time.monotonic() >= attach_deadline:
+                        raise
+                    self._sleep_lock_backoff(attempt, deadline=attach_deadline)
+                    if time.monotonic() >= attach_deadline:
+                        raise
             finally:
                 if connection is not None:
                     connection.close()
         self._attached = True
 
     def _assert_schema(self, connection: sqlite3.Connection) -> None:
+        from puppetmaster.readonly import ReadTimeout
         try:
             row = connection.execute(
                 "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
         except sqlite3.OperationalError as exc:
-            if _is_sqlite_lock_error(exc):
+            if isinstance(exc, ReadTimeout) or _is_sqlite_lock_error(exc):
                 raise
             raise SqliteSchemaError(
                 f"SQLite store schema is missing at {self.db_path}: {exc}"
@@ -571,9 +582,12 @@ class SQLiteSwarmStore(SwarmStore):
     def _record_lock_error(self) -> None:
         self.lock_error_count += 1
 
-    def _sleep_lock_backoff(self, attempt: int) -> None:
+    def _sleep_lock_backoff(self, attempt: int, *, deadline=None) -> None:
         delay = _SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
-        time.sleep(delay + random.uniform(0, delay))
+        delay += random.uniform(0, delay)
+        if deadline is not None:
+            delay = min(delay, max(0, deadline - time.monotonic()))
+        time.sleep(delay)
 
     def _connect_with_lock_retry(self) -> sqlite3.Connection:
         last_error: Optional[sqlite3.OperationalError] = None
@@ -2215,10 +2229,14 @@ class SQLiteSwarmStore(SwarmStore):
             "check_kind": "quick_check",
         }
 
-    def _connect_readonly(self, *, attach_binding=False) -> sqlite3.Connection:
+    def _connect_readonly(self, *, attach_binding=False, attach_deadline=None) -> sqlite3.Connection:
         """Open the DB read-only without applying write-side durability PRAGMAs."""
         from puppetmaster.readonly import connect
-        connection = connect(self, timeout=self.busy_timeout_ms / 1000.0, attach_binding=attach_binding)
+        timeout = self.busy_timeout_ms / 1000.0
+        # Spend attach's write-contention budget in one fenced helper. A proven
+        # write can outlast one busy timeout; rebinding here would lose history.
+        connection = connect(self, timeout=timeout, attach_binding=attach_binding,
+                             attach_deadline=attach_deadline)
         try:
             connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         except Exception:
