@@ -29663,6 +29663,8 @@ class NPlusOneRegressionTests(unittest.TestCase):
                 self.assertEqual(persisted, replace(
                     first, status=TaskStatus.QUEUED, lease_owner=None,
                     lease_expires_at=None, updated_at=persisted.updated_at,
+                    claimed_at=None,
+                    working_seconds=persisted.working_seconds,
                 ))
                 self.assertEqual(reopened.get_task_by_id(failing.id), failing)
                 self.assertEqual(reopened.get_task_by_id(later.id), later)

@@ -3,7 +3,13 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Optional
 
-from puppetmaster.models import Artifact, ArtifactType, parse_iso
+from puppetmaster.models import (
+    Artifact,
+    ArtifactType,
+    parse_iso,
+    task_is_satisfied,
+    task_working_seconds,
+)
 from puppetmaster.consumption import build_attempt_consumption_report
 from puppetmaster.usage import aggregate_token_usage
 from puppetmaster.scm_observe import derive_attention
@@ -38,16 +44,21 @@ def build_job_receipt(store: Any, job_id: str) -> dict[str, Any]:
     empty_tasks = _empty_or_unstructured_task_ids(artifacts)
     stdout_salvage = _stdout_salvage_count(artifacts)
     elapsed = _elapsed_seconds(job.created_at, job.completed_at)
+    working = round(sum(task_working_seconds(task) for task in tasks), 3)
+    parked = None if elapsed is None else round(max(0.0, elapsed - working), 3)
     total_tokens = int(token_usage.get("total_tokens") or 0)
     drift = _estimate_drift(artifacts, total_tokens)
     return {
         "job_id": job_id,
         "status": str(job.status),
         "elapsed_seconds": elapsed,
+        "working_seconds": working,
+        "parked_seconds": parked,
         "tasks": {
             "total": len(tasks),
             "complete": _task_status_count(tasks, "complete"),
             "failed": _task_status_count(tasks, "failed"),
+            "skipped": _task_status_count(tasks, "skipped"),
             "blocked": _task_status_count(tasks, "blocked"),
             "degraded": len(degraded_tasks),
         },
@@ -99,7 +110,7 @@ def _delivery(store: Any, job_id: str, tasks: list[Any], artifacts: list[Artifac
         store.get_job(job_id).status,
         quality=quality.get("quality"),
         stale_tasks=stale,
-        incomplete_tasks=any(str(task.status) != "complete" for task in tasks),
+        incomplete_tasks=any(not task_is_satisfied(task.status) for task in tasks),
         required_artifacts=bool(artifacts),
     )
 

@@ -116,6 +116,34 @@ class WorkerRuntime:
             )
             return True
 
+        from puppetmaster.prerun import prerun_skip_reason
+
+        skip_reason = prerun_skip_reason(task)
+        if skip_reason:
+            skipped_run = AgentRun(
+                job_id=self.job_id,
+                task_id=task.id,
+                role=task.role,
+                worker_id=self.worker_id,
+                status=TaskStatus.SKIPPED,
+                completed_at=now_iso(),
+            )
+            self.store.save_run(skipped_run)
+            self.store.update_task_status(
+                task, TaskStatus.SKIPPED, worker_id=self.worker_id
+            )
+            self.store.emit(
+                self.job_id,
+                "worker.prerun_skipped",
+                {
+                    "worker_id": self.worker_id,
+                    "task_id": task.id,
+                    "role": task.role,
+                    "reason": skip_reason,
+                },
+            )
+            return True
+
         run = AgentRun(
             job_id=self.job_id,
             task_id=task.id,

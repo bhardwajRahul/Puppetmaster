@@ -1,3 +1,13 @@
+## v1.26.0 — 2026-09-08
+
+**Control-plane kernel: budget-closed enqueue, capability claim, legal transitions, prerun skip, working duration.**
+
+- Refuse `enqueue_subtask` when the job budget is already exhausted. Exact fingerprint replay still returns the existing child.
+- Add capability-aware `claim_next_task` and read-only `peek_next_task` (`adapters` / `labels`).
+- Enforce `LEGAL_TASK_TRANSITIONS` at `update_task_status` on both stores. Same-status writes stay idempotent.
+- Honor `payload.prerun.skip` before adapter spawn. New `TaskStatus.SKIPPED` is a satisfied terminal that unblocks dependents.
+- Fold `now - claimed_at` when leaving RUNNING. Receipts add `working_seconds` and `parked_seconds` so HOLD/wait wall time is not counted as work.
+
 ## v1.25.0 — 2026-09-06
 
 - Fix direct Codex billing provenance and preserve unknown registry valuations as API-equivalent estimates (#136, reported by @kbentonferguson).

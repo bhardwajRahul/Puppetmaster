@@ -11,10 +11,15 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Mapping, Optional, Union
 
 from puppetmaster.budget import (
-    BudgetPolicy, BudgetLiability, BudgetConflictError, budget_totals, check_admission,
+    BudgetAdmissionError,
+    BudgetConflictError,
+    BudgetLiability,
+    BudgetPolicy,
+    budget_totals,
+    check_admission,
 )
 from puppetmaster.models import (
     AgentRun,
@@ -29,8 +34,12 @@ from puppetmaster.models import (
     MemoryRecord,
     Task,
     TaskStatus,
+    apply_running_duration,
     artifact_from_dict,
+    assert_legal_task_transition,
     is_cost_final_job_status,
+    task_is_satisfied,
+    task_is_terminal,
     graph_edge_from_dict,
     job_from_dict,
     make_graph_edge,
@@ -230,6 +239,43 @@ def _prepare_for_persistence(value: Any) -> Any:
 
 
 from puppetmaster.store_contracts import StoreContracts
+
+
+def _capability_values(value: Any) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def task_matches_capabilities(
+    task: Task,
+    capabilities: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when a worker's advertised adapters/labels can execute ``task``.
+
+    Omitted ``capabilities`` matches everything (legacy workers). An explicit
+    empty ``adapters`` list matches nothing. Placement is optional: a task
+    without ``payload.placement`` / ``payload.required_labels`` is unscoped.
+    """
+    if not capabilities:
+        return True
+    adapters = _capability_values(capabilities.get("adapters"))
+    if adapters is not None and str(task.adapter or "local") not in adapters:
+        return False
+    labels = _capability_values(capabilities.get("labels"))
+    if labels is not None:
+        required = _capability_values(
+            (task.payload or {}).get("placement")
+            or (task.payload or {}).get("required_labels")
+        )
+        if required and not set(required).intersection(labels):
+            return False
+    return True
 
 
 class SwarmStore(StoreContracts):
@@ -930,6 +976,21 @@ class SwarmStore(StoreContracts):
             )
             return None
 
+        if job is not None and job.budget_policy is not None:
+            try:
+                check_admission(
+                    job.budget_policy,
+                    self.budget_snapshot(job_id)["reservations"],
+                )
+            except BudgetAdmissionError as exc:
+                self._emit_enqueue_refused(
+                    job_id,
+                    "budget_exhausted",
+                    parent_task_id=parent_task_id,
+                    extra={"detail": str(exc)},
+                )
+                return None
+
         child_payload = dict(payload or {})
         child_payload["enqueued_from_parent"] = True
         child_payload["parent_task_id"] = parent_task_id
@@ -1134,12 +1195,13 @@ class SwarmStore(StoreContracts):
         lease_id: Optional[str] = None,
     ) -> Task:
         stored = self.get_task_by_id(task.id)
+        assert_legal_task_transition(stored.status, status)
         # The caller carries the lease token granted at claim time; default to
         # the claimed task's own ``lease_id`` so existing call sites fence
         # correctly without having to thread the token through explicitly.
         expected_lease = lease_id if lease_id is not None else task.lease_id
         updated = self._build_status_update(stored, status)
-        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        terminal = task_is_terminal(status)
         if terminal and worker_id is not None and not self._lease_matches(
             stored, worker_id, expected_lease
         ):
@@ -1154,15 +1216,16 @@ class SwarmStore(StoreContracts):
 
     @staticmethod
     def _build_status_update(stored: Task, status: TaskStatus) -> Task:
-        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        timed = apply_running_duration(stored, status)
+        terminal = task_is_terminal(status)
         return replace(
-            stored,
+            timed,
             status=status,
             lease_owner=None if terminal else stored.lease_owner,
             lease_expires_at=None if terminal else stored.lease_expires_at,
             lease_id=None if terminal else stored.lease_id,
             updated_at=now_iso(),
-            completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
+            completed_at=now_iso() if task_is_satisfied(status) else stored.completed_at,
         )
 
     def _atomic_status_update(
@@ -1298,14 +1361,16 @@ class SwarmStore(StoreContracts):
         if task.status == TaskStatus.RUNNING and self._has_pending_completion(task):
             return True
         if not self.dependencies_complete(task, task_map=task_map):
-            blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
+            blocked = apply_running_duration(task, TaskStatus.BLOCKED)
+            blocked = replace(blocked, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
             return True
         if task.status == TaskStatus.COMPLETE:
             return True
         if task.attempts >= self.max_task_attempts:
+            failed = apply_running_duration(task, TaskStatus.FAILED)
             failed = replace(
-                task,
+                failed,
                 status=TaskStatus.FAILED,
                 lease_owner=None,
                 lease_expires_at=None,
@@ -1383,8 +1448,9 @@ class SwarmStore(StoreContracts):
 
     @staticmethod
     def _build_claimed_task(task: Task, worker_id: str, lease_seconds: int) -> Task:
+        timed = apply_running_duration(task, TaskStatus.RUNNING)
         return replace(
-            task,
+            timed,
             status=TaskStatus.RUNNING,
             attempts=task.attempts + 1,
             generation=(task.generation or 0) + 1,
@@ -1472,7 +1538,53 @@ class SwarmStore(StoreContracts):
         worker_id: str,
         role: Optional[str] = None,
         lease_seconds: int = 60,
+        capabilities: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Task]:
+        for task, task_map in self._iter_claim_candidates(
+            job_id,
+            worker_id,
+            role=role,
+            capabilities=capabilities,
+            persist_blocked=True,
+        ):
+            claimed = self.claim_task(
+                task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
+            )
+            if claimed is not None:
+                return claimed
+        return None
+
+    def peek_next_task(
+        self,
+        job_id: str,
+        worker_id: str,
+        role: Optional[str] = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Task]:
+        """Return the next claimable task without taking a lease or flipping status.
+
+        Blocked dependents stay queued in the peek path so a liveness probe
+        cannot mutate the job. Candidate order matches ``claim_next_task``.
+        """
+        for task, _task_map in self._iter_claim_candidates(
+            job_id,
+            worker_id,
+            role=role,
+            capabilities=capabilities,
+            persist_blocked=False,
+        ):
+            return task
+        return None
+
+    def _iter_claim_candidates(
+        self,
+        job_id: str,
+        worker_id: str,
+        role: Optional[str] = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
+        *,
+        persist_blocked: bool,
+    ) -> Iterable[tuple[Task, dict[str, Task]]]:
         # Unblock is a supervisor tick (recover/refresh loops), not a claim side
         # effect. Workers must not refresh_blocked_tasks on every claim.
         # Load the job's tasks once and resolve dependency status from the
@@ -1493,18 +1605,14 @@ class SwarmStore(StoreContracts):
             if task.status != TaskStatus.QUEUED:
                 continue
             if not self.dependencies_complete(task, task_map=task_map):
-                self.save_task(replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso()))
+                if persist_blocked:
+                    self.save_task(replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso()))
                 continue
             if role is not None and task.role != role:
                 continue
-            # claim_task acquires the per-task lock internally so direct callers
-            # are race-safe without requiring claim_next_task's sweep wrapper.
-            claimed = self.claim_task(
-                task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
-            )
-            if claimed is not None:
-                return claimed
-        return None
+            if not task_matches_capabilities(task, capabilities):
+                continue
+            yield task, task_map
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
         self.reconcile_completions(job_id)
@@ -1526,8 +1634,9 @@ class SwarmStore(StoreContracts):
 
     @staticmethod
     def _build_recovered_task(task: Task) -> Task:
+        timed = apply_running_duration(task, TaskStatus.QUEUED)
         return replace(
-            task,
+            timed,
             status=TaskStatus.QUEUED,
             lease_owner=None,
             lease_expires_at=None,
@@ -1576,7 +1685,7 @@ class SwarmStore(StoreContracts):
                     dependency = self.get_task_by_id(dependency_id)
                 except FileNotFoundError:
                     return False
-            if dependency.status != TaskStatus.COMPLETE:
+            if not task_is_satisfied(dependency.status):
                 return False
         return True
 
@@ -3188,7 +3297,7 @@ class SwarmStore(StoreContracts):
             job.status,
             quality=quality.get("quality"),
             stale_tasks=stale,
-            incomplete_tasks=any(task.status != TaskStatus.COMPLETE for task in tasks),
+            incomplete_tasks=any(not task_is_satisfied(task.status) for task in tasks),
             required_artifacts=bool(artifacts),
         )
 
@@ -3325,7 +3434,9 @@ class SwarmStore(StoreContracts):
         }
 
     def has_incomplete_tasks(self, job_id: str) -> bool:
-        return any(task.status != TaskStatus.COMPLETE for task in self.list_tasks(job_id))
+        return any(
+            not task_is_satisfied(task.status) for task in self.list_tasks(job_id)
+        )
 
     def list_memory(self) -> list[dict[str, Any]]:
         self.init()
