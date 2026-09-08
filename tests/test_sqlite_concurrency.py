@@ -926,7 +926,8 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
                 if not process.is_alive():
                     process.close()
 
-            self.assertEqual(errors, [])
+            if errors:
+                self.fail("\n\n".join(errors))
             tasks = supervisor.list_tasks(job.id)
             status_counts = Counter(str(task.status) for task in tasks)
             failed_events = [e["payload"] for e in supervisor.read_events(job.id)
