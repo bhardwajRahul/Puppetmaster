@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import threading
 import time
 from dataclasses import replace
@@ -47,7 +48,7 @@ class WorkerRuntime:
     def _heartbeat_interval(self) -> float:
         configured = self.heartbeat_seconds
         if configured is None:
-            configured = 2.0 if self.poll_seconds == 0.1 else self.poll_seconds
+            configured = 2.0
         return max(0.01, min(configured, max(0.1, self.lease_seconds / 3)))
 
     def run_once(self) -> bool:
@@ -474,8 +475,13 @@ class WorkerRuntime:
         run: AgentRun,
         task_id: str,
         lease_id: Optional[str] = None,
+        opportunistic: bool = False,
     ):
-        coalesced = getattr(type(self.store), "heartbeat_run_and_renew_lease", None)
+        method = ("heartbeat_run_and_renew_lease_opportunistic" if opportunistic
+                  else "heartbeat_run_and_renew_lease")
+        coalesced = getattr(type(self.store), method, None)
+        if opportunistic and not callable(coalesced):
+            coalesced = getattr(type(self.store), "heartbeat_run_and_renew_lease", None)
         if callable(coalesced):
             return coalesced(
                 self.store, run, task_id, self.worker_id, self.lease_seconds, lease_id
@@ -494,7 +500,19 @@ class WorkerRuntime:
         lease_id: Optional[str] = None,
     ) -> None:
         while not stop.wait(self._heartbeat_interval()):
-            run, renewed = self._heartbeat_run_and_lease(run, task_id, lease_id)
+            try:
+                run, renewed = self._heartbeat_run_and_lease(
+                    run, task_id, lease_id, True
+                )
+            except sqlite3.OperationalError as exc:
+                from puppetmaster.sqlite_store import _is_sqlite_lock_error
+
+                if not _is_sqlite_lock_error(exc):
+                    raise
+                # A failed reservation did not mutate either record. Let the
+                # next heartbeat determine whether the lease still belongs to
+                # this worker instead of killing the background thread.
+                continue
             if renewed is None:
                 self._lease_lost.set()
                 stop.set()
@@ -600,14 +618,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _write_startup_error(state_dir, job_id: str, worker_id: str, exc: BaseException) -> None:
-    """Record a worker that died before/while starting so the failure isn't a
-    silent 0-byte log.
+def _write_startup_error(
+    backend: str,
+    state_dir,
+    job_id: str,
+    worker_id: str,
+    exc: BaseException,
+) -> None:
+    """Record a worker that died during startup or execution.
 
-    A worker that fails to start (bad env, import error, store init failure)
-    used to vanish with no trace — indistinguishable from "never launched". We
-    drop a startup-error file next to the job's task logs and, if the store is
-    usable, emit a ``worker.startup_failed`` event so it shows up in the feed.
+    A worker that exits outside normal Exception handling can otherwise vanish
+    with no trace. Keep the existing startup-error file/event contract while
+    preserving the traceback for both startup and execution failures.
     """
     import traceback
 
@@ -618,14 +640,14 @@ def _write_startup_error(state_dir, job_id: str, worker_id: str, exc: BaseExcept
         crash_dir = Path(state_dir) / "jobs" / job_id / "tasks"
         crash_dir.mkdir(parents=True, exist_ok=True)
         (crash_dir / f"startup_error-{worker_id}.log").write_text(
-            f"worker {worker_id} for job {job_id} failed to start:\n\n{detail}",
+            f"worker {worker_id} for job {job_id} failed to start or run:\n\n{detail}",
             encoding="utf-8",
             errors="replace",
         )
     except Exception:
         pass
     try:
-        create_store("sqlite", state_dir, mode="attach").emit(
+        create_store(backend, state_dir, mode="attach").emit(
             job_id,
             "worker.startup_failed",
             {"worker_id": worker_id, "error": str(exc)},
@@ -660,12 +682,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             crash_after_claim=args.crash_after_claim,
         )
         return 0 if runtime.run_until_idle() >= 0 else 1
-    except SystemExit:
-        # An intentional exit (e.g. the crash-after-claim demo) is not a
-        # startup failure — let it propagate untouched.
+    except SystemExit as exc:
+        # Only the crash-after-claim path owns exit 77. Other SystemExit values
+        # are unexpected worker failures and need the same durable traceback as
+        # any other BaseException; otherwise the supervisor sees only exit 1.
+        if not (args.crash_after_claim and exc.code == 77):
+            _write_startup_error(args.backend, state_dir, args.job_id, worker_id, exc)
         raise
     except BaseException as exc:  # noqa: BLE001 — last-resort trace before dying
-        _write_startup_error(state_dir, args.job_id, worker_id, exc)
+        _write_startup_error(args.backend, state_dir, args.job_id, worker_id, exc)
         raise
 
 

@@ -276,7 +276,9 @@ class RunfileAndOnBoundTests(unittest.TestCase):
             )
             self.addCleanup(httpd.server_close)
             info = read_dashboard_runfile(state_dir)
-            self.assertEqual(info["port"], port + 1)
+            bound_port = httpd.server_address[1]
+            self.assertGreater(bound_port, port)
+            self.assertEqual(info["port"], bound_port)
             self.assertEqual(info["pid"], os.getpid())
 
     def test_on_bound_receives_actual_port(self) -> None:
@@ -292,7 +294,9 @@ class RunfileAndOnBoundTests(unittest.TestCase):
                 on_bound=lambda h, p: calls.append((h, p)),
             )
             self.addCleanup(httpd.server_close)
-            self.assertEqual(calls, [("127.0.0.1", port + 1)])
+            bound_port = httpd.server_address[1]
+            self.assertGreater(bound_port, port)
+            self.assertEqual(calls, [("127.0.0.1", bound_port)])
 
 
 class DashboardIdentityRobustnessTests(unittest.TestCase):

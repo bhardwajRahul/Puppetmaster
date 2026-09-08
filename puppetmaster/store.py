@@ -82,6 +82,10 @@ class LaunchConflictError(ValueError):
     """A launch key was reused for a different normalized request."""
 
 
+class ProjectionWriteAdmissionError(sqlite3.OperationalError):
+    """The file projection writer was unavailable before a source mutation."""
+
+
 class ResetSubgraphResult(list):
     """Task list from ``reset_subgraph`` plus superseded artifact ids.
 
@@ -1409,7 +1413,13 @@ class SwarmStore(StoreContracts):
         worker_id: Optional[str] = None,
     ) -> bool:
         claim_snapshot = self._task_claim_snapshot(task)
-        if not self._save_task_if_matches(task_id, claim_snapshot, claimed):
+        try:
+            if not self._save_task_if_matches(task_id, claim_snapshot, claimed):
+                return False
+        except ProjectionWriteAdmissionError:
+            # The durable task file has not changed. Treat unavailable
+            # projection admission like a lost claim so run_until_idle can
+            # retry from fresh state instead of killing the worker.
             return False
         return True
 
@@ -1470,6 +1480,15 @@ class SwarmStore(StoreContracts):
         # a per-edge file glob / SQLite SELECT on every claim sweep).
         tasks = self.list_tasks(job_id)
         task_map = {task.id: task for task in tasks}
+        if len(tasks) > 1:
+            # Workers otherwise stampede the first queued task, then repeat the
+            # same losing writer reservation for every task already claimed by
+            # a peer. A stable per-worker rotation spreads those first CAS
+            # attempts across the queue without changing eligibility or
+            # allowing a claim outside the store's atomic fence.
+            digest = hashlib.sha256(worker_id.encode("utf-8")).digest()
+            offset = int.from_bytes(digest[:8], "big") % len(tasks)
+            tasks = tasks[offset:] + tasks[:offset]
         for task in tasks:
             if task.status != TaskStatus.QUEUED:
                 continue
@@ -2325,10 +2344,15 @@ class SwarmStore(StoreContracts):
             try:
                 with connection(self, metadata_only=True) as c:
                     return read_identity(c, self.backend_name)
-            except sqlite3.OperationalError as exc:
-                transient = str(exc) == 'database is locked' or (
-                    isinstance(exc, ReadUnavailable) and any(reason in str(exc)
-                    for reason in ('source changed', 'active reader', 'live sidecars')))
+            except (sqlite3.OperationalError, ReadUnavailable) as exc:
+                transient = (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and str(exc) == 'database is locked'
+                ) or (
+                    isinstance(exc, ReadUnavailable)
+                    and any(reason in str(exc)
+                            for reason in ('source changed', 'active reader', 'live sidecars'))
+                )
                 if not transient or time.monotonic() >= deadline:
                     raise
                 time.sleep(.01)
@@ -3615,8 +3639,15 @@ class SwarmStore(StoreContracts):
         if projected:
             self.init()
             marker = str(path) + ":" + new_id("write")
-            with connection(self, write=True) as c:
-                c.execute("INSERT INTO projection_pending VALUES(?)", (marker,))
+            try:
+                with connection(self, write=True) as c:
+                    c.execute("INSERT INTO projection_pending VALUES(?)", (marker,))
+            except sqlite3.OperationalError as exc:
+                from puppetmaster.readonly import _locked
+
+                if not _locked(exc):
+                    raise
+                raise ProjectionWriteAdmissionError(str(exc)) from exc
         if projected and file_kind(path) == 'job':
             from puppetmaster.selected_economics import check_receipt_replacement
             from puppetmaster.contracts import ContractConflict

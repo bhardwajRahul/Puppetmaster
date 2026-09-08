@@ -40,6 +40,9 @@ jobs:
         run: npm install --package-lock=false --no-audit
       - name: Smoke check Cursor runner syntax
         run: npm run smoke:cursor-runner
+      - name: Windows attach-herd canary
+        if: runner.os == 'Windows'
+        run: python -m unittest tests.test_sqlite_concurrency.SqliteMultiprocessAttachTests.test_supervisor_ensure_then_n_workers_attach_claim_complete -v
       - name: Run Python tests
         run: python -m unittest discover -s tests -v
       - name: Smoke check CLI metadata

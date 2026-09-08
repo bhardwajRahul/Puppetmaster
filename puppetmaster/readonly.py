@@ -454,7 +454,8 @@ class ReadConnection:
                     write_race = getattr(exc, 'same_store_write', False)
                     topology_race = attach_binding and getattr(exc, 'launch_topology_change', False)
                     source_open_contention = (
-                        attach_binding and getattr(exc, 'source_open_contention', False)
+                        (attach_binding or launch_binding) and
+                        getattr(exc, 'source_open_contention', False)
                     )
                     locked = _locked(exc)
                     unavailable = isinstance(exc, ReadUnavailable) and any(
