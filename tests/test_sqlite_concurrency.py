@@ -99,6 +99,33 @@ class SqliteAttachEnsureTests(unittest.TestCase):
             job = store.create_job("after attach")
             self.assertEqual(store.get_job(job.id).goal, "after attach")
 
+    def test_attach_retries_proven_windows_source_open_contention(self) -> None:
+        from puppetmaster.readonly import ReadUnavailable
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            SQLiteSwarmStore(root).ensure_schema()
+            store = SQLiteSwarmStore(root)
+            original_connect = store._connect_readonly
+            denied = ReadUnavailable(
+                "unable to open database: source changed or unavailable: "
+                "[WinError 5] Access is denied."
+            )
+            denied.source_open_contention = True
+            calls = 0
+
+            def connect(*args: object, **kwargs: object):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise denied
+                return original_connect(*args, **kwargs)
+
+            with mock.patch.object(store, "_connect_readonly", side_effect=connect), \
+                    mock.patch.object(store, "_sleep_lock_backoff"):
+                store.attach()
+            self.assertEqual(calls, 2)
+
     def test_concurrent_attach_never_writes_schema(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / ".puppetmaster"
@@ -238,6 +265,28 @@ class SqliteSessionRetryTests(unittest.TestCase):
                 for event in ("task.lease_renewed", "run.heartbeat"):
                     self.assertEqual(sum(e["event"] == event for e in events), 1)
             finally:
+                blocker.close()
+
+    def test_opportunistic_heartbeat_does_not_queue_behind_writer(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("opportunistic heartbeat")
+            task = Task(job_id=job.id, role="implement", instruction="noop")
+            store.save_task(task)
+            claimed = store.claim_task(task.id, "w-1")
+            run = AgentRun(job_id=job.id, task_id=task.id, role=task.role, worker_id="w-1")
+            store.save_run(run)
+            blocker = store.connect()
+            try:
+                blocker.execute("BEGIN IMMEDIATE")
+                with mock.patch.object(store, "_sleep_lock_backoff") as retry:
+                    with self.assertRaises(sqlite3.OperationalError):
+                        store.heartbeat_run_and_renew_lease_opportunistic(
+                            run, task.id, "w-1", lease_id=claimed.lease_id)
+                retry.assert_not_called()
+            finally:
+                blocker.rollback()
                 blocker.close()
 
     def test_waiting_heartbeat_cannot_overwrite_completion_or_successor_lease(self) -> None:
@@ -639,6 +688,38 @@ class SqliteHeartbeatCoalesceTests(unittest.TestCase):
 
 
 class WorkerHeartbeatLifecycleTests(unittest.TestCase):
+    def test_background_heartbeat_prefers_opportunistic_writer(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("background heartbeat")
+            task = Task(job_id=job.id, role="implement", instruction="noop")
+            store.save_task(task)
+            claimed = store.claim_task(task.id, "w-1")
+            run = AgentRun(job_id=job.id, task_id=task.id, role=task.role, worker_id="w-1")
+            runtime = WorkerRuntime(store, job.id, "implement", "w-1",
+                                    heartbeat_seconds=0.01)
+            stop = threading.Event()
+
+            def heartbeat(*args, **kwargs):
+                stop.set()
+                return run, claimed
+
+            with mock.patch.object(
+                SQLiteSwarmStore,
+                "heartbeat_run_and_renew_lease_opportunistic",
+                autospec=True,
+                side_effect=heartbeat,
+            ) as opportunistic, mock.patch.object(
+                SQLiteSwarmStore,
+                "heartbeat_run_and_renew_lease",
+                autospec=True,
+            ) as blocking:
+                runtime._heartbeat_until_stopped(run, task.id, stop,
+                                                 lease_id=claimed.lease_id)
+            opportunistic.assert_called_once()
+            blocking.assert_not_called()
+
     def test_completion_waits_for_inflight_sqlite_heartbeat(self) -> None:
         self._assert_heartbeat_drained_before_terminal(exception=False)
 
@@ -711,7 +792,9 @@ class WorkerHeartbeatLifecycleTests(unittest.TestCase):
                     # The heartbeat now reserves the writer before reading the
                     # task, so it cannot reach renewal until this lock releases.
                     entered.set()
-                    updated, renewed = original_heartbeat(*args)
+                    # Force the blocking path: this lifecycle test proves that
+                    # an actually in-flight write drains before publication.
+                    updated, renewed = original_heartbeat(*args[:3])
                     return updated, None if lose_lease else renewed
                 finally:
                     heartbeat_finished.set()

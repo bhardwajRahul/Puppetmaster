@@ -267,7 +267,9 @@ class SQLiteSwarmStore(SwarmStore):
                     raise
                 # The helper already exhausted any proven write retry. A fresh
                 # binding must not erase an unproven source-change rejection.
-                if isinstance(exc, ReadUnavailable) and "source changed" in str(exc):
+                if (isinstance(exc, ReadUnavailable)
+                        and "source changed" in str(exc)
+                        and not getattr(exc, "source_open_contention", False)):
                     raise
                 if not locked and not isinstance(exc, ReadUnavailable):
                     raise
@@ -1051,34 +1053,65 @@ class SQLiteSwarmStore(SwarmStore):
         """Persist a run heartbeat and renew the task lease in one transaction."""
         self._ensure_attached()
         updated = replace(run, heartbeat_at=now_iso())
+        with self._writer_scope() as connection:
+            renewed = self._heartbeat_run_and_renew_lease_on_connection(
+                connection, updated, task_id, worker_id, lease_seconds, lease_id
+            )
+        return updated, renewed
+
+    def heartbeat_run_and_renew_lease_opportunistic(
+        self,
+        run: AgentRun,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+        lease_id: Optional[str] = None,
+    ) -> tuple[AgentRun, Optional[Task]]:
+        """Persist a background heartbeat only when the writer is available."""
+        self._ensure_attached()
+        updated = replace(run, heartbeat_at=now_iso())
+        with self._opportunistic_writer_scope() as connection:
+            renewed = self._heartbeat_run_and_renew_lease_on_connection(
+                connection, updated, task_id, worker_id, lease_seconds, lease_id
+            )
+        return updated, renewed
+
+    def _heartbeat_run_and_renew_lease_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        updated: AgentRun,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        lease_id: Optional[str],
+    ) -> Optional[Task]:
         heartbeat_payload = {
             "run_id": updated.id,
             "worker_id": updated.worker_id,
             "task_id": updated.task_id,
         }
         saved_payload = {"run_id": updated.id, "role": updated.role}
-        with self._writer_scope() as connection:
-            row = connection.execute(
-                "SELECT data FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            renewed: Optional[Task] = None
-            if row is not None:
-                task = task_from_dict(json.loads(row["data"]))
-                if task.status == TaskStatus.RUNNING and self._lease_matches(
-                    task, worker_id, lease_id
-                ):
-                    renewed = self._renew_lease_on_connection(
-                        connection,
-                        task_id,
-                        task,
-                        self._build_renewed_task(task, lease_seconds),
-                        worker_id,
-                        lease_id,
-                    )
-            self._upsert_run_connection(connection, updated)
-            self._emit(connection, updated.job_id, "run.saved", saved_payload)
-            self._emit(connection, updated.job_id, "run.heartbeat", heartbeat_payload)
-        return updated, renewed
+        row = connection.execute(
+            "SELECT data FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        renewed: Optional[Task] = None
+        if row is not None:
+            task = task_from_dict(json.loads(row["data"]))
+            if task.status == TaskStatus.RUNNING and self._lease_matches(
+                task, worker_id, lease_id
+            ):
+                renewed = self._renew_lease_on_connection(
+                    connection,
+                    task_id,
+                    task,
+                    self._build_renewed_task(task, lease_seconds),
+                    worker_id,
+                    lease_id,
+                )
+        self._upsert_run_connection(connection, updated)
+        self._emit(connection, updated.job_id, "run.saved", saved_payload)
+        self._emit(connection, updated.job_id, "run.heartbeat", heartbeat_payload)
+        return renewed
 
     def _upsert_run_connection(
         self, connection: sqlite3.Connection, run: AgentRun
@@ -1264,6 +1297,22 @@ class SQLiteSwarmStore(SwarmStore):
             return
         with self._session() as connection:
             self._reserve_writer(connection)
+            self._completion_connection.connection = connection
+            try:
+                yield connection
+            finally:
+                self._completion_connection.connection = None
+
+    @contextmanager
+    def _opportunistic_writer_scope(self):
+        """Reserve once without SQLite's busy wait for background heartbeats."""
+        active = getattr(self._completion_connection, "connection", None)
+        if active is not None:
+            yield active
+            return
+        with self._session() as connection:
+            connection.execute("PRAGMA busy_timeout = 0")
+            connection.execute("BEGIN IMMEDIATE")
             self._completion_connection.connection = connection
             try:
                 yield connection
