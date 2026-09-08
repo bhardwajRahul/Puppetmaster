@@ -705,6 +705,13 @@ def _launch_transient(exc):
          getattr(exc, 'launch_topology_change', False))))
 
 
+def _source_open_contention(exc):
+    return bool(
+        getattr(exc, 'source_open_contention', False)
+        or getattr(exc, 'winerror', None) in (5, 32, 33)
+    )
+
+
 def _metadata_fence(before, after):
     from puppetmaster.identity import StoreIdentityError
     if (before is not None and after is not None and
@@ -731,18 +738,19 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
     retry_deadline = None
     refresh_stamp = None
     refresh_error = None
-    launch_source = _source_stamp(store)[1] if launch_binding else None
+    launch_source = None
     while True:
         if launch_binding and selection(store) != store._read_selection:
             raise StoreIdentityError('store removed or replaced since selection; explicitly reopen')
-        if launch_source is not None:
-            current_source = _source_stamp(store)[1]
-            # Reject observed metadata-only drift; ctime is not an operation counter.
-            _metadata_fence(launch_source, current_source)
-            launch_source = current_source
-        if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
-            raise ReadUnavailable('unable to open database: source changed')
         try:
+            if launch_binding:
+                current_source = _source_stamp(store)[1]
+                if launch_source is not None:
+                    # Reject observed metadata-only drift; ctime is not an operation counter.
+                    _metadata_fence(launch_source, current_source)
+                launch_source = current_source
+            if refresh_stamp is not None and _source_stamp(store) != refresh_stamp:
+                raise ReadUnavailable('unable to open database: source changed')
             remaining = min(timeout, (deadline if retry_deadline is None else retry_deadline) - time.monotonic())
             if timeout > 0 and remaining <= 0:
                 raise ReadTimeout('unable to open database: reader timed out')
@@ -755,6 +763,25 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
                 connection._abort()
                 raise ReadUnavailable('unable to open database: source changed')
             return connection
+        except OSError as exc:
+            if (
+                isinstance(exc, FileNotFoundError)
+                or not (attach_binding or launch_binding)
+                or not _source_open_contention(exc)
+            ):
+                raise
+            if contention_window[0] is None:
+                contention_window[0] = min(deadline, time.monotonic() + (0.1 if reuse else 1.0))
+            next_deadline = (
+                attach_deadline if attach_binding and attach_deadline is not None
+                else deadline
+            )
+            retry_deadline = next_deadline if retry_deadline is None else min(retry_deadline, next_deadline)
+            if time.monotonic() >= retry_deadline:
+                raise
+            time.sleep(min(.05, max(0, retry_deadline - time.monotonic())))
+            if time.monotonic() >= retry_deadline:
+                raise
         except sqlite3.OperationalError as exc:
             if isinstance(exc, ReadTimeout) and refresh_error is not None and not (attach_binding or launch_binding):
                 raise refresh_error
