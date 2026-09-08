@@ -2451,7 +2451,7 @@ class SwarmStore(StoreContracts):
         deadline = time.monotonic() + 5
         while True:
             try:
-                with connection(self, metadata_only=True, attach_binding=True) as c:
+                with connection(self, metadata_only=True) as c:
                     return read_identity(c, self.backend_name)
             except (sqlite3.OperationalError, ReadUnavailable, OSError) as exc:
                 from puppetmaster.readonly import _source_open_contention
