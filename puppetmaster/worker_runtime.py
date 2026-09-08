@@ -475,8 +475,13 @@ class WorkerRuntime:
         run: AgentRun,
         task_id: str,
         lease_id: Optional[str] = None,
+        opportunistic: bool = False,
     ):
-        coalesced = getattr(type(self.store), "heartbeat_run_and_renew_lease", None)
+        method = ("heartbeat_run_and_renew_lease_opportunistic" if opportunistic
+                  else "heartbeat_run_and_renew_lease")
+        coalesced = getattr(type(self.store), method, None)
+        if opportunistic and not callable(coalesced):
+            coalesced = getattr(type(self.store), "heartbeat_run_and_renew_lease", None)
         if callable(coalesced):
             return coalesced(
                 self.store, run, task_id, self.worker_id, self.lease_seconds, lease_id
@@ -496,7 +501,9 @@ class WorkerRuntime:
     ) -> None:
         while not stop.wait(self._heartbeat_interval()):
             try:
-                run, renewed = self._heartbeat_run_and_lease(run, task_id, lease_id)
+                run, renewed = self._heartbeat_run_and_lease(
+                    run, task_id, lease_id, True
+                )
             except sqlite3.OperationalError as exc:
                 from puppetmaster.sqlite_store import _is_sqlite_lock_error
 
