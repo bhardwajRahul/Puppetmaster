@@ -43,7 +43,7 @@ def source_stamp(path=None, *, fd=None):
         # Attributes only, shared read/write/delete, including directories.
         handle = create(str(path), 0x80, 7, None, 3, 0x02000000, None)
         if handle == wintypes.HANDLE(-1).value:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _retryable_windows_contention(ctypes.WinError(ctypes.get_last_error()))
         try:
             fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
         except BaseException:
@@ -60,10 +60,10 @@ def source_stamp(path=None, *, fd=None):
         for _ in range(8):
             first, last = BasicInfo(), BasicInfo()
             if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(first), ctypes.sizeof(first)):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise _retryable_windows_contention(ctypes.WinError(ctypes.get_last_error()))
             st = os.fstat(fd)
             if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(last), ctypes.sizeof(last)):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise _retryable_windows_contention(ctypes.WinError(ctypes.get_last_error()))
             write = (last.write - epoch) * 100
             if (first.write, first.change) == (last.write, last.change) and st.st_mtime_ns == write:
                 return (st.st_dev, st.st_ino, st.st_size, write, (last.change - epoch) * 100)
