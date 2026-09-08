@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.26.0](CHANGELOG.md#v1260--2026-09-08) — budget-closed enqueue, capability-aware claim/peek, legal task transitions, prerun skip, and working vs parked receipt duration. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.26.1](CHANGELOG.md#v1261--2026-09-08) — parent-side Windows attach retries `source_stamp` Access Denied. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 
