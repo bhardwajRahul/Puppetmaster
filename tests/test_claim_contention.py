@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
 from puppetmaster.contracts import ContractConflict
 from puppetmaster.identity import StoreIdentityError
-from puppetmaster.models import Task, TaskStatus
+from puppetmaster.models import AgentRun, Task, TaskStatus
 from puppetmaster.readonly import ReadUnavailable
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.store import SwarmStore
@@ -174,6 +174,28 @@ class ClaimContentionTests(unittest.TestCase):
             claimed = store.get_task_by_id(task.id)
             self.assertEqual(claimed.status, TaskStatus.COMPLETE)
             self.assertEqual(claimed.attempts, 1)
+
+    def test_file_save_run_retries_projection_writer_admission_timeout(self):
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp))
+            job = store.create_job('projection admission save')
+            run = AgentRun(job.id, 'task', 'explore', 'worker')
+            from puppetmaster import projections
+            original = projections._reserve_writer
+            calls = 0
+
+            def reserve(connection, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise sqlite3.OperationalError('database is locked')
+                return original(connection, *args, **kwargs)
+
+            with patch.object(projections, '_reserve_writer', side_effect=reserve):
+                store.save_run(run)
+            saved = store.read_json(store.job_dir(job.id) / 'runs' / f'{run.id}.json')
+            self.assertEqual(saved['id'], run.id)
+            self.assertGreaterEqual(calls, 2)
 
     def test_file_claim_does_not_swallow_nonlock_projection_failure(self):
         with TemporaryDirectory() as tmp:

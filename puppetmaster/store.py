@@ -3020,8 +3020,21 @@ class SwarmStore(StoreContracts):
                       key=lambda r: (r.attempt_id, r.observation_id))
 
     def save_run(self, run: AgentRun) -> None:
-        self.write_json(self.job_dir(run.job_id) / "runs" / f"{run.id}.json", run)
+        self._write_json_retrying_admission(
+            self.job_dir(run.job_id) / "runs" / f"{run.id}.json", run
+        )
         self.emit(run.job_id, "run.saved", {"run_id": run.id, "role": run.role})
+
+    def _write_json_retrying_admission(self, path: Path, value: Any) -> None:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                self.write_json(path, value)
+                return
+            except ProjectionWriteAdmissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def _prepare_artifact_for_save(self, artifact: Artifact) -> Artifact:
         """Bound oversized payloads, validate schema, then stamp content hash."""

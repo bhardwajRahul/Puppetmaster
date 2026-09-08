@@ -4,6 +4,7 @@
 
 - Treat `CreateFileW` / `GetFileInformationByHandleEx` WinError 5/32/33 as `source_open_contention` in `source_stamp()`.
 - Retry those `OSError`s on `attach_binding` / `launch_binding` inside the existing deadline. File-backend `incarnation` retries the same Access Denied without treating the read as a WAL attach. Ordinary short reads stay fail-fast.
+- File-backend `save_run` retries `ProjectionWriteAdmissionError` the way claim already treats a locked projection writer, so two demo workers finishing together do not kill the child.
 - Remove the duplicate in-workflow attach-herd canary. `windows-store.yml` already owns that signal; CI discover still runs the herd test.
 
 ## v1.26.0 — 2026-09-08
