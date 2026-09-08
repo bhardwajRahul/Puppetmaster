@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
 from puppetmaster.budget import (
-    BudgetPolicy, BudgetLiability, BudgetConflictError, budget_totals, check_admission,
+    BudgetAdmissionError,
+    BudgetConflictError,
+    BudgetLiability,
+    BudgetPolicy,
+    budget_totals,
+    check_admission,
 )
 from puppetmaster.models import (
     AgentRun,
@@ -929,6 +934,21 @@ class SwarmStore(StoreContracts):
                 },
             )
             return None
+
+        if job is not None and job.budget_policy is not None:
+            try:
+                check_admission(
+                    job.budget_policy,
+                    self.budget_snapshot(job_id)["reservations"],
+                )
+            except BudgetAdmissionError as exc:
+                self._emit_enqueue_refused(
+                    job_id,
+                    "budget_exhausted",
+                    parent_task_id=parent_task_id,
+                    extra={"detail": str(exc)},
+                )
+                return None
 
         child_payload = dict(payload or {})
         child_payload["enqueued_from_parent"] = True
