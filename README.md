@@ -165,7 +165,7 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 
 ## Status
 
-Puppetmaster is a daily-driver beta at **v1.25.0**, suitable for supervised local engineering. This release adds strict store incarnation checks, bounded nonmutating reads, selected economics with usage provenance, and completion, claim, and launch contention repairs. Job receipts report invocation process outcomes separately from artifact delivery quality.
+Puppetmaster is a daily-driver beta at **v1.26.0**, suitable for supervised local engineering. This release closes five control-plane kernel gaps: enqueue refuses an already-exhausted job budget, claim/peek can filter by adapter and label capabilities, `update_task_status` enforces a legal transition map, `payload.prerun.skip` marks SKIPPED before adapter spawn, and receipts split working time from parked HOLD/wait wall time.
 
 [Store contracts](docs/STORE_CONTRACTS.md) describe the embedding APIs and their limits. [Attempt accounting](docs/ATTEMPT_LEDGER.md) preserves retries and unknown usage; selected-result economics remain separate. [Budget reservations](docs/BUDGET_RESERVATIONS.md) enforce cumulative admission, though opaque provider overruns can exceed allowances. SQLite state migrates to schema v5, with stale projection triggers repaired at supervisor initialization. Stop long-lived Puppetmaster processes before the schema cutover and restart supervisors, workers, MCP servers, and dashboards on the new version. See the [feature matrix](docs/FEATURES.md) and [changelog](docs/CHANGELOG.md).
 
