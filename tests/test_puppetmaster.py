@@ -27237,6 +27237,20 @@ class AuditFixTests(unittest.TestCase):
         self.assertEqual(store.heartbeat_run.call_count, 1)
         self.assertEqual(store.renew_task_lease.call_count, 1)
 
+    def test_default_heartbeat_interval_is_not_the_poll_interval(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        runtime = WorkerRuntime(
+            store=MagicMock(),
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+            lease_seconds=30,
+            poll_seconds=0.05,
+        )
+
+        self.assertEqual(runtime._heartbeat_interval(), 2.0)
+
     def test_heartbeat_interval_keeps_margin_for_short_leases(self) -> None:
         from puppetmaster.worker_runtime import WorkerRuntime
 

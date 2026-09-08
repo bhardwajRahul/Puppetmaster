@@ -48,7 +48,7 @@ class WorkerRuntime:
     def _heartbeat_interval(self) -> float:
         configured = self.heartbeat_seconds
         if configured is None:
-            configured = 2.0 if self.poll_seconds == 0.1 else self.poll_seconds
+            configured = 2.0
         return max(0.01, min(configured, max(0.1, self.lease_seconds / 3)))
 
     def run_once(self) -> bool:
