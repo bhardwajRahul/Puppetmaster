@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.26.1](CHANGELOG.md#v1261--2026-09-08) — parent-side Windows attach retries `source_stamp` Access Denied. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.0](CHANGELOG.md#v1270--2026-09-08) — community observations order already-sufficient models; preference stays taste; ROUTING names the winning source. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 

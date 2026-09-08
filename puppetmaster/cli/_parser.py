@@ -2732,6 +2732,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the import report without writing the registry.",
     )
+    models_import_obs = models_sub.add_parser(
+        "import-observations",
+        help=(
+            "Import a versioned community observation bundle (StrongOrc-shaped). "
+            "Writes ~/.puppetmaster/community-observations.json only. "
+            "Never writes capability_score. Exact identity only."
+        ),
+    )
+    models_import_obs.add_argument("--registry-path", help="Ignored; observations are not registry rows.")
+    models_import_obs.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Observation bundle JSON path (default: docs/baselines/strongorc-observations-v1.json).",
+    )
+    models_import_obs.add_argument(
+        "--store-path",
+        help="Override the observation store path.",
+    )
+    models_import_obs.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Parse and report without writing the observation store.",
+    )
 
     evaluators_cmd = subcommands.add_parser(
         "evaluators",

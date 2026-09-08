@@ -31,8 +31,21 @@ from math import isfinite
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
+from puppetmaster.community_observations import (
+    community_gate,
+    load_community_observations,
+    match_observation,
+)
 from puppetmaster.model_registry import ModelSpec, enabled_specs, model_id_allowed
+from puppetmaster.role_preferences import (
+    RolePreference,
+    apply_strict,
+    first_soft_preferred,
+    load_role_preferences,
+)
 from puppetmaster.scorecards import (
+    SCORE_SOURCE_COMMUNITY_OBSERVATION,
+    SCORE_SOURCE_PREFERENCE,
     card_capability,
     effective_capability_score,
     is_capability_sufficient,
@@ -753,6 +766,8 @@ def _route_task_once(
     calibration: Optional[TokenEstimateCalibration] = None,
     local_receipts: Optional[Iterable] = None,
     generation_presence: Optional[Iterable[ModelSpec]] = None,
+    community_observations: Optional[Iterable] = None,
+    role_preferences: Optional[Mapping[str, RolePreference]] = None,
 ) -> RoutingDecision:
     """Pick a model for ``task`` from ``registry`` using ``policy``.
 
@@ -1118,6 +1133,99 @@ def _route_task_once(
             f"at {_cap(strongest)}."
         )
 
+    if community_observations is None:
+        observation_rows = load_community_observations()
+    else:
+        observation_rows = list(community_observations)
+    if role_preferences is None:
+        preference_map = load_role_preferences()
+    else:
+        preference_map = dict(role_preferences)
+    role_pref = preference_map.get(canonical_role)
+
+    if role_pref is not None and role_pref.mode == "strict":
+        after_pref = apply_strict(after_cost, role_pref.preferred)
+        if not after_pref:
+            raise NoEligibleModelError(
+                "Strict role preference excluded every eligible model for "
+                f"role {canonical_role!r}."
+            )
+        for spec in after_cost:
+            if spec not in after_pref:
+                rejected.append((spec, "not preferred (strict)"))
+        after_cost = after_pref
+        sufficient = [s for s in after_cost if _sufficient(s)]
+        if task.strict_capability and not sufficient:
+            raise NoEligibleModelError(
+                "Strict role preference left no model that meets capability "
+                f"{need} for role {canonical_role!r}."
+            )
+
+    community_pick = community_gate(sufficient, canonical_role, observation_rows)
+    if community_pick is not None:
+        pick = community_pick
+        reason = (
+            f"community observation gate selected {pick.id} for "
+            f"role {canonical_role}"
+            + _overlay_note(pick)
+        )
+        winner_obs = match_observation(pick, canonical_role, observation_rows)
+        for spec in after_cost:
+            if spec.id == pick.id:
+                continue
+            other = match_observation(spec, canonical_role, observation_rows)
+            if other is None:
+                rejected.append(
+                    (spec, "no matching community observation")
+                )
+            elif winner_obs is not None:
+                rejected.append(
+                    (
+                        spec,
+                        f"community gate selected {pick.id} "
+                        f"(pass_rate {winner_obs.pass_rate:g} vs {other.pass_rate:g})",
+                    )
+                )
+            else:
+                rejected.append((spec, f"community gate selected {pick.id}"))
+        return _decision(
+            pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+            _baseline_cost, _baseline_id, _baseline_nominal,
+            allowed_model_ids=_allowed_for_artifact,
+            role=task.role,
+            calibration=_candidate_calibration(pick),
+            local_receipts=receipts,
+            candidates=after_cost,
+            order_source=SCORE_SOURCE_COMMUNITY_OBSERVATION,
+        )
+
+    if (
+        role_pref is not None
+        and role_pref.mode == "soft"
+        and role_pref.preferred
+    ):
+        soft_pick = first_soft_preferred(sufficient, role_pref.preferred)
+        if soft_pick is not None:
+            pick = soft_pick
+            reason = (
+                f"soft role preference selected {pick.id} for "
+                f"role {canonical_role}"
+                + _overlay_note(pick)
+            )
+            for spec in after_cost:
+                if spec.id != pick.id:
+                    rejected.append((spec, f"not preferred (soft); kept {pick.id}"))
+            return _decision(
+                pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+                _baseline_cost, _baseline_id, _baseline_nominal,
+                allowed_model_ids=_allowed_for_artifact,
+                role=task.role,
+                calibration=_candidate_calibration(pick),
+                local_receipts=receipts,
+                candidates=after_cost,
+                order_source=SCORE_SOURCE_PREFERENCE,
+            )
+
     prefer = (task.prefer_model_id or "").strip()
     if (
         prefer
@@ -1406,6 +1514,8 @@ def route_task(
     shadow_policy: Optional[str] = None,
     local_receipts: Optional[Iterable] = None,
     generation_presence: Optional[Iterable[ModelSpec]] = None,
+    community_observations: Optional[Iterable] = None,
+    role_preferences: Optional[Mapping[str, RolePreference]] = None,
 ) -> RoutingDecision:
     """Pick the production model and optionally attach counterfactual evidence.
 
@@ -1432,6 +1542,8 @@ def route_task(
         calibration=calibration,
         local_receipts=local_receipts,
         generation_presence=generation_presence,
+        community_observations=community_observations,
+        role_preferences=role_preferences,
     )
     production = replace(production, registry_billing=next(
         model.billing for model in authority if model.id == production.model.id
@@ -1449,6 +1561,8 @@ def route_task(
         calibration=calibration,
         local_receipts=local_receipts,
         generation_presence=generation_presence,
+        community_observations=community_observations,
+        role_preferences=role_preferences,
     )
     from puppetmaster.shadow_routing import shadow_evidence
 
@@ -1524,6 +1638,7 @@ def _decision(
     calibration: Optional[TokenEstimateCalibration] = None,
     local_receipts: Optional[Iterable] = None,
     candidates: Optional[Iterable[ModelSpec]] = None,
+    order_source: Optional[str] = None,
 ) -> RoutingDecision:
     canonical_role, _profile, taxonomy = _role_profile(role)
     score_fields = _decision_score_fields(
@@ -1532,6 +1647,11 @@ def _decision(
         receipts=local_receipts,
         candidates=candidates,
     )
+    if order_source:
+        score_fields["score_source"] = order_source
+        provenance = dict(score_fields.get("score_provenance") or {})
+        provenance["order_source"] = order_source
+        score_fields["score_provenance"] = provenance
     return RoutingDecision(
         model=pick,
         policy=policy,

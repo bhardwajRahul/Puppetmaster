@@ -658,6 +658,8 @@ def _run_models_subcommand(args) -> int:
 
     if args.models_command == "import-baseline":
         return _run_models_import_baseline(args, path)
+    if args.models_command == "import-observations":
+        return _run_models_import_observations(args)
 
     raise SystemExit(f"unknown models subcommand: {args.models_command}")
 
@@ -759,6 +761,40 @@ def _run_models_import_baseline(args, path: Path) -> int:
         print(f"  skipped_adapter_mismatch: {skip.get('id')} ({skip.get('reason')})")
     if not dry_run:
         print(f"  wrote {path}")
+    return 0
+
+
+def _run_models_import_observations(args) -> int:
+    """Import a StrongOrc-shaped observation bundle. Never writes capability_score."""
+    from puppetmaster.community_observations import (
+        default_community_observations_path,
+        default_example_bundle_path,
+        import_observations,
+    )
+
+    bundle_path = Path(args.path) if args.path else default_example_bundle_path()
+    store_path = (
+        Path(args.store_path) if getattr(args, "store_path", None) else default_community_observations_path()
+    )
+    dry_run = bool(getattr(args, "dry_run", False))
+    try:
+        observations, report = import_observations(
+            bundle_path, store_path, dry_run=dry_run
+        )
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"import-observations{' (dry-run)' if dry_run else ''}: "
+        f"count={report['count']} store={report['store']}"
+    )
+    for item in observations:
+        print(
+            f"  {item.registry_id} adapter={item.adapter} role={item.role} "
+            f"effort={item.effort} pass_rate={item.pass_rate:g}"
+        )
+    if not dry_run:
+        print(f"  wrote {store_path}")
     return 0
 
 

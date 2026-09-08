@@ -1,3 +1,14 @@
+## v1.27.0 — 2026-09-08
+
+**Community observations are order, not capability (#138).**
+
+- Add a versioned observation store (`models import-observations`) that never writes `capability_score` or role cards.
+- After availability and the existing sufficiency floor, apply StrongOrc's gated order (unique winner only on a 0.10 mean delta whose paired CI does not cover 0).
+- Join on exact identity: registry id + adapter + effort + mapped worker role. Orchestrator-track rows cannot map onto implement/explore/review/audit/plan.
+- Keep user role preference (`role-preferences.json`) as a separate sort/filter. Soft orders among sufficient models; strict fail-closes. Preference never rewrites evidence.
+- Stamp ROUTING `score_source` as `community_observation` or `preference` when that layer picked the winner. The 0–100 authority number stays the existing card/receipt/manual score.
+- Credit @kbentonferguson for the StrongOrc prior / preference / source-disclosure contract.
+
 ## v1.26.1 — 2026-09-08
 
 **Windows attach retries parent-side source-stamp Access Denied.**
