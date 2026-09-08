@@ -137,6 +137,44 @@ class TaskStatus(StringEnum):
     FAILED = "failed"
 
 
+class IllegalTaskStatusTransition(ValueError):
+    """A task status write used an edge that the lifecycle map rejects."""
+
+
+LEGAL_TASK_TRANSITIONS = {
+    TaskStatus.BLOCKED: frozenset({TaskStatus.QUEUED, TaskStatus.FAILED}),
+    TaskStatus.QUEUED: frozenset(
+        {
+            TaskStatus.RUNNING,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+            TaskStatus.COMPLETE,
+        }
+    ),
+    TaskStatus.RUNNING: frozenset(
+        {
+            TaskStatus.COMPLETE,
+            TaskStatus.FAILED,
+            TaskStatus.QUEUED,
+            TaskStatus.BLOCKED,
+        }
+    ),
+    TaskStatus.COMPLETE: frozenset({TaskStatus.QUEUED, TaskStatus.FAILED}),
+    TaskStatus.FAILED: frozenset({TaskStatus.QUEUED, TaskStatus.COMPLETE}),
+}
+
+
+def assert_legal_task_transition(current: TaskStatus, nxt: TaskStatus) -> None:
+    """Idempotent same-status writes pass; unknown edges raise."""
+    if current == nxt:
+        return
+    allowed = LEGAL_TASK_TRANSITIONS.get(current, frozenset())
+    if nxt not in allowed:
+        raise IllegalTaskStatusTransition(
+            f"illegal task status transition: {current} -> {nxt}"
+        )
+
+
 class ArtifactType(StringEnum):
     FINDING = "finding"
     DECISION = "decision"

@@ -35,6 +35,7 @@ from puppetmaster.models import (
     Task,
     TaskStatus,
     artifact_from_dict,
+    assert_legal_task_transition,
     is_cost_final_job_status,
     graph_edge_from_dict,
     job_from_dict,
@@ -1191,6 +1192,7 @@ class SwarmStore(StoreContracts):
         lease_id: Optional[str] = None,
     ) -> Task:
         stored = self.get_task_by_id(task.id)
+        assert_legal_task_transition(stored.status, status)
         # The caller carries the lease token granted at claim time; default to
         # the claimed task's own ``lease_id`` so existing call sites fence
         # correctly without having to thread the token through explicitly.
