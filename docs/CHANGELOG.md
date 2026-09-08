@@ -1,3 +1,11 @@
+## v1.26.1 — 2026-09-08
+
+**Windows attach retries parent-side source-stamp Access Denied.**
+
+- Treat `CreateFileW` / `GetFileInformationByHandleEx` WinError 5/32/33 as `source_open_contention` in `source_stamp()`.
+- Retry those `OSError`s on `attach_binding` / `launch_binding` inside the existing deadline. Ordinary short reads stay fail-fast.
+- Remove the duplicate in-workflow attach-herd canary. `windows-store.yml` already owns that signal; CI discover still runs the herd test.
+
 ## v1.26.0 — 2026-09-08
 
 **Control-plane kernel: budget-closed enqueue, capability claim, legal transitions, prerun skip, working duration.**
