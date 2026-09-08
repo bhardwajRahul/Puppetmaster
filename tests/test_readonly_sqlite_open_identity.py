@@ -16,6 +16,8 @@ import hermetic_env  # noqa: F401
 from puppetmaster import readonly
 from puppetmaster import readonly_worker as worker
 from puppetmaster.sqlite_store import SQLiteSwarmStore
+from puppetmaster.store import SwarmStore
+from puppetmaster.store_factory import create_store
 
 
 class SQLiteOpenIdentityTests(unittest.TestCase):
@@ -245,6 +247,45 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
             with patch.object(readonly, 'source_stamp', flaky):
                 with readonly.connect(store, attach_binding=True, timeout=2) as connection:
                     self.assertEqual(connection.execute('SELECT 42').fetchone()[0], 42)
+        self.assertGreaterEqual(calls['n'], 2)
+
+    def test_ordinary_connect_does_not_retry_parent_source_stamp_access_denied(self):
+        denied = PermissionError('Access is denied')
+        denied.winerror = 5
+        denied.source_open_contention = True
+        calls = {'n': 0}
+
+        def denied_once(path=None, *, fd=None):
+            calls['n'] += 1
+            raise denied
+
+        with TemporaryDirectory() as directory:
+            store = SQLiteSwarmStore(directory)
+            store.ensure_schema()
+            store.attach()
+            with patch.object(readonly, 'source_stamp', denied_once):
+                with self.assertRaises(PermissionError):
+                    readonly.connect(store, timeout=2)
+        self.assertEqual(calls['n'], 1)
+
+    def test_file_attach_incarnation_retries_parent_source_stamp_access_denied(self):
+        denied = PermissionError('Access is denied')
+        denied.winerror = 5
+        denied.source_open_contention = True
+        calls = {'n': 0}
+        real = readonly.source_stamp
+
+        def flaky(path=None, *, fd=None):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise denied
+            return real(path, fd=fd)
+
+        with TemporaryDirectory() as directory:
+            SwarmStore(directory).init()
+            with patch.object(readonly, 'source_stamp', flaky):
+                store = create_store('file', directory, mode='attach')
+                self.assertIsNotNone(store.incarnation)
         self.assertGreaterEqual(calls['n'], 2)
 
     def test_windows_guard_sharing_denial_closes_session_and_reuses_helper(self):

@@ -2451,9 +2451,10 @@ class SwarmStore(StoreContracts):
         deadline = time.monotonic() + 5
         while True:
             try:
-                with connection(self, metadata_only=True) as c:
+                with connection(self, metadata_only=True, attach_binding=True) as c:
                     return read_identity(c, self.backend_name)
-            except (sqlite3.OperationalError, ReadUnavailable) as exc:
+            except (sqlite3.OperationalError, ReadUnavailable, OSError) as exc:
+                from puppetmaster.readonly import _source_open_contention
                 transient = (
                     isinstance(exc, sqlite3.OperationalError)
                     and str(exc) == 'database is locked'
@@ -2461,6 +2462,10 @@ class SwarmStore(StoreContracts):
                     isinstance(exc, ReadUnavailable)
                     and any(reason in str(exc)
                             for reason in ('source changed', 'active reader', 'live sidecars'))
+                ) or (
+                    isinstance(exc, OSError)
+                    and not isinstance(exc, FileNotFoundError)
+                    and _source_open_contention(exc)
                 )
                 if not transient or time.monotonic() >= deadline:
                     raise

@@ -302,14 +302,16 @@ def _reserve_writer(c, timeout=5.0):
 
 
 @contextmanager
-def connection(store, *, metadata_only=False, launch_binding=False, write=False):
+def connection(store, *, metadata_only=False, launch_binding=False, attach_binding=False, write=False):
     if metadata_only:
         from puppetmaster.readonly import connect, selection
         from puppetmaster.identity import StoreIdentityError
         active = getattr(getattr(store, '_completion_connection', None), 'connection', None)
         if active is not None and selection(store) != store._read_selection:
             raise StoreIdentityError("store replaced during supervisor transaction")
-        c = active if active is not None else connect(store, timeout=5, reuse=True, launch_binding=launch_binding)
+        c = active if active is not None else connect(
+            store, timeout=5, reuse=True, launch_binding=launch_binding, attach_binding=attach_binding,
+        )
         c.row_factory = sqlite3.Row
         try:
             from puppetmaster.identity import read_identity, StoreIdentityError, legacy_schema
