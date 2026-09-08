@@ -34,6 +34,7 @@ from puppetmaster.models import (
     MemoryRecord,
     Task,
     TaskStatus,
+    apply_running_duration,
     artifact_from_dict,
     assert_legal_task_transition,
     is_cost_final_job_status,
@@ -1215,9 +1216,10 @@ class SwarmStore(StoreContracts):
 
     @staticmethod
     def _build_status_update(stored: Task, status: TaskStatus) -> Task:
+        timed = apply_running_duration(stored, status)
         terminal = task_is_terminal(status)
         return replace(
-            stored,
+            timed,
             status=status,
             lease_owner=None if terminal else stored.lease_owner,
             lease_expires_at=None if terminal else stored.lease_expires_at,
@@ -1359,14 +1361,16 @@ class SwarmStore(StoreContracts):
         if task.status == TaskStatus.RUNNING and self._has_pending_completion(task):
             return True
         if not self.dependencies_complete(task, task_map=task_map):
-            blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
+            blocked = apply_running_duration(task, TaskStatus.BLOCKED)
+            blocked = replace(blocked, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
             return True
         if task.status == TaskStatus.COMPLETE:
             return True
         if task.attempts >= self.max_task_attempts:
+            failed = apply_running_duration(task, TaskStatus.FAILED)
             failed = replace(
-                task,
+                failed,
                 status=TaskStatus.FAILED,
                 lease_owner=None,
                 lease_expires_at=None,
@@ -1444,8 +1448,9 @@ class SwarmStore(StoreContracts):
 
     @staticmethod
     def _build_claimed_task(task: Task, worker_id: str, lease_seconds: int) -> Task:
+        timed = apply_running_duration(task, TaskStatus.RUNNING)
         return replace(
-            task,
+            timed,
             status=TaskStatus.RUNNING,
             attempts=task.attempts + 1,
             generation=(task.generation or 0) + 1,
@@ -1629,8 +1634,9 @@ class SwarmStore(StoreContracts):
 
     @staticmethod
     def _build_recovered_task(task: Task) -> Task:
+        timed = apply_running_duration(task, TaskStatus.QUEUED)
         return replace(
-            task,
+            timed,
             status=TaskStatus.QUEUED,
             lease_owner=None,
             lease_expires_at=None,

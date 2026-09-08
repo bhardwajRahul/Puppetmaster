@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional, Union
@@ -278,9 +278,47 @@ class Task:
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     completed_at: Optional[str] = None
+    claimed_at: Optional[str] = None
+    working_seconds: float = 0.0
 
     # New task/claim/reset epoch. Missing historical epochs stay unknown.
     generation: Optional[int] = 0
+
+
+def apply_running_duration(
+    task: Task, next_status: TaskStatus, *, now: Optional[str] = None
+) -> Task:
+    """Fold ``now - claimed_at`` when leaving RUNNING; stamp claim when entering."""
+    stamp = now or now_iso()
+    extra = 0.0
+    claimed_at = task.claimed_at
+    if task.status == TaskStatus.RUNNING and next_status != TaskStatus.RUNNING:
+        if claimed_at:
+            try:
+                extra = max(0.0, (parse_iso(stamp) - parse_iso(claimed_at)).total_seconds())
+            except (TypeError, ValueError):
+                extra = 0.0
+        claimed_at = None
+    elif next_status == TaskStatus.RUNNING and task.status != TaskStatus.RUNNING:
+        claimed_at = stamp
+    return replace(
+        task,
+        claimed_at=claimed_at,
+        working_seconds=round(float(task.working_seconds or 0.0) + extra, 3),
+    )
+
+
+def task_working_seconds(task: Task, *, now: Optional[str] = None) -> float:
+    """Persisted working time plus the open RUNNING slice, if any."""
+    base = float(getattr(task, "working_seconds", 0.0) or 0.0)
+    claimed_at = getattr(task, "claimed_at", None)
+    if getattr(task, "status", None) == TaskStatus.RUNNING and claimed_at:
+        stamp = now or now_iso()
+        try:
+            base += max(0.0, (parse_iso(stamp) - parse_iso(claimed_at)).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    return round(base, 3)
 
 
 @dataclass(frozen=True)
@@ -540,6 +578,8 @@ def task_from_dict(data: dict[str, Any]) -> Task:
         created_at=data["created_at"],
         updated_at=data.get("updated_at", data["created_at"]),
         completed_at=data.get("completed_at"),
+        claimed_at=data.get("claimed_at"),
+        working_seconds=float(data.get("working_seconds") or 0.0),
     )
 
 

@@ -942,6 +942,10 @@ def _run_receipt_command(args, store) -> int:
     print(f"job {receipt['job_id']}: receipt")
     if receipt.get("elapsed_seconds") is not None:
         print(f"  elapsed: {receipt['elapsed_seconds']}s")
+    if receipt.get("working_seconds") is not None:
+        print(f"  working: {receipt['working_seconds']}s")
+    if receipt.get("parked_seconds") is not None:
+        print(f"  parked: {receipt['parked_seconds']}s")
     tasks = receipt["tasks"]
     artifacts = receipt["artifacts"]
     signals = receipt["signals"]
