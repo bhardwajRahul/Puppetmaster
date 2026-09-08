@@ -37,6 +37,8 @@ from puppetmaster.models import (
     artifact_from_dict,
     assert_legal_task_transition,
     is_cost_final_job_status,
+    task_is_satisfied,
+    task_is_terminal,
     graph_edge_from_dict,
     job_from_dict,
     make_graph_edge,
@@ -1198,7 +1200,7 @@ class SwarmStore(StoreContracts):
         # correctly without having to thread the token through explicitly.
         expected_lease = lease_id if lease_id is not None else task.lease_id
         updated = self._build_status_update(stored, status)
-        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        terminal = task_is_terminal(status)
         if terminal and worker_id is not None and not self._lease_matches(
             stored, worker_id, expected_lease
         ):
@@ -1213,7 +1215,7 @@ class SwarmStore(StoreContracts):
 
     @staticmethod
     def _build_status_update(stored: Task, status: TaskStatus) -> Task:
-        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        terminal = task_is_terminal(status)
         return replace(
             stored,
             status=status,
@@ -1221,7 +1223,7 @@ class SwarmStore(StoreContracts):
             lease_expires_at=None if terminal else stored.lease_expires_at,
             lease_id=None if terminal else stored.lease_id,
             updated_at=now_iso(),
-            completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
+            completed_at=now_iso() if task_is_satisfied(status) else stored.completed_at,
         )
 
     def _atomic_status_update(
@@ -1677,7 +1679,7 @@ class SwarmStore(StoreContracts):
                     dependency = self.get_task_by_id(dependency_id)
                 except FileNotFoundError:
                     return False
-            if dependency.status != TaskStatus.COMPLETE:
+            if not task_is_satisfied(dependency.status):
                 return False
         return True
 
@@ -3289,7 +3291,7 @@ class SwarmStore(StoreContracts):
             job.status,
             quality=quality.get("quality"),
             stale_tasks=stale,
-            incomplete_tasks=any(task.status != TaskStatus.COMPLETE for task in tasks),
+            incomplete_tasks=any(not task_is_satisfied(task.status) for task in tasks),
             required_artifacts=bool(artifacts),
         )
 
@@ -3426,7 +3428,9 @@ class SwarmStore(StoreContracts):
         }
 
     def has_incomplete_tasks(self, job_id: str) -> bool:
-        return any(task.status != TaskStatus.COMPLETE for task in self.list_tasks(job_id))
+        return any(
+            not task_is_satisfied(task.status) for task in self.list_tasks(job_id)
+        )
 
     def list_memory(self) -> list[dict[str, Any]]:
         self.init()

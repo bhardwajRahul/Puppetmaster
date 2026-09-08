@@ -25,6 +25,7 @@ from puppetmaster.models import (
     artifact_from_dict,
     assert_legal_task_transition,
     graph_edge_from_dict,
+    task_is_terminal,
     is_cost_final_job_status,
     job_from_dict,
     make_graph_edge,
@@ -872,7 +873,7 @@ class SQLiteSwarmStore(SwarmStore):
         assert_legal_task_transition(stored.status, status)
         expected_lease = lease_id if lease_id is not None else task.lease_id
         updated = self._build_status_update(stored, status)
-        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        terminal = task_is_terminal(status)
         if terminal and worker_id is not None and not self._lease_matches(
             stored, worker_id, expected_lease
         ):

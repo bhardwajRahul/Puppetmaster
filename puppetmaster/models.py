@@ -135,6 +135,31 @@ class TaskStatus(StringEnum):
     RUNNING = "running"
     COMPLETE = "complete"
     FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+TERMINAL_TASK_STATUSES = frozenset(
+    {TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.SKIPPED}
+)
+SATISFIED_TASK_STATUSES = frozenset({TaskStatus.COMPLETE, TaskStatus.SKIPPED})
+
+
+def task_is_terminal(status: TaskStatus) -> bool:
+    """True when the task will do no more work unless an operator resets it."""
+    try:
+        status = status if isinstance(status, TaskStatus) else TaskStatus(status)
+    except ValueError:
+        return False
+    return status in TERMINAL_TASK_STATUSES
+
+
+def task_is_satisfied(status: TaskStatus) -> bool:
+    """True when dependents may treat this task as finished successfully."""
+    try:
+        status = status if isinstance(status, TaskStatus) else TaskStatus(status)
+    except ValueError:
+        return False
+    return status in SATISFIED_TASK_STATUSES
 
 
 class IllegalTaskStatusTransition(ValueError):
@@ -149,6 +174,7 @@ LEGAL_TASK_TRANSITIONS = {
             TaskStatus.BLOCKED,
             TaskStatus.FAILED,
             TaskStatus.COMPLETE,
+            TaskStatus.SKIPPED,
         }
     ),
     TaskStatus.RUNNING: frozenset(
@@ -157,10 +183,12 @@ LEGAL_TASK_TRANSITIONS = {
             TaskStatus.FAILED,
             TaskStatus.QUEUED,
             TaskStatus.BLOCKED,
+            TaskStatus.SKIPPED,
         }
     ),
     TaskStatus.COMPLETE: frozenset({TaskStatus.QUEUED, TaskStatus.FAILED}),
     TaskStatus.FAILED: frozenset({TaskStatus.QUEUED, TaskStatus.COMPLETE}),
+    TaskStatus.SKIPPED: frozenset({TaskStatus.QUEUED}),
 }
 
 

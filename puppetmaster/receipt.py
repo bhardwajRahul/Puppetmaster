@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Optional
 
-from puppetmaster.models import Artifact, ArtifactType, parse_iso
+from puppetmaster.models import Artifact, ArtifactType, parse_iso, task_is_satisfied
 from puppetmaster.consumption import build_attempt_consumption_report
 from puppetmaster.usage import aggregate_token_usage
 from puppetmaster.scm_observe import derive_attention
@@ -48,6 +48,7 @@ def build_job_receipt(store: Any, job_id: str) -> dict[str, Any]:
             "total": len(tasks),
             "complete": _task_status_count(tasks, "complete"),
             "failed": _task_status_count(tasks, "failed"),
+            "skipped": _task_status_count(tasks, "skipped"),
             "blocked": _task_status_count(tasks, "blocked"),
             "degraded": len(degraded_tasks),
         },
@@ -99,7 +100,7 @@ def _delivery(store: Any, job_id: str, tasks: list[Any], artifacts: list[Artifac
         store.get_job(job_id).status,
         quality=quality.get("quality"),
         stale_tasks=stale,
-        incomplete_tasks=any(str(task.status) != "complete" for task in tasks),
+        incomplete_tasks=any(not task_is_satisfied(task.status) for task in tasks),
         required_artifacts=bool(artifacts),
     )
 

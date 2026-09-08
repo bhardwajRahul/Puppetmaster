@@ -8,7 +8,13 @@ from contextlib import contextmanager
 from puppetmaster.contracts import (
     CancellationReceipt, ContractConflict, EffectReceipt, TaskBinding, immutable_digest,
 )
-from puppetmaster.models import JobRef, TaskStatus, is_terminal_job_status, to_jsonable
+from puppetmaster.models import (
+    JobRef,
+    TaskStatus,
+    is_terminal_job_status,
+    task_is_terminal,
+    to_jsonable,
+)
 from puppetmaster.projections import connection
 
 
@@ -91,7 +97,7 @@ class StoreContracts:
             if any(b.generation is None or task_binding(t) != b for t, b in zip(tasks, bindings)):
                 outcome = "stale_binding"
             elif is_terminal_job_status(self.get_job(job_ref.job_id).status) or all(
-                    t.status in (TaskStatus.COMPLETE, TaskStatus.FAILED) for t in tasks):
+                    task_is_terminal(t.status) for t in tasks):
                 outcome = "already_terminal"
             else:
                 outcome = "requested"
@@ -102,7 +108,7 @@ class StoreContracts:
                     c.execute("INSERT INTO cancellation_targets VALUES(?,?,?,?,?,?,?,?)",
                               (job_ref.job_id, b.task_id, b.generation, b.lease_id or "",
                                b.owner or "", request_id, immutable_digest(b),
-                               int(task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED))))
+                               int(task_is_terminal(task.status))))
             return receipt
 
     def get_cancellation_receipt(self, job_ref, request_id):
