@@ -197,7 +197,9 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
     def test_windows_initial_stamp_access_denial_is_retryable_contention(self):
         denied = PermissionError('Access is denied')
         denied.winerror = 5
+        native_path = type(Path())
         with patch.object(worker, 'stamps', side_effect=denied), \
+                patch.object(worker, 'Path', native_path), \
                 patch.object(worker.os, 'name', 'nt'):
             with self.assertRaises(PermissionError) as caught:
                 worker.main('source.sqlite3')
