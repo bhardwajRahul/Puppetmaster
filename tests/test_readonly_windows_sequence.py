@@ -202,7 +202,7 @@ class WindowsSequenceTests(unittest.TestCase):
             self.assertEqual([request['wal_snapshot'] for request in requests], [False, True])
             connection.close()
 
-    def test_windows_attach_retries_transient_guard_open_denial(self):
+    def assert_guard_open_denial_retried(self, **binding):
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(tmp)
             store.ensure_schema()
@@ -240,11 +240,17 @@ class WindowsSequenceTests(unittest.TestCase):
                     patch.object(readonly, 'source_stamp', return_value=(1, 2, 3, 4, 5)), \
                     patch.object(readonly, '_source_stamp', return_value=(
                         (1, 2, 3, 4, 5), None, None, None, None, None)):
-                connection = readonly.ReadConnection(
-                    store, 1, attach_binding=True, attach_deadline=time.monotonic() + 1)
+                connection = readonly.ReadConnection(store, 1, **binding)
             requests = connection.process.stdin.getvalue().splitlines()
             self.assertEqual(len(requests), 2)
             connection.close()
+
+    def test_windows_attach_retries_transient_guard_open_denial(self):
+        self.assert_guard_open_denial_retried(
+            attach_binding=True, attach_deadline=time.monotonic() + 1)
+
+    def test_windows_launch_retries_transient_guard_open_denial(self):
+        self.assert_guard_open_denial_retried(launch_binding=True)
 
 
 if __name__ == '__main__':
