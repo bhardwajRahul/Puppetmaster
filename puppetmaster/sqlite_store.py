@@ -267,7 +267,9 @@ class SQLiteSwarmStore(SwarmStore):
                     raise
                 # The helper already exhausted any proven write retry. A fresh
                 # binding must not erase an unproven source-change rejection.
-                if isinstance(exc, ReadUnavailable) and "source changed" in str(exc):
+                if (isinstance(exc, ReadUnavailable)
+                        and "source changed" in str(exc)
+                        and not getattr(exc, "source_open_contention", False)):
                     raise
                 if not locked and not isinstance(exc, ReadUnavailable):
                     raise

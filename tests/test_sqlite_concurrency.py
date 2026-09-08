@@ -99,6 +99,33 @@ class SqliteAttachEnsureTests(unittest.TestCase):
             job = store.create_job("after attach")
             self.assertEqual(store.get_job(job.id).goal, "after attach")
 
+    def test_attach_retries_proven_windows_source_open_contention(self) -> None:
+        from puppetmaster.readonly import ReadUnavailable
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            SQLiteSwarmStore(root).ensure_schema()
+            store = SQLiteSwarmStore(root)
+            original_connect = store._connect_readonly
+            denied = ReadUnavailable(
+                "unable to open database: source changed or unavailable: "
+                "[WinError 5] Access is denied."
+            )
+            denied.source_open_contention = True
+            calls = 0
+
+            def connect(*args: object, **kwargs: object):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise denied
+                return original_connect(*args, **kwargs)
+
+            with mock.patch.object(store, "_connect_readonly", side_effect=connect), \
+                    mock.patch.object(store, "_sleep_lock_backoff"):
+                store.attach()
+            self.assertEqual(calls, 2)
+
     def test_concurrent_attach_never_writes_schema(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / ".puppetmaster"
