@@ -11,7 +11,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Mapping, Optional, Union
 
 from puppetmaster.budget import (
     BudgetAdmissionError,
@@ -235,6 +235,43 @@ def _prepare_for_persistence(value: Any) -> Any:
 
 
 from puppetmaster.store_contracts import StoreContracts
+
+
+def _capability_values(value: Any) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def task_matches_capabilities(
+    task: Task,
+    capabilities: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when a worker's advertised adapters/labels can execute ``task``.
+
+    Omitted ``capabilities`` matches everything (legacy workers). An explicit
+    empty ``adapters`` list matches nothing. Placement is optional: a task
+    without ``payload.placement`` / ``payload.required_labels`` is unscoped.
+    """
+    if not capabilities:
+        return True
+    adapters = _capability_values(capabilities.get("adapters"))
+    if adapters is not None and str(task.adapter or "local") not in adapters:
+        return False
+    labels = _capability_values(capabilities.get("labels"))
+    if labels is not None:
+        required = _capability_values(
+            (task.payload or {}).get("placement")
+            or (task.payload or {}).get("required_labels")
+        )
+        if required and not set(required).intersection(labels):
+            return False
+    return True
 
 
 class SwarmStore(StoreContracts):
@@ -1492,7 +1529,53 @@ class SwarmStore(StoreContracts):
         worker_id: str,
         role: Optional[str] = None,
         lease_seconds: int = 60,
+        capabilities: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Task]:
+        for task, task_map in self._iter_claim_candidates(
+            job_id,
+            worker_id,
+            role=role,
+            capabilities=capabilities,
+            persist_blocked=True,
+        ):
+            claimed = self.claim_task(
+                task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
+            )
+            if claimed is not None:
+                return claimed
+        return None
+
+    def peek_next_task(
+        self,
+        job_id: str,
+        worker_id: str,
+        role: Optional[str] = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Task]:
+        """Return the next claimable task without taking a lease or flipping status.
+
+        Blocked dependents stay queued in the peek path so a liveness probe
+        cannot mutate the job. Candidate order matches ``claim_next_task``.
+        """
+        for task, _task_map in self._iter_claim_candidates(
+            job_id,
+            worker_id,
+            role=role,
+            capabilities=capabilities,
+            persist_blocked=False,
+        ):
+            return task
+        return None
+
+    def _iter_claim_candidates(
+        self,
+        job_id: str,
+        worker_id: str,
+        role: Optional[str] = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
+        *,
+        persist_blocked: bool,
+    ) -> Iterable[tuple[Task, dict[str, Task]]]:
         # Unblock is a supervisor tick (recover/refresh loops), not a claim side
         # effect. Workers must not refresh_blocked_tasks on every claim.
         # Load the job's tasks once and resolve dependency status from the
@@ -1513,18 +1596,14 @@ class SwarmStore(StoreContracts):
             if task.status != TaskStatus.QUEUED:
                 continue
             if not self.dependencies_complete(task, task_map=task_map):
-                self.save_task(replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso()))
+                if persist_blocked:
+                    self.save_task(replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso()))
                 continue
             if role is not None and task.role != role:
                 continue
-            # claim_task acquires the per-task lock internally so direct callers
-            # are race-safe without requiring claim_next_task's sweep wrapper.
-            claimed = self.claim_task(
-                task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
-            )
-            if claimed is not None:
-                return claimed
-        return None
+            if not task_matches_capabilities(task, capabilities):
+                continue
+            yield task, task_map
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
         self.reconcile_completions(job_id)
