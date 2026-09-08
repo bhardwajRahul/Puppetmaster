@@ -236,7 +236,10 @@ def attest_linux_database(before, source_fd):
 def main(path, *, wal_snapshot=False):
     path = Path(path)
     wal_snapshot = bool(wal_snapshot and os.name == 'nt')
-    before = stamps(path)
+    try:
+        before = stamps(path)
+    except OSError as exc:
+        raise _retryable_windows_contention(exc)
     if before[0] is None:
         emit(dict(kind='unavailable', error='unable to open database: source missing'))
         return

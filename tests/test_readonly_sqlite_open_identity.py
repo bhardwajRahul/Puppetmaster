@@ -194,6 +194,15 @@ class SQLiteOpenIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, 'sharing violation'):
                 worker.open_windows_source('source.sqlite3')
 
+    def test_windows_initial_stamp_access_denial_is_retryable_contention(self):
+        denied = PermissionError('Access is denied')
+        denied.winerror = 5
+        with patch.object(worker, 'stamps', side_effect=denied), \
+                patch.object(worker.os, 'name', 'nt'):
+            with self.assertRaises(PermissionError) as caught:
+                worker.main('source.sqlite3')
+        self.assertTrue(caught.exception.source_open_contention)
+
     def test_windows_guard_sharing_denial_closes_session_and_reuses_helper(self):
         denied = PermissionError('Access is denied')
         denied.winerror = 5
