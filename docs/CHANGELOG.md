@@ -1,3 +1,12 @@
+## v1.27.3 — 2026-09-09
+
+**Classify Codex spend-cap turn failures as billing_or_quota (#161).**
+
+- Map workspace `spend cap` Codex `turn.failed` output to `billing_or_quota` so
+  the existing worker-runtime / router fallback path can recover (instead of
+  stuck `codex_turn_failed`).
+- Credit @kbentonferguson.
+
 ## v1.27.2 — 2026-09-09
 
 **Dashboard: never paint Marionette provenance JSON as the job title.**
