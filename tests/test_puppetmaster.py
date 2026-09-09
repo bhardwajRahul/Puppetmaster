@@ -7397,6 +7397,44 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(verification.payload["failure"], "timeout")
         self.assertEqual(verification.payload["live_log"], "/tmp/codex_exec_live.log")
 
+    def test_codex_adapter_classifies_turn_failed_spend_cap_as_billing_or_quota(self) -> None:
+        message = (
+            "You hit your spend cap set by the owner of your workspace. "
+            "Ask an owner to increase your spend cap to continue."
+        )
+        streamed = StreamedProcess(
+            returncode=1,
+            stdout="\n".join(
+                [
+                    json.dumps({"type": "thread.started", "thread_id": "th_spend_cap"}),
+                    json.dumps({"type": "turn.started"}),
+                    json.dumps({"type": "error", "message": message}),
+                    json.dumps({"type": "turn.failed", "error": {"message": message}}),
+                ]
+            ),
+            stderr="",
+            timed_out=False,
+            live_log_path="/tmp/codex_exec_live.log",
+        )
+        task = Task(
+            id="t-codex-spend-cap",
+            job_id="job-codex-spend-cap",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "read-only", "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch("puppetmaster.adapters.run_streamed_subprocess", return_value=streamed):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "failed")
+        self.assertEqual(verification.payload["failure"], "billing_or_quota")
+        self.assertEqual(verification.payload["turn_failure_message"], message)
+
     def test_codex_adapter_bypassed_read_only_uses_worktree_guard(self) -> None:
         from puppetmaster.adapters import verification_artifact
 
