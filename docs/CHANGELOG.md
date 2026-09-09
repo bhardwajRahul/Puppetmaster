@@ -1,3 +1,12 @@
+## v1.27.4 — 2026-09-09
+
+**Same-job continuous planner: intent before fan-out, typed handoffs, kernel requeue.**
+
+- Opt-in `role=planner` / `payload.continuous_planner` stays in the same job. The planner does not code; it emits `intent_spec` then bounded `enqueue_subtasks`. Nested job starts stay refused.
+- Fan-out without a job `intent_spec` decision is refused (`intent_spec_required`). With intent, planner follow-up limit rises to the spec's `fanout_max` (default cap 20) instead of the four-child default. Planner parents also get a matching child-count ceiling so an 8–20 worker wave still leaves a slot for the next planner iteration.
+- FINDING/PATCH handoffs carry `done`, `deviations`, and `concerns` (empty lists allowed). When non-planner children finish, the kernel requeues the planner with those handoffs; `kind=scope_complete` stops the loop.
+- Prompt contract: constraints (no TODOs / no partial implementations) sit with the artifact types; the planner contract is injected after `Your task:` so the shared prefix stays cacheable.
+
 ## v1.27.3 — 2026-09-09
 
 **Classify Codex spend-cap turn failures as billing_or_quota (#161).**

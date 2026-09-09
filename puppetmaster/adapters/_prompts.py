@@ -50,9 +50,10 @@ _PUPPETMASTER_ARTIFACT_CONTRACT_LINES = (
     "Return only JSON, with no markdown wrapper, in this shape:",
     '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
     "Allowed artifact types:",
-    '- finding: requires "claim", "evidence", "confidence".',
+    '- finding: requires "claim", "evidence", "confidence". Also "done" (short what you finished), "deviations" (list of strings), "concerns" (list of strings). Empty lists are allowed.',
     '- risk: requires "risk", "mitigation", "evidence", "confidence".',
     '- decision: requires "decision", "why", "evidence", "confidence".',
+    "Constraints beat reminders: No TODOs, no partial implementations. Do not instruct for generic engineering the model already knows — only this repo's tests, deploy, and forbidden deps.",
 )
 
 
@@ -223,6 +224,19 @@ def build_structured_prompt(
     return "\n".join(lines)
 
 
+_PLANNER_TASK_CONTRACT = (
+    "You are the planner for this job. Do not write code. Do not edit files. "
+    "You own the scope: emit an intent_spec decision (architecture, out_of_scope, "
+    "dependency_philosophy, resource_timeouts, fanout_min, fanout_max) before any "
+    "worker fan-out. Then emit 8-20 disjoint same-job tasks via enqueue_subtasks "
+    "on a finding (numeric range, not 'many'). Workers are unaware of you; they "
+    "return one handoff (done, deviations, concerns). After they finish you will "
+    "run again. Before kind=scope_complete, enqueue a snapshot-lane task to take "
+    "a green fixup pass. Constraints: no TODOs, no partial implementations, no "
+    "nested job starts, no worker-to-worker coordination."
+)
+
+
 def structured_prompt_for_task(
     task: Task,
     *,
@@ -236,13 +250,17 @@ def structured_prompt_for_task(
     later re-anchor pass.
     """
     from puppetmaster.acceptance_criteria import acceptance_criteria_for_task
+    from puppetmaster.continuous_plan import is_planner_task
 
     if prompt is None:
         base = task.payload.get("prompt") or task.instruction
     else:
         base = prompt
+    body = str(base or "")
+    if is_planner_task(task):
+        body = _PLANNER_TASK_CONTRACT + "\n\n" + body
     return build_structured_prompt(
-        str(base or ""),
+        body,
         final_message_note=final_message_note,
         acceptance_criteria=acceptance_criteria_for_task(task),
     )
@@ -277,6 +295,10 @@ def build_implement_prompt(prompt: str) -> str:
             "tool first with your ordered steps, then update it (in_progress/done) as "
             "you go — it keeps the work organized and shows the user your progress.",
             _HASHLINE_EDIT_RULES,
+            "Constraints: No TODOs, no partial implementations. Stay inside this "
+            "task; do not wander off to fix unrelated failures. Other workers own "
+            "those. End the report with deviations (list) and concerns (list); empty "
+            "lists are allowed.",
             "Keep the change focused on the task; run any obvious local checks you can. "
             "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
             "the working tree containing your final intended changes.",
