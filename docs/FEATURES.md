@@ -103,7 +103,7 @@ Six production adapters live plus the keys-only `agentic` standalone worker; cur
 | CodeGraph | Optional shared repo intelligence ([docs](CODEGRAPH.md)) |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
 | Reproducible benchmarks | Six harnesses in [`bench/`](../bench/), each with markdown + JSON receipts under `bench/results/` |
-| Local dashboard (v0.9.0+) | `puppetmaster dashboard [<job_id>]` — zero-dependency live web board (task graph, typed artifacts, cost, auto-fallback reroutes, alerts) served from durable state; no OTLP collector required |
+| Local dashboard (v0.9.0+) | `puppetmaster dashboard [<job_id>]` — zero-dependency live web board (task graph, typed artifacts, cost, auto-fallback reroutes, alerts) served from durable state; no OTLP collector required. Host panes use `/?job=<id>&embed=1` to hide chrome. |
 | Shared verified context (v1.22.2+) | DeLM-inspired durable gists: admission-gated peer injection, selective gist→summary→raw unfold, bounded adaptive `enqueue_subtask`, dashboard **Frontier** + Gists panel; compounds with SQLite artifacts / provenance edges |
 | Cross-platform CI | GitHub Actions matrix runs the full suite on Linux / macOS / Windows (Python 3.9 + 3.12), **all three required and green.** Getting Windows there fixed real defects: a leaked sqlite handle (Windows mandatory locks), POSIX-mode path splitting that mangled `C:\…` executables, a `fcntl`-only CodeGraph lock that was a no-op on Windows (now `msvcrt`), and a `doctor` that could crash on a bad CLI shim |
 | AWS Bedrock agentic (v1.19.0+) | First-class `provider=bedrock` via stdlib Converse API (IAM/BYOK); live account model discovery; prompt-cache and token/cost parity with other providers (v1.19.1+) |

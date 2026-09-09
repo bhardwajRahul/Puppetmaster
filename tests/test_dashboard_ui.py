@@ -20,6 +20,40 @@ class DashboardUiTests(unittest.TestCase):
         self.assertNotIn("{{DASHBOARD_CSS}}", INDEX_HTML)
         self.assertNotIn("{{DASHBOARD_JS}}", INDEX_HTML)
         self.assertNotIn("https://", _PAGE_HEAD)
+        self.assertIn("html.embed .rail { display: none; }", INDEX_HTML)
+        self.assertIn("function isEmbedSearch", INDEX_HTML)
+        self.assertIn("jobHref(job.id, embedMode)", INDEX_HTML)
+        self.assertIn("window.setInterval(tick, 1500)", INDEX_HTML)
+
+    def test_embed_query_helpers_parse_job_and_embed_flags(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        from puppetmaster.dashboard import _PAGE_APP_JS
+
+        start = _PAGE_APP_JS.index("function isEmbedSearch")
+        end = _PAGE_APP_JS.index("const qs = new URLSearchParams")
+        prefix = _PAGE_APP_JS[start:end]
+        harness = prefix + r"""
+const assert = require("assert");
+assert.equal(isEmbedSearch("?job=job_1&embed=1"), true);
+assert.equal(isEmbedSearch("?embed=1"), true);
+assert.equal(isEmbedSearch("?embed=true"), true);
+assert.equal(isEmbedSearch("?embed=yes"), true);
+assert.equal(isEmbedSearch("?embed=0"), false);
+assert.equal(isEmbedSearch("?job=job_1"), false);
+assert.equal(isEmbedSearch("?embedded=1"), false);
+assert.equal(isEmbedSearch(""), false);
+assert.equal(jobHref("job_abc", false), "?job=job_abc");
+assert.equal(jobHref("job_abc", true), "?job=job_abc&embed=1");
+assert.equal(jobHref("id&x=1", true), "?job=id%26x%3D1&embed=1");
+console.log("embed-query-ok");
+"""
+        completed = subprocess.run(
+            [node, "-"], input=harness, capture_output=True, encoding="utf-8", timeout=30
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("embed-query-ok", completed.stdout)
 
     def test_snapshot_exposes_only_recorded_task_dependencies(self) -> None:
         from puppetmaster.dashboard import build_job_snapshot

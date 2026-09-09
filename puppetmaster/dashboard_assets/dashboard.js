@@ -1,4 +1,13 @@
+function isEmbedSearch(search) {
+  return /(?:^|[?&])embed=(1|true|yes)\b/i.test(search || "");
+}
+
+function jobHref(id, embed) {
+  return "?job=" + encodeURIComponent(id) + (embed ? "&embed=1" : "");
+}
+
 const qs = new URLSearchParams(location.search);
+const embedMode = isEmbedSearch(location.search);
 let jobId = qs.get("job");
 let activeView = qs.get("view") === "jobs" || !jobId ? "jobs" : "job";
 let activeTab = "overview";
@@ -124,7 +133,7 @@ function renderIndex() {
   } else {
     html += '<div class="run-list">';
     for (const job of shown) {
-      const href = `?job=${encodeURIComponent(job.id)}`;
+      const href = jobHref(job.id, embedMode);
       html += `<a class="run-row" href="${href}" aria-label="Open ${esc(jobHeadline(job))}">${statusLabel(job.status)}<span class="run-name"><strong title="${esc(job.goal)}">${esc(jobHeadline(job))}</strong><span>${esc(job.id)}</span></span><span class="run-project">${esc(job.project || projectLabel(meta) || "Local workspace")}</span><time class="run-time" datetime="${esc(job.created_at || "")}">${esc(fmtAgo(job.created_at))}</time></a>`;
     }
     html += "</div>";

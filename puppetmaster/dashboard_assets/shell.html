@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Puppetmaster</title>
+<script>
+document.documentElement.classList.toggle(
+  "embed",
+  /(?:^|[?&])embed=(1|true|yes)\b/i.test(location.search)
+);
+</script>
 <style>
 {{TOKENS_CSS}}
 {{DASHBOARD_CSS}}
