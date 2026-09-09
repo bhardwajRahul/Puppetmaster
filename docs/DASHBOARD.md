@@ -176,7 +176,7 @@ job view reads cleanly on a phone.
 
 Two views: the **jobs index** (`/`, the default landing on every viewport) and a
 single **job view** (`?job=<id>`). `?view=jobs` forces the index even when a
-stale job id lingers in the URL.
+stale job id lingers in the URL. Host panes can add `embed=1` (see job view).
 
 ### Jobs index (`/`)
 
@@ -185,6 +185,13 @@ newest first, with a status pill, a scannable headline, the job id, and a
 relative timestamp. Filter by status. Click through to a job.
 
 ### Job view (`/?job=<id>`)
+
+Embed mode is the same job view without app chrome:
+`http://127.0.0.1:<port>/?job=<id>&embed=1`. Combine `job` and `embed`; `embed=1`
+(also `true` / `yes`) hides the Puppetmaster rail and stacks the graph +
+inspector for roughly 420–560px, with compact columns around 700px. A sticky
+strip keeps status, a goal one-liner, and selected-model cost visible while
+scrolling.
 
 Top to bottom:
 

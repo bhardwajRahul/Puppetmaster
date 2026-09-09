@@ -127,6 +127,8 @@ puppetmaster artifacts <job_id>
 python -m puppetmaster dashboard
 ```
 
+A host pane (for example Marionette) can load a chrome-free job view at `http://127.0.0.1:<port>/?job=<id>&embed=1`.
+
 [CodeGraph](https://github.com/colbymchenry/codegraph) is an optional structural code index. When installed, Puppetmaster adds task-relevant CodeGraph context before worker calls; otherwise workers use ordinary repository inspection. See [CODEGRAPH.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CODEGRAPH.md).
 
 Puppetmaster sits above libraries such as LangGraph and CrewAI: those libraries help you build an agent, while Puppetmaster coordinates existing agent CLIs and adapters. See [WHY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/WHY.md) and [COMPARISON.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPARISON.md).
@@ -165,7 +167,7 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 
 ## Status
 
-Puppetmaster is a daily-driver beta at **v1.27.0**, suitable for supervised local engineering. This release adds a community observation store and a separate role-preference file so StrongOrc-shaped priors can order already-sufficient models without rewriting `capability_score`. ROUTING names `community_observation` or `preference` when that layer chose the winner.
+Puppetmaster is a daily-driver beta at **v1.27.1**, suitable for supervised local engineering. v1.27.1 adds chrome-free `/?job=&embed=1` densify mode for Marionette (and other) host panes. v1.27.0 added a community observation store and a separate role-preference file so StrongOrc-shaped priors can order already-sufficient models without rewriting `capability_score`. ROUTING names `community_observation` or `preference` when that layer chose the winner.
 
 [Store contracts](docs/STORE_CONTRACTS.md) describe the embedding APIs and their limits. [Attempt accounting](docs/ATTEMPT_LEDGER.md) preserves retries and unknown usage; selected-result economics remain separate. [Budget reservations](docs/BUDGET_RESERVATIONS.md) enforce cumulative admission, though opaque provider overruns can exceed allowances. SQLite state migrates to schema v5, with stale projection triggers repaired at supervisor initialization. Stop long-lived Puppetmaster processes before the schema cutover and restart supervisors, workers, MCP servers, and dashboards on the new version. See the [feature matrix](docs/FEATURES.md) and [changelog](docs/CHANGELOG.md).
 
