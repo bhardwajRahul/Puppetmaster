@@ -1,3 +1,12 @@
+## v1.27.2 — 2026-09-09
+
+**Dashboard: never paint Marionette provenance JSON as the job title.**
+
+- Hosts stamp `job.label` with session/dispatch/origin JSON for scoping. The
+  board now treats that as provenance, not a headline — prefer goal/title so
+  embed panes (and small Jobs rails) stop showing the raw JSON dump.
+
+
 ## v1.27.1 — 2026-09-09
 
 **Dashboard embed mode for host panes.**

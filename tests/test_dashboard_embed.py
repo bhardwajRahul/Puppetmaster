@@ -65,5 +65,15 @@ class DashboardEmbedModeTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"embed=\(1\|true\|yes\)", INDEX_HTML)), 2)
 
 
+    def test_display_title_skips_marionette_provenance_label(self) -> None:
+        self.assertIn("function isProvenanceLabel", _PAGE_APP_JS)
+        self.assertIn("function jobDisplayTitle", _PAGE_APP_JS)
+        self.assertIn("jobDisplayTitle(job)", _PAGE_APP_JS)
+        self.assertNotIn(
+            "const headline = job.job.label || job.job.title || job.job.id;",
+            _PAGE_APP_JS,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

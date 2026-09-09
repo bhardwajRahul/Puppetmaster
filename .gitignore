@@ -30,3 +30,4 @@ research/
 # Operator-only runbooks / personal notes — never ship in the product repo.
 docs/PYPI_NAME_REQUEST.md
 
+uv.lock
