@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph
-from puppetmaster.failure import classify_codex_failure
+from puppetmaster.failure import UNKNOWN, classify_codex_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import selected_token_usage
@@ -347,6 +347,11 @@ class CodexAdapter(CliWorkerAdapter):
 
         parsed_artifacts = cursor_result_artifacts(task, worker_id, last_message, adapter="codex")
         process_failed = completed.returncode != 0 or turn_failed
+        failure = classify_codex_failure(
+            completed.stderr + "\n" + completed.stdout + "\n" + turn_failure_message
+        ) if process_failed else None
+        if turn_failed and failure == UNKNOWN:
+            failure = "codex_turn_failed"
         unstructured = not process_failed and not parsed_artifacts and bool(last_message.strip())
         degraded = unstructured and not write_capable
 
@@ -403,15 +408,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "changed_files": after["changed_files"],
                 "untracked_files": after["untracked_files"],
                 **diff_source_payload(before, after),
-                "failure": (
-                    None
-                    if not process_failed
-                    else "codex_turn_failed"
-                    if turn_failed
-                    else classify_codex_failure(
-                        completed.stderr + "\n" + completed.stdout + "\n" + turn_failure_message
-                    )
-                ),
+                "failure": failure,
             },
         )
         artifacts: list[Artifact] = [verification]
