@@ -1,3 +1,13 @@
+## Unreleased
+
+**Dashboard embed mode for host panes.**
+
+- `/?job=<id>&embed=1` hides the left Puppetmaster chrome and uses a denser
+  single-job layout so Marionette (or any webview) can host the board in a
+  ~420–700px tool pane. Live polling and job data are unchanged.
+- Embed polish: tighter type and spacing, a sticky status/goal/cost strip, and
+  the same highlights, frontier, and evidence panels.
+
 ## v1.27.0 — 2026-09-08
 
 **Community observations are order, not capability (#138).**
