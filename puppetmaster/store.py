@@ -905,6 +905,14 @@ class SwarmStore(StoreContracts):
             if max_children_per_parent is None
             else max(0, int(max_children_per_parent))
         )
+        if max_children_per_parent is None:
+            try:
+                from puppetmaster.continuous_plan import follow_up_limit_for, is_planner_task
+
+                if is_planner_task(parent):
+                    child_limit = max(child_limit, follow_up_limit_for(parent) + 1)
+            except Exception:
+                pass
         job_limit = (
             self.max_enqueue_job_tasks
             if max_job_tasks is None
@@ -1096,6 +1104,30 @@ class SwarmStore(StoreContracts):
                     extra={"artifact_id": artifact.id},
                 )
             return []
+        from puppetmaster.continuous_plan import (
+            REASON_INTENT_SPEC,
+            follow_up_limit_for,
+            intent_spec_for_job,
+            is_planner_task,
+        )
+
+        producing = None
+        try:
+            producing = self.get_task_by_id(producing_id)
+        except Exception:
+            producing = None
+        if producing is not None:
+            limit = follow_up_limit_for(producing, limit)
+            if is_planner_task(producing) and intent_spec_for_job(
+                self.list_artifacts(artifact.job_id)
+            ) is None:
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_INTENT_SPEC,
+                    parent_task_id=parent_id,
+                    extra={"artifact_id": artifact.id},
+                )
+                return []
         gate_failed = artifact_is_failed_gate(artifact) or gate_failed_for_task(
             self, artifact.job_id, producing_id
         )
@@ -2779,6 +2811,12 @@ class SwarmStore(StoreContracts):
                     if (published.status != TaskStatus.COMPLETE or
                             published.completed_at != run.completed_at):
                         continue
+                try:
+                    from puppetmaster.continuous_plan import maybe_requeue_planner
+
+                    maybe_requeue_planner(self, task)
+                except Exception:
+                    pass
                 events = self.read_events_since(job_id, record["event_cursor"])
                 if not any(e["event"] == "worker.completed_task" and
                            e["payload"] == record["event_payload"] for e in events):
