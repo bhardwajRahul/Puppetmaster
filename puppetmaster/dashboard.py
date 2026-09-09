@@ -851,10 +851,6 @@ function phaseStrip(phase) {
     + `<span class="${labelCls}">${esc(p.label || "")}</span></div>`;
 }
 
-function jobHeadline(j) {
-  return j.label || j.title || j.id;
-}
-
 // Header label answering "which project is this board serving?" from an
 // /api/meta payload. Pure by contract: no fetch/document/window/location, no
 // globals at all -- this constant is executed verbatim under node by the test
