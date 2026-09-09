@@ -1,4 +1,4 @@
-## Unreleased
+## v1.27.1 — 2026-09-09
 
 **Dashboard embed mode for host panes.**
 
@@ -7,6 +7,7 @@
   ~420–700px tool pane. Live polling and job data are unchanged.
 - Embed polish: tighter type and spacing, a sticky status/goal/cost strip, and
   the same highlights, frontier, and evidence panels.
+
 
 ## v1.27.0 — 2026-09-08
 
