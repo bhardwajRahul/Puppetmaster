@@ -37,6 +37,28 @@ function truncateGoal(goal, maxChars = 120) {
   return esc(firstLine.length <= maxChars ? firstLine : firstLine.slice(0, maxChars) + "…");
 }
 
+/** Marionette (and similar hosts) stamp session provenance into job.label as JSON. */
+function isProvenanceLabel(label) {
+  const text = String(label || "").trim();
+  if (!text.startsWith("{")) return false;
+  try {
+    const data = JSON.parse(text);
+    return !!(data && typeof data === "object" && (data.session_id || data.dispatch_id || data.origin));
+  } catch (_err) {
+    return false;
+  }
+}
+
+/** Prefer human title/goal over opaque provenance JSON labels. */
+function jobDisplayTitle(jobRecord) {
+  const job = jobRecord && jobRecord.job ? jobRecord.job : jobRecord || {};
+  const label = job.label || "";
+  if (label && !isProvenanceLabel(label)) return label;
+  const goal = String(job.goal || "").trim();
+  if (goal && !isProvenanceLabel(goal)) return goal.split("\n")[0] || goal;
+  return job.title || job.id || "Run";
+}
+
 function fmtAgo(iso) {
   const timestamp = Date.parse(iso || "");
   if (!Number.isFinite(timestamp)) return "Unknown";
@@ -81,8 +103,8 @@ function setEmbedContext(job) {
     crumbs.hidden = false;
     return;
   }
-  const rawGoal = job.job.goal || job.job.label || job.job.title || job.job.id || "";
-  const oneLiner = rawGoal.split("\n")[0];
+  const rawGoal = jobDisplayTitle(job);
+  const oneLiner = String(rawGoal || "").split("\n")[0];
   const cost = formatSelectedCost(actualCost(job));
   const costHtml = cost === "unknown" ? "" : `<span class="embed-cost mono">${esc(cost)}</span>`;
   const html = `${statusLabel(job.job.status)}<span class="embed-goal" title="${esc(rawGoal)}">${truncateGoal(oneLiner, 72)}</span>${costHtml}`;
@@ -308,7 +330,7 @@ function renderRouting(job) {
 function renderJob() {
   const job = latestJob;
   if (!job) return;
-  const headline = job.job.label || job.job.title || job.job.id;
+  const headline = jobDisplayTitle(job);
   setEmbedContext(job);
   setBreadcrumb(["Runs", headline]);
   if (!selectedTaskId && job.tasks && job.tasks.length) {
@@ -320,7 +342,7 @@ function renderJob() {
   const complete = Number(progress.complete || progress.completed || 0);
   const actual = actualCost(job);
   const evaluators = (job.evaluator_epoch || []).map(entry => `<span class="chip" title="Evaluator epoch">${esc(entry.slot_id || "evaluator")}@v${esc(entry.version)} · ${esc(entry.role || "unknown")}</span>`).join("");
-  let html = `<section class="page-heading job-heading"><div><div class="job-title-row"><h1>${esc(headline)}</h1>${statusLabel(job.job.status)}</div><details class="objective" data-disclosure="objective"><summary>Objective</summary><p>${esc(job.job.goal || "No objective recorded.")}</p></details><div class="job-meta"><span class="metric"><span>Workers</span><b>${formatNumber(job.worker_count)}</b></span><span class="metric"><span>Progress</span><b>${complete}/${total}</b></span><span class="metric"><span>Tokens</span><b>${formatNumber(job.tokens_total)}</b></span><span class="metric"><span>Artifacts</span><b>${Object.values(job.artifacts || {}).reduce((sum, items) => sum + (Array.isArray(items) ? items.length : 0), 0)}</b></span>${phaseStrip(job.phase)}${job.verification_criterion || ""}${evaluators}</div></div><span class="mono muted">${esc(job.job.id)}</span></section>`;
+  let html = `<section class="page-heading job-heading"><div><div class="job-title-row"><h1>${esc(headline)}</h1>${statusLabel(job.job.status)}</div><details class="objective" data-disclosure="objective"><summary>Objective</summary><p>${esc((job.job.goal && !isProvenanceLabel(job.job.goal) ? job.job.goal : "") || (isProvenanceLabel(job.job.label) ? "Host-scoped run (session provenance on label)." : "No objective recorded."))}</p></details><div class="job-meta"><span class="metric"><span>Workers</span><b>${formatNumber(job.worker_count)}</b></span><span class="metric"><span>Progress</span><b>${complete}/${total}</b></span><span class="metric"><span>Tokens</span><b>${formatNumber(job.tokens_total)}</b></span><span class="metric"><span>Artifacts</span><b>${Object.values(job.artifacts || {}).reduce((sum, items) => sum + (Array.isArray(items) ? items.length : 0), 0)}</b></span>${phaseStrip(job.phase)}${job.verification_criterion || ""}${evaluators}</div></div><span class="mono muted">${esc(job.job.id)}</span></section>`;
   html += `<div class="tabs" role="tablist" aria-label="Job detail"><button class="tab-button" type="button" role="tab" id="tab-overview" aria-controls="job-panel" tabindex="${activeTab === "overview" ? 0 : -1}" data-tab="overview" aria-selected="${activeTab === "overview"}">Overview</button><button class="tab-button" type="button" role="tab" id="tab-evidence" aria-controls="job-panel" tabindex="${activeTab === "evidence" ? 0 : -1}" data-tab="evidence" aria-selected="${activeTab === "evidence"}">Evidence</button><button class="tab-button" type="button" role="tab" id="tab-routing" aria-controls="job-panel" tabindex="${activeTab === "routing" ? 0 : -1}" data-tab="routing" aria-selected="${activeTab === "routing"}">Routing</button></div><section role="tabpanel" id="job-panel" aria-labelledby="tab-${activeTab}">`;
   html += activeTab === "evidence" ? renderEvidence(job) : activeTab === "routing" ? renderRouting(job) : renderOverview(job);
   html += "</section>";

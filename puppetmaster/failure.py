@@ -111,7 +111,9 @@ _ADAPTER_EXTRA_RULES: dict[str, Tuple[Rule, ...]] = {
         (_all("denied", "model"), MODEL_UNAVAILABLE),
         (_any("permission", "not allowed", "denied"), PERMISSION_DENIED),
     ),
-    "codex": (),
+    "codex": (
+        (_any("spend cap"), BILLING_OR_QUOTA),
+    ),
     "hermes": (
         (_all("no such file or directory", "hermes"), MISSING_CLI),
         (_any("no provider", "provider credentials"), NOT_AUTHENTICATED),
