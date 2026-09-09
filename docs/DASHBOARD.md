@@ -189,7 +189,9 @@ relative timestamp. Filter by status. Click through to a job.
 Embed mode is the same job view without app chrome:
 `http://127.0.0.1:<port>/?job=<id>&embed=1`. Combine `job` and `embed`; `embed=1`
 (also `true` / `yes`) hides the Puppetmaster rail and stacks the graph +
-inspector for roughly 420–560px, with compact columns around 700px.
+inspector for roughly 420–560px, with compact columns around 700px. A sticky
+strip keeps status, a goal one-liner, and selected-model cost visible while
+scrolling.
 
 Top to bottom:
 

@@ -71,6 +71,26 @@ function setBreadcrumb(parts) {
   }).join("");
 }
 
+function setEmbedContext(job) {
+  const bar = document.getElementById("embed-context");
+  const crumbs = document.getElementById("breadcrumb");
+  if (!bar || !crumbs) return;
+  if (!embedMode || !job || !job.job) {
+    if (!bar.hidden) bar.hidden = true;
+    if (bar.innerHTML) bar.innerHTML = "";
+    crumbs.hidden = false;
+    return;
+  }
+  const rawGoal = job.job.goal || job.job.label || job.job.title || job.job.id || "";
+  const oneLiner = rawGoal.split("\n")[0];
+  const cost = formatSelectedCost(actualCost(job));
+  const costHtml = cost === "unknown" ? "" : `<span class="embed-cost mono">${esc(cost)}</span>`;
+  const html = `${statusLabel(job.job.status)}<span class="embed-goal" title="${esc(rawGoal)}">${truncateGoal(oneLiner, 72)}</span>${costHtml}`;
+  if (bar.innerHTML !== html) bar.innerHTML = html;
+  bar.hidden = false;
+  crumbs.hidden = true;
+}
+
 function replaceContent(html) {
   if (html === lastContent) return false;
   const active = document.activeElement;
@@ -106,6 +126,7 @@ function renderEmpty(title, copy) {
 }
 
 function renderIndex() {
+  setEmbedContext(null);
   setBreadcrumb(["Runs"]);
   const counts = latestJobs.reduce((result, job) => {
     result[job.status] = (result[job.status] || 0) + 1;
@@ -288,6 +309,7 @@ function renderJob() {
   const job = latestJob;
   if (!job) return;
   const headline = job.job.label || job.job.title || job.job.id;
+  setEmbedContext(job);
   setBreadcrumb(["Runs", headline]);
   if (!selectedTaskId && job.tasks && job.tasks.length) {
     const priority = job.tasks.find(task => ["failed", "stalled", "blocked", "running", "in_progress"].includes(task.status));
@@ -331,6 +353,7 @@ async function tick() {
   } catch (error) {
     setConnection("offline", "Disconnected");
     if (error.status === 404 && activeView === "job") {
+      setEmbedContext(null);
       setBreadcrumb(["Runs", "Not found"]);
       replaceContent(renderEmpty("Run not found", "This run is not present in the dashboard's current workspace state."));
     } else if (!latestJob && !latestJobs.length) {

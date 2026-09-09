@@ -32,7 +32,24 @@ class DashboardEmbedModeTests(unittest.TestCase):
         self.assertIn("html.embed .overview-grid { grid-template-columns: minmax(0, 1fr);", css)
         self.assertIn("@media (min-width: 680px)", css)
         wide = css[css.index("@media (min-width: 680px)") :]
-        self.assertIn("minmax(0, 1fr) minmax(16rem, 38%)", wide)
+        self.assertIn("minmax(0, 1fr) minmax(15rem, 36%)", wide)
+
+    def test_embed_sticky_context_keeps_status_goal_and_cost(self) -> None:
+        self.assertIn('id="embed-context"', _PAGE_HEAD)
+        self.assertIn("function setEmbedContext", _PAGE_APP_JS)
+        self.assertIn("formatSelectedCost(actualCost(job))", _PAGE_APP_JS)
+        css = _embed_css()
+        self.assertIn("html.embed .topbar { position: sticky;", css)
+        self.assertIn("html.embed .embed-context", css)
+        self.assertIn("html.embed .embed-cost", css)
+        self.assertIn("html.embed .breadcrumb[hidden]", css)
+
+    def test_embed_keeps_highlights_frontier_and_evidence(self) -> None:
+        self.assertIn("function renderHighlights", _PAGE_APP_JS)
+        self.assertIn("${renderHighlights(job)}", _PAGE_APP_JS)
+        self.assertIn("function renderFrontier", _PAGE_APP_JS)
+        self.assertIn("function renderEvidence", _PAGE_APP_JS)
+        self.assertIn("html.embed .highlights { padding:", _embed_css())
 
     def test_job_rows_preserve_embed_on_deep_links(self) -> None:
         self.assertIn("jobHref(job.id, embedMode)", _PAGE_APP_JS)
