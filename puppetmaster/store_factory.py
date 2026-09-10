@@ -5,6 +5,7 @@ from typing import Union
 
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.store import SwarmStore
+from puppetmaster.workspace_scope import assert_same_scope
 
 
 def create_store(
@@ -24,6 +25,10 @@ def create_store(
     """
     if mode not in {"deferred", "ensure", "attach"}:
         raise ValueError(f"unsupported store mode: {mode}")
+    # Attach reads of other project dirs are allowed; supervisor ensure of a
+    # *different* root while frozen is the silent-swap footgun we refuse.
+    if mode == "ensure":
+        assert_same_scope(state_dir)
     if backend == "file":
         store = SwarmStore(state_dir)
         if mode == "ensure":

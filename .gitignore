@@ -24,8 +24,9 @@ coverage/
 .coverage
 
 # Separate research project — lives in its own repo (durable-state-vs-context).
-# Never track or push it with Puppetmaster.
-research/
+# Never track or push it with Puppetmaster. Anchor at repo root so
+# docs/research/ (product steal notes) remains trackable.
+/research/
 
 # Operator-only runbooks / personal notes — never ship in the product repo.
 docs/PYPI_NAME_REQUEST.md
