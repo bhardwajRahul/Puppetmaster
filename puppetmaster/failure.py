@@ -58,6 +58,7 @@ def _model_unavailable(lowered: str) -> bool:
         or "not found" in lowered
         or "invalid" in lowered
         or "does not exist" in lowered
+        or "not supported" in lowered
         or "404" in lowered
     )
 

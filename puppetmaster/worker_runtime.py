@@ -327,7 +327,13 @@ class WorkerRuntime:
         # success, and the orchestrator's auto-fallback could never re-route.
         recoverable = self._recoverable_failure(artifacts)
         blocked = self._blocked_verdict(artifacts)
-        if worker_run.status == TaskStatus.FAILED or recoverable is not None or blocked is not None:
+        failed = self._failed_verdict(artifacts)
+        if (
+            worker_run.status == TaskStatus.FAILED
+            or recoverable is not None
+            or blocked is not None
+            or failed is not None
+        ):
             failed_run = replace(
                 run,
                 status=TaskStatus.FAILED,
@@ -345,7 +351,7 @@ class WorkerRuntime:
                     "worker_id": self.worker_id,
                     "task_id": task.id,
                     "role": self.role,
-                    "failure": recoverable or blocked,
+                    "failure": recoverable or blocked or failed,
                     "blocked": blocked,
                 },
             )
@@ -496,6 +502,37 @@ class WorkerRuntime:
             payload = getattr(artifact, "payload", None) or {}
             if payload.get("result") == "blocked":
                 return str(payload.get("failure") or "blocked")
+        return None
+
+    @staticmethod
+    def _failed_verdict(artifacts: list) -> Optional[str]:
+        """Return the failure reason when verification executed and failed.
+
+        Provider HTTP 400s (e.g. unsupported ``luna-pro`` on ChatGPT Codex) and
+        other hard verification failures previously could miss
+        :data:`RECOVERABLE_FAILURES` and still record the task COMPLETE — a
+        green "done" over empty deltas. ``result=failed`` /
+        ``execution_status=failed`` must always veto COMPLETE.
+        """
+        from puppetmaster.models import ArtifactType
+
+        for artifact in artifacts:
+            kind = getattr(artifact, "type", None)
+            if kind != ArtifactType.VERIFICATION and str(kind) != "verification":
+                continue
+            payload = getattr(artifact, "payload", None) or {}
+            result = str(payload.get("result") or "").strip().lower()
+            exec_status = str(
+                payload.get("execution_status")
+                or getattr(artifact, "execution_status", None)
+                or ""
+            ).strip().lower()
+            if result == "failed" or exec_status == "failed":
+                return str(
+                    payload.get("failure")
+                    or payload.get("provider_reason")
+                    or "verification_failed"
+                )
         return None
 
     def _heartbeat_run_and_lease(

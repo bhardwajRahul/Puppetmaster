@@ -252,10 +252,32 @@ class Stitcher:
             hint = self._FAILURE_REMEDIATION.get(
                 str(failure), "the worker could not complete; see the artifact for details."
             )
-            alerts.append(
-                f"- **{failure}** on `{adapter}` worker — {hint}"
-            )
+            line = f"- **{failure}** on `{adapter}` worker — {hint}"
+            excerpt = self._provider_body_excerpt(payload)
+            if excerpt:
+                line += f"\n  provider_body: {excerpt}"
+            alerts.append(line)
         return alerts
+
+    @staticmethod
+    def _provider_body_excerpt(payload: dict, *, limit: int = 240) -> str:
+        """Short redacted provider stderr/body for Alerts (not status alone)."""
+        for key in ("provider_body", "stderr", "stderr_excerpt", "body"):
+            raw = payload.get(key)
+            if not isinstance(raw, str):
+                continue
+            text = " ".join(raw.strip().split())
+            if not text:
+                continue
+            if len(text) > limit:
+                text = text[: limit - 3].rstrip() + "..."
+            return text
+        reason = payload.get("provider_reason") or payload.get("http_status")
+        if reason is not None and str(reason).strip():
+            # Prefer body when present; fall back only when nothing else exists.
+            if payload.get("http_status") is not None and not payload.get("provider_reason"):
+                return f"http_status:{payload.get('http_status')}"
+        return ""
 
     @staticmethod
     def _adapter_from_evidence(artifact: Artifact) -> str:
