@@ -81,6 +81,22 @@ def same_store_write(before, after):
             before[:2] == after[:2] and before[2:4] != after[2:4])
 
 
+def adopt_darwin_open_ctime(before, descriptor_after_open):
+    """Rebase the pre-open main stamp after Darwin r+b LOCK_EX.
+
+    APFS can bump ctime on a writable open of the same inode (Application
+    Support ``state.sqlite3``). That is not a replaced file. Later full-tuple
+    compares still fence ABA. Keep a list so it stays type-equal to stamps().
+    """
+    main = before[0]
+    if (sys.platform != 'darwin' or main is None or descriptor_after_open is None
+            or main[:4] != descriptor_after_open[:4]):
+        return before
+    adopted = list(before)
+    adopted[0] = descriptor_after_open
+    return adopted
+
+
 def emit(value):
     print(json.dumps(value), flush=True)
 
@@ -267,8 +283,14 @@ def main(path, *, wal_snapshot=False):
         uri = (path.resolve().as_uri() + ('?mode=ro' if wal_snapshot else '?mode=ro&immutable=1') if os.name == 'nt'
                else descriptor_uri(source.fileno()))
         descriptor_before = source_stamp(fd=source.fileno())
-        if ((descriptor_before[:2] if wal_snapshot else descriptor_before) !=
-                (before[0][:2] if wal_snapshot else before[0])):
+        if wal_snapshot:
+            bound = descriptor_before[:2] == before[0][:2]
+        elif sys.platform == 'darwin' and descriptor_before[:4] == before[0][:4]:
+            bound = True
+            before = adopt_darwin_open_ctime(before, descriptor_before)
+        else:
+            bound = descriptor_before == before[0]
+        if not bound:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       same_store_write=same_store_write(before[0], descriptor_before)))
             return

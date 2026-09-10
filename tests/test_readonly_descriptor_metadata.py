@@ -121,13 +121,70 @@ class DescriptorMetadataTests(unittest.TestCase):
                     self.assertEqual(responses[-1]['kind'], 'unavailable')
                     self.assertNotIn('rows', responses[-1])
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin r+b lock-open updates ctime')
+    def test_darwin_exclusive_open_ctime_only_still_reads(self):
+        """APFS can bump ctime when the helper opens the db r+b for LOCK_EX.
+
+        Observed on ~/Library/Application Support/.../state.sqlite3; tmp files
+        often do not. Rebase that one ctime onto the bound stamp; later ABA
+        still uses the full tuple. Path restat after open matches the fd.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'source.sqlite3'
+            with closing(sqlite3.connect(path)) as c:
+                c.execute('CREATE TABLE sample(value)')
+                c.execute('INSERT INTO sample VALUES (1)')
+                c.commit()
+            original_stamp = worker.source_stamp
+            original_stamps = worker.stamps
+            stamp_calls = [0]
+            responses = []
+
+            def source_stamp(path_arg=None, *, fd=None):
+                result = list(original_stamp(path_arg, fd=fd))
+                if fd is not None:
+                    result[4] += 1
+                return tuple(result)
+
+            def stamps(selected):
+                result = original_stamps(selected)
+                stamp_calls[0] += 1
+                if stamp_calls[0] > 1 and result[0] is not None:
+                    main = result[0]
+                    result = [(main[0], main[1], main[2], main[3], main[4] + 1)] + result[1:]
+                return result
+
+            with patch.object(worker, 'source_stamp', side_effect=source_stamp), \
+                    patch.object(worker, 'stamps', side_effect=stamps), \
+                    patch.object(worker.sys, 'stdin', io.StringIO(
+                        '{"sql":"SELECT value FROM sample","parameters":[]}\n')), \
+                    patch.object(worker, 'emit', side_effect=responses.append):
+                worker.main(path)
+            self.assertEqual(responses[-1]['rows'], [(1,)])
+            self.assertGreater(stamp_calls[0], 1)
+
+    def test_adopt_darwin_open_ctime_keeps_stamps_list_type(self):
+        before = [(1, 2, 3, 4, 5), None, None, None]
+        adopted = worker.adopt_darwin_open_ctime(before, (1, 2, 3, 4, 6))
+        if sys.platform != 'darwin':
+            self.assertIs(adopted, before)
+            return
+        self.assertIsInstance(adopted, list)
+        restat = [(1, 2, 3, 4, 6), None, None, None]
+        self.assertEqual(adopted, restat)
+
     def test_ctime_mismatch_still_rejects_binding(self):
+        if sys.platform == 'darwin':
+            self.skipTest('Darwin rebases lock-open ctime; see test_darwin_exclusive_open_ctime_only_still_reads')
         responses = self.run_reader(change='st_ctime_ns', change_at=1)
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0]['kind'], 'unavailable')
 
     def test_descriptor_must_bind_to_selected_path(self):
-        for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')
+        if sys.platform != 'darwin':
+            fields += ('st_ctime_ns',)
+        for field in fields:
             with self.subTest(field=field):
                 responses = self.run_reader(change=field, change_at=1)
                 self.assertEqual(len(responses), 1)
