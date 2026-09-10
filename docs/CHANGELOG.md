@@ -1,4 +1,21 @@
+## Unreleased
+
+## v1.27.6 — 2026-09-09
+
+**Orchestration durability: command ledger, run journal, WorkspaceScope (#167).**
+
+- Session command ledger: durable `run` / `steer` / `interrupt` / `respond_input`
+  with mark-before-execute, TTL, and supersede rules (`session_commands`).
+- Run journal crash stamps: mid-stream journals close as `aborted` on
+  `host.recovered`; resume attempt budget blocks revive loops (`run_journal`).
+- WorkspaceScope freeze: primary store root bound once per CLI/MCP process;
+  `create_store(..., mode="ensure")` refuses silent foreign-root swap.
+- Research notes under `docs/research/` (harness native-first, ACP negative
+  lessons, durability map). MCP/CLI remain the engine; UI hosts are viewports.
+- Tests: `test_session_commands`, `test_run_journal`, `test_workspace_scope`.
+
 ## v1.27.5 — 2026-09-09
+
 
 **Dashboard Runs list: prefer human goal over Marionette provenance JSON.**
 

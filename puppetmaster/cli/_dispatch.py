@@ -59,6 +59,10 @@ from puppetmaster.mcp_registry import (
     summarize as registry_summarize,
 )
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.workspace_scope import (
+    bind_workspace_scope,
+    classify_scope_kind,
+)
 from puppetmaster.state import (
     find_state_dir_for_job,
     list_project_state_dirs,
@@ -141,6 +145,19 @@ from puppetmaster.cli.commands_cell import (
 )
 
 
+
+def _bind_primary_workspace_scope(state_dir: Path, args: argparse.Namespace) -> Path:
+    """Bind the CLI command's primary store root (Comet WorkspaceScope).
+
+    CLI is one-shot per ``main()`` invocation, so we rebind at command start.
+    Within the command, ``create_store(..., mode="ensure")`` still refuses a
+    foreign root. Long-lived MCP engines freeze without rebind in ``mcp_server.main``.
+    """
+    explicit = bool(getattr(args, "state_dir", None) or os.environ.get("PUPPETMASTER_STATE_DIR"))
+    kind = classify_scope_kind(explicit_state_dir=explicit)
+    bind_workspace_scope(state_dir, kind=kind, rebind=True)
+    return state_dir
+
 def _resolve_command_state_dir(args: argparse.Namespace) -> Path:
     """Resolve durable state for the command's workspace without moving overrides.
 
@@ -152,12 +169,12 @@ def _resolve_command_state_dir(args: argparse.Namespace) -> Path:
     """
     explicit_state_dir = getattr(args, "state_dir", None)
     if explicit_state_dir or os.environ.get("PUPPETMASTER_STATE_DIR"):
-        return resolve_state_dir(explicit_state_dir)
+        return _bind_primary_workspace_scope(resolve_state_dir(explicit_state_dir), args)
 
     command_cwd = getattr(args, "cwd", None)
     if command_cwd:
-        return resolve_state_dir(cwd=Path(command_cwd))
-    return resolve_state_dir()
+        return _bind_primary_workspace_scope(resolve_state_dir(cwd=Path(command_cwd)), args)
+    return _bind_primary_workspace_scope(resolve_state_dir(), args)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

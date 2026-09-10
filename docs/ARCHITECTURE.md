@@ -51,6 +51,40 @@ Use `python -m puppetmaster state` to print the resolved path. Use `--state-dir`
 
 The file backend remains useful for debugging because every object is a readable JSON file.
 
+
+## Command plane (unreleased; tip 1.27.5)
+
+Send / steer / interrupt / respond_input are durable **session commands** the
+host executes (`puppetmaster.session_commands`). Entries live under
+`<state>/command-ledgers/<job_id>.jsonl` with a processed-id set. Evaluation is
+pure (dedupe → TTL → supersede → execute) and **marks processed before
+execute** so crash recovery stays idempotent.
+
+| Kind | Maps to |
+| --- | --- |
+| `run` | Task / artifact admission |
+| `steer` | Follow-up instruction (planner / enqueue) |
+| `interrupt` | Scoped durable cancellation |
+| `respond_input` | Answer a pending gate / question |
+
+Run journals (`puppetmaster.run_journal`) sit beside liveness: a mid-stream
+journal is stamped `aborted` on `host.recovered`. Resume attempts are budgeted
+so auto-revive cannot loop forever.
+
+WorkspaceScope (`puppetmaster.workspace_scope`) freezes the primary store root
+for the engine process. Auth / profile / `--state-dir` changes must not silently
+swap roots mid-process; cross-project attach remains allowed.
+
+## Headless engine honesty
+
+MCP and CLI are the orchestration **engine**. Marionette, Automaton, and Discord
+OS are **viewports** — they may start and supervise jobs, but they must not own
+command-ledger / run-journal / lease truth that belongs in the store.
+
+Research notes: [research/harness.md](research/harness.md),
+[research/acp.md](research/acp.md),
+[research/orchestration-durability.md](research/orchestration-durability.md).
+
 ## Failure Model
 
 Workers are allowed to die. The lease expires, the task becomes recoverable, and another worker can reclaim it. The crash demo exercises this path.
