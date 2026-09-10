@@ -1,6 +1,8 @@
 ## Unreleased
 
-**Orchestration durability (Comet/Zeron steal) — stays on tip 1.27.5; no 1.28.**
+## v1.27.6 — 2026-09-09
+
+**Orchestration durability: command ledger, run journal, WorkspaceScope (#167).**
 
 - Session command ledger: durable `run` / `steer` / `interrupt` / `respond_input`
   with mark-before-execute, TTL, and supersede rules (`session_commands`).
