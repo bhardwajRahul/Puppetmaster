@@ -46,6 +46,10 @@ from puppetmaster.mcp_registry import (
 )
 from puppetmaster.run_id import reserve_run_logs
 from puppetmaster.state import resolve_state_dir, state_identity
+from puppetmaster.workspace_scope import (
+    bind_workspace_scope,
+    classify_scope_kind,
+)
 from puppetmaster.state_health import diagnose_state_dir, short_warning
 from puppetmaster.store_factory import create_store
 from puppetmaster.swarm_launch import (
@@ -928,6 +932,20 @@ class McpTool:
 
 
 def main() -> int:
+    # Freeze primary local scope once for this MCP engine process. Per-tool
+    # mcp_state_dir may attach other project dirs for job lookup; that must
+    # not rebind the frozen engine root (create_store ensure asserts).
+    try:
+        from puppetmaster.state import resolve_state_dir
+        import os as _os
+        _explicit = bool(_os.environ.get("PUPPETMASTER_STATE_DIR"))
+        bind_workspace_scope(
+            resolve_state_dir(),
+            kind=classify_scope_kind(explicit_state_dir=_explicit),
+            label="mcp",
+        )
+    except Exception:
+        pass
     # Hide Windows console windows for every child we spawn (workers,
     # git, codegraph) before any subprocess machinery runs.
     from puppetmaster.win_console import hide_child_consoles
@@ -4407,6 +4425,8 @@ def environment(args: JsonObject) -> dict[str, str]:
 
 def cwd(args: JsonObject) -> str:
     return str(args.get("cwd") or os.getcwd())
+
+
 
 
 def mcp_state_dir(args: JsonObject) -> Path:

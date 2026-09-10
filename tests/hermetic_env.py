@@ -277,6 +277,12 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
             reset_cursor_codegraph_invocation_cache()
         except Exception:
             pass
+        try:
+            from puppetmaster.workspace_scope import reset_workspace_scope
+
+            reset_workspace_scope()
+        except Exception:
+            pass
         outcome = _ORIG_TESTCASE_RUN(self, result)
         # Reap AFTER the test, not before: this attributes the leak to the test
         # that actually wrote the registry, instead of the isolation silently

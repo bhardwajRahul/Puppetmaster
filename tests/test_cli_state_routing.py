@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401
+
 import contextlib
 import io
-import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
