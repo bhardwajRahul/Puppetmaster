@@ -81,6 +81,24 @@ def same_store_write(before, after):
             before[:2] == after[:2] and before[2:4] != after[2:4])
 
 
+def open_stamp(stamp_tuple):
+    """Stamp compared after this helper opens the db for the lock.
+
+    Darwin APFS updates ctime on a writable open of some files (the host
+    ``state.sqlite3`` under Application Support). That is not a replaced
+    inode. Windows ChangeTime stays in the comparison.
+    """
+    if stamp_tuple is None:
+        return None
+    if sys.platform == 'darwin':
+        return stamp_tuple[:4]
+    return stamp_tuple
+
+
+def open_stamps(rows):
+    return tuple(open_stamp(item) for item in rows)
+
+
 def emit(value):
     print(json.dumps(value), flush=True)
 
@@ -267,8 +285,8 @@ def main(path, *, wal_snapshot=False):
         uri = (path.resolve().as_uri() + ('?mode=ro' if wal_snapshot else '?mode=ro&immutable=1') if os.name == 'nt'
                else descriptor_uri(source.fileno()))
         descriptor_before = source_stamp(fd=source.fileno())
-        if ((descriptor_before[:2] if wal_snapshot else descriptor_before) !=
-                (before[0][:2] if wal_snapshot else before[0])):
+        if ((descriptor_before[:2] if wal_snapshot else open_stamp(descriptor_before)) !=
+                (before[0][:2] if wal_snapshot else open_stamp(before[0]))):
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       same_store_write=same_store_write(before[0], descriptor_before)))
             return
@@ -324,7 +342,7 @@ def main(path, *, wal_snapshot=False):
                 emit(dict(kind='OperationalError', error='database is locked'))
                 return
         after = _stamps_after_open(path)
-        if not wal_snapshot and after != before:
+        if not wal_snapshot and open_stamps(after) != open_stamps(before):
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
                       same_store_write=same_store_write(before[0], after[0])))
@@ -339,7 +357,7 @@ def main(path, *, wal_snapshot=False):
                       code=5))
             return
         after = _stamps_after_open(path)
-        if not wal_snapshot and after != before:
+        if not wal_snapshot and open_stamps(after) != open_stamps(before):
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
             return
@@ -360,13 +378,13 @@ def main(path, *, wal_snapshot=False):
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('BEGIN')
             c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
-            if not wal_snapshot and _stamps_after_open(path) != before:
+            if not wal_snapshot and open_stamps(_stamps_after_open(path)) != open_stamps(before):
                 emit(dict(kind='unavailable', error='unable to open database: source changed'))
                 return
             def unchanged():
                 current = source_stamp(fd=source.fileno())
                 return (current[:2] == descriptor_before[:2] if wal_snapshot
-                        else current == descriptor_before)
+                        else open_stamp(current) == open_stamp(descriptor_before))
             emit(dict(journal='wal' if header[18:20] == b'\x02\x02' else 'delete'))
             def event(name, args):
                 emit(dict(event=name, args=args))

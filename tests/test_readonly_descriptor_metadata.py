@@ -114,20 +114,65 @@ class DescriptorMetadataTests(unittest.TestCase):
                     self.assertNotIn('rows', responses[-1])
 
     def test_descriptor_changes_remain_unavailable(self):
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')
+        if sys.platform != 'darwin':
+            fields += ('st_ctime_ns',)
         for change_at in (2, 3):  # Before SQL and before returning its rows.
-            for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+            for field in fields:
                 with self.subTest(field=field, change_at=change_at):
                     responses = self.run_reader(change=field, change_at=change_at)
                     self.assertEqual(responses[-1]['kind'], 'unavailable')
                     self.assertNotIn('rows', responses[-1])
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin r+b lock-open updates ctime')
+    def test_darwin_exclusive_open_ctime_only_still_reads(self):
+        """APFS can bump ctime when the helper opens the db r+b for LOCK_EX.
+
+        Observed on ~/Library/Application Support/.../state.sqlite3; tmp files
+        often do not. A ctime-only drift is not a replaced file.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'source.sqlite3'
+            with closing(sqlite3.connect(path)) as c:
+                c.execute('CREATE TABLE sample(value)')
+                c.execute('INSERT INTO sample VALUES (1)')
+                c.commit()
+            original = worker.stamps
+            responses = []
+            calls = [0]
+
+            def stamps_with_ctime_bump(selected):
+                result = original(selected)
+                calls[0] += 1
+                if calls[0] > 1 and result[0] is not None:
+                    main = result[0]
+                    result = [(main[0], main[1], main[2], main[3], main[4] + 1)] + result[1:]
+                return result
+
+            with patch.object(worker, 'stamps', side_effect=stamps_with_ctime_bump), \
+                    patch.object(worker.sys, 'stdin', io.StringIO(
+                        '{"sql":"SELECT value FROM sample","parameters":[]}\n')), \
+                    patch.object(worker, 'emit', side_effect=responses.append):
+                worker.main(path)
+            self.assertEqual(responses[-1]['rows'], [(1,)])
+            self.assertGreater(calls[0], 1)
+
     def test_ctime_mismatch_still_rejects_binding(self):
         responses = self.run_reader(change='st_ctime_ns', change_at=1)
+        if sys.platform == 'darwin':
+            # Darwin r+b lock-open updates ctime on some volumes (including the
+            # host state.sqlite3). Inode/size/mtime still fence replacement.
+            self.assertEqual(responses[-1]['rows'], [(1,)])
+            self.assertNotEqual(responses[-1].get('kind'), 'unavailable')
+            return
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0]['kind'], 'unavailable')
 
     def test_descriptor_must_bind_to_selected_path(self):
-        for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')
+        if sys.platform != 'darwin':
+            fields += ('st_ctime_ns',)
+        for field in fields:
             with self.subTest(field=field):
                 responses = self.run_reader(change=field, change_at=1)
                 self.assertEqual(len(responses), 1)
