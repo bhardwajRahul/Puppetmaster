@@ -36,6 +36,7 @@ import json
 import os
 import random
 import socket
+import uuid
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -607,7 +608,70 @@ def _harvest_response_headers(headers: Any, *, http_status: Optional[int] = None
         return
 
 
+def _is_opencode_host(url: Optional[str]) -> bool:
+    """True when *url* points at OpenCode Go/Zen (opencode.ai)."""
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(url or "").netloc.lower()
+    except Exception:
+        host = (url or "").lower()
+    return host == "opencode.ai" or host.endswith(".opencode.ai") or "opencode.ai" in (url or "").lower()
+
+
+def _resolve_opencode_session_id(
+    session_id: Optional[str] = None,
+    messages: Optional[list] = None,
+) -> str:
+    """Sticky OpenCode session id. Always returns a value — omit is a 400."""
+    if session_id and str(session_id).strip():
+        return str(session_id).strip()
+    for key in ("PUPPETMASTER_JOB_SESSION_ID", "PUPPETMASTER_JOB_ID", "HARNESS_SESSION_ID"):
+        env = (os.environ.get(key) or "").strip()
+        if env:
+            return env
+    if messages:
+        try:
+            return _openai_session_id_from_messages(messages)
+        except Exception:
+            pass
+    return uuid.uuid4().hex
+
+
+def _stamp_opencode_session_header(
+    headers: dict,
+    *,
+    url: Optional[str],
+    session_id: Optional[str] = None,
+    messages: Optional[list] = None,
+) -> dict:
+    """Set ``x-opencode-session`` on OpenCode hosts. Best-effort, never raises.
+
+    OpenCode Go rejects requests that omit this header (MissingSessionID).
+    See https://opencode.ai/docs/go/#where-can-i-use-it
+    """
+    try:
+        if not isinstance(headers, dict) or not _is_opencode_host(url):
+            return headers
+        existing = headers.get("x-opencode-session")
+        if existing and str(existing).strip():
+            return headers
+        headers["x-opencode-session"] = _resolve_opencode_session_id(
+            session_id=session_id,
+            messages=messages,
+        )
+    except Exception:
+        try:
+            if isinstance(headers, dict) and _is_opencode_host(url) and not headers.get("x-opencode-session"):
+                headers["x-opencode-session"] = uuid.uuid4().hex
+        except Exception:
+            pass
+    return headers
+
+
 def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
+    headers = dict(headers)
+    _stamp_opencode_session_header(headers, url=url)
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -1093,6 +1157,8 @@ def _open_stream(url: str, *, headers: dict, body: dict, timeout: int):
     Mirrors :func:`_post_json`'s error normalization so a streaming call raises
     the same classifiable :class:`ProviderError` on HTTP/transport failure.
     """
+    headers = dict(headers)
+    _stamp_opencode_session_header(headers, url=url)
     request = urllib.request.Request(
         url,
         data=json.dumps({**body, "stream": True}).encode("utf-8"),
@@ -2087,6 +2153,15 @@ def _opencode_go_chat(
 
     bare, mode, prepared, url = _prepare_opencode_go_call(
         model=model, extra=extra, base_url=base_url,
+    )
+    headers = dict(headers)
+    extra_sid = None
+    if isinstance(prepared, dict):
+        extra_sid = prepared.get("session_id")
+    if extra_sid is None and isinstance(extra, dict):
+        extra_sid = extra.get("session_id")
+    _stamp_opencode_session_header(
+        headers, url=url or base_url, session_id=extra_sid, messages=messages,
     )
     use_stream = stream or on_delta is not None
     if mode == OPENAI_RESPONSES:

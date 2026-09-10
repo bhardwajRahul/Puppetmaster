@@ -871,5 +871,161 @@ class OpenCodeGoAgenticSelectionTests(unittest.TestCase):
         self.assertIn("OPENCODE_GO_API_KEY", risk.payload["mitigation"])
 
 
+class OpenCodeGoSessionHeaderTests(unittest.TestCase):
+    """OpenCode Go rejects requests that omit x-opencode-session (MissingSessionID)."""
+
+    def test_chat_completions_sends_x_opencode_session(self) -> None:
+        captured: dict = {}
+
+        def fake_post(url, *, headers, body, timeout):
+            captured["headers"] = headers
+            return {
+                "choices": [{
+                    "message": {"content": "ok", "role": "assistant"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+
+        with mock.patch.object(providers, "_post_json", side_effect=fake_post):
+            providers.provider_chat(
+                provider="opencode-go",
+                model="opencode-go/deepseek-v4-flash",
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="sk-go-test",
+            )
+        self.assertTrue(str(captured["headers"].get("x-opencode-session") or "").strip())
+
+    def test_anthropic_and_responses_also_send_header(self) -> None:
+        seen: list[str] = []
+
+        def fake_post(url, *, headers, body, timeout):
+            seen.append(str(headers.get("x-opencode-session") or ""))
+            if url.endswith("/messages"):
+                return {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            return {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+
+        with mock.patch.object(providers, "_post_json", side_effect=fake_post):
+            providers.provider_chat(
+                provider="opencode-go",
+                model="minimax-m3",
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="sk-go-test",
+            )
+            providers.provider_chat(
+                provider="opencode-go",
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="sk-go-test",
+            )
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(sid.strip() for sid in seen))
+
+    def test_post_json_stamps_header_when_caller_omits_it(self) -> None:
+        captured: dict = {}
+
+        class _Resp:
+            headers = {}
+
+            def read(self):
+                return b'{"ok": true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+            return _Resp()
+
+        with mock.patch.object(providers, "check_external_dispatch"):
+            with mock.patch.object(providers.urllib.request, "urlopen", side_effect=fake_urlopen):
+                providers._post_json(
+                    "https://opencode.ai/zen/go/v1/chat/completions",
+                    headers={"Authorization": "Bearer x"},
+                    body={"model": "m"},
+                    timeout=5,
+                )
+        request = captured["request"]
+        value = request.get_header("X-opencode-session") or request.get_header("x-opencode-session")
+        self.assertTrue(str(value or "").strip())
+
+    def test_post_json_skips_non_opencode_host(self) -> None:
+        captured: dict = {}
+
+        class _Resp:
+            headers = {}
+
+            def read(self):
+                return b'{"ok": true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+            return _Resp()
+
+        with mock.patch.object(providers, "check_external_dispatch"):
+            with mock.patch.object(providers.urllib.request, "urlopen", side_effect=fake_urlopen):
+                providers._post_json(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": "Bearer x"},
+                    body={"model": "m"},
+                    timeout=5,
+                )
+        request = captured["request"]
+        value = request.get_header("X-opencode-session") or request.get_header("x-opencode-session")
+        self.assertFalse(value)
+
+    def test_job_id_env_is_sticky_session(self) -> None:
+        captured: dict = {}
+
+        def fake_post(url, *, headers, body, timeout):
+            captured["headers"] = headers
+            return {
+                "choices": [{
+                    "message": {"content": "ok", "role": "assistant"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+
+        with mock.patch.dict(os.environ, {"PUPPETMASTER_JOB_ID": "job_sticky_1"}):
+            with mock.patch.object(providers, "_post_json", side_effect=fake_post):
+                providers.provider_chat(
+                    provider="opencode-go",
+                    model="opencode-go/deepseek-v4-flash",
+                    messages=[{"role": "user", "content": "hi"}],
+                    api_key="sk-go-test",
+                )
+        self.assertEqual(captured["headers"].get("x-opencode-session"), "job_sticky_1")
+
+
 if __name__ == "__main__":
     unittest.main()

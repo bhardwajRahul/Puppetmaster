@@ -1,5 +1,17 @@
 ## Unreleased
 
+## v1.27.9 — 2026-09-10
+
+**OpenCode Go swarm workers send `x-opencode-session`.**
+
+Agentic `_post_json` / `_open_stream` / `_opencode_go_chat` stamp
+`x-opencode-session` on opencode.ai hosts. Sticky id prefers an explicit
+session, then `PUPPETMASTER_JOB_SESSION_ID` / `PUPPETMASTER_JOB_ID` /
+`HARNESS_SESSION_ID`, then a message digest, then a UUID. Omitting the
+header was HTTP 400 `MissingSessionID` on every Go swarm worker. The
+Marionette chat-pilot helper in `pmharness/drivers/` never ran on this
+path.
+
 ## v1.27.8 — 2026-09-10
 
 **Darwin readonly helper: ignore ctime-only drift after lock-open.**
