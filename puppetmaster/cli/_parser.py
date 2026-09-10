@@ -677,7 +677,15 @@ def build_parser() -> argparse.ArgumentParser:
             "swarm in one repo and want to find the job from another shell."
         ),
     )
-    subcommands.add_parser("last", help="Print the most recent job id.")
+    last = subcommands.add_parser("last", help="Print the most recent job id in this state_dir.")
+    last.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print a bind object (job_id, status, state_dir, goal_preview, "
+            "role_count, finding_count). Default stays id-only."
+        ),
+    )
     subcommands.add_parser(
         "projects",
         help=(

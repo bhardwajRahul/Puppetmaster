@@ -325,9 +325,44 @@ class PuppetmasterTests(unittest.TestCase):
                 )
 
         called_args = run.call_args.args[0]
-        self.assertEqual(called_args[-1], "last")
+        self.assertIn("last", called_args)
+        self.assertIn("--json", called_args)
         self.assertIn("job_123", result["content"][0]["text"])
         self.assertFalse(result["isError"])
+
+    def test_last_json_binds_latest_job_in_this_store(self) -> None:
+        from io import StringIO
+        from puppetmaster.cli import main as cli_main
+        from puppetmaster.store_factory import create_store
+
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            store = create_store("sqlite", state_dir)
+            older = store.create_job("old 4-role audit Conversation.tsx:466")
+            newer = store.create_job("smoke 2-role deepseek-v4-flash")
+            store.save_job(replace(newer, created_at="2099-01-01T00:00:00+00:00"))
+            self.assertNotEqual(older.id, newer.id)
+
+            buf = StringIO()
+            with patch("sys.stdout", buf):
+                rc = cli_main(["--state-dir", str(state_dir), "--backend", "sqlite", "last"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(buf.getvalue().strip(), newer.id)
+
+            buf = StringIO()
+            with patch("sys.stdout", buf):
+                rc = cli_main(
+                    ["--state-dir", str(state_dir), "--backend", "sqlite", "last", "--json"]
+                )
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload["job_id"], newer.id)
+            self.assertEqual(payload["state_dir"], str(state_dir.resolve()))
+            self.assertIn("smoke 2-role", payload["goal_preview"])
+            self.assertNotIn("Conversation.tsx", payload["goal_preview"])
+            self.assertIn("THIS state_dir only", payload["store_scope"])
+            self.assertIn("role_count", payload)
+            self.assertIn("finding_count", payload)
 
     def test_mcp_start_tool_returns_job_id_without_waiting_for_completion(self) -> None:
         with TemporaryDirectory() as tmp:
