@@ -121,6 +121,7 @@ from puppetmaster.cli.commands_jobs import (
     _run_gc_command,
     _run_reap_command,
     _run_wait_command,
+    last_job_bind,
 )
 from puppetmaster.cli.commands_gate import (
     _run_affected_command,
@@ -1616,7 +1617,10 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if job is None:
             print("no jobs")
             return 1
-        print(job.id)
+        if getattr(args, "json", False):
+            print(json.dumps(last_job_bind(store, job, state_dir), indent=2))
+        else:
+            print(job.id)
         return 0
 
     if args.command == "status":
