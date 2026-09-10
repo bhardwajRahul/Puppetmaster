@@ -2400,6 +2400,42 @@ class PuppetmasterTests(unittest.TestCase):
                         store.list_tasks(job.id),
                     )
 
+    def test_inline_workers_contain_system_exit(self) -> None:
+        """crash_after_claim SystemExit(77) must not kill an in-process host."""
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        def _explore_exits(self: WorkerRuntime) -> int:
+            if self.role == "explore":
+                raise SystemExit(77)
+            return 1
+
+        specs = [
+            WorkerSpec(role="explore", instruction="find facts"),
+            WorkerSpec(role="architect", instruction="choose design"),
+        ]
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("inline system-exit containment")
+            for spec in specs:
+                store.save_task(
+                    Task(
+                        job_id=job.id,
+                        role=spec.role,
+                        instruction=spec.instruction,
+                        adapter=spec.adapter,
+                        payload=dict(spec.payload),
+                    )
+                )
+            with patch(
+                "puppetmaster.orchestrator.WorkerRuntime.run_until_idle",
+                _explore_exits,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "aborted"):
+                    Orchestrator(store)._run_inline_workers(
+                        job,
+                        store.list_tasks(job.id),
+                    )
+
     def test_daemon_worker_mode_uses_warm_worker(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
