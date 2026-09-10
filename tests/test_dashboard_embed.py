@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import unittest
 
 from puppetmaster.dashboard import INDEX_HTML, _PAGE_APP_JS, _PAGE_HEAD
@@ -73,6 +75,64 @@ class DashboardEmbedModeTests(unittest.TestCase):
             "const headline = job.job.label || job.job.title || job.job.id;",
             _PAGE_APP_JS,
         )
+
+    def test_runs_list_uses_display_title_not_undefined_headline(self) -> None:
+        start = _PAGE_APP_JS.index("function renderIndex")
+        end = _PAGE_APP_JS.index("function actualCost")
+        render_index = _PAGE_APP_JS[start:end]
+        self.assertIn("jobDisplayTitle(job)", render_index)
+        self.assertNotIn("jobHeadline", render_index)
+        self.assertNotIn("jobHeadline", _PAGE_APP_JS)
+        self.assertNotIn("function jobHeadline", INDEX_HTML)
+        self.assertNotIn("j.label || j.title || j.id", INDEX_HTML)
+
+    def test_display_title_prefers_goal_over_provenance_json(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        start = _PAGE_APP_JS.index("function isProvenanceLabel")
+        end = _PAGE_APP_JS.index("function fmtAgo")
+        prefix = _PAGE_APP_JS[start:end]
+        harness = prefix + r"""
+const assert = require("assert");
+const provenance = '{"session_id":"8cc8a1c2281d","dispatch_id":"call_380675","origin":"marionette"}';
+const truncated = '{"session_id":"8cc8a1c2281d","dispatch_id":"call_380675","origin":"marionette","app';
+assert.equal(isProvenanceLabel(provenance), true);
+assert.equal(isProvenanceLabel(truncated), true);
+assert.equal(isProvenanceLabel("{not-json session_id"), true);
+assert.equal(isProvenanceLabel('{"foo":1}'), false);
+assert.equal(isProvenanceLabel("Audit the catalog"), false);
+assert.equal(
+  jobDisplayTitle({label: provenance, goal: "Audit the offline catalog", id: "job_1"}),
+  "Audit the offline catalog"
+);
+assert.equal(
+  jobDisplayTitle({label: truncated, goal: "Audit the offline catalog", id: "job_1"}),
+  "Audit the offline catalog"
+);
+assert.equal(
+  jobDisplayTitle({label: provenance, goal: provenance, id: "job_1"}),
+  "job_1"
+);
+assert.equal(
+  jobDisplayTitle({label: "Human label", goal: "Ignored goal", id: "job_1"}),
+  "Human label"
+);
+assert.equal(
+  jobDisplayTitle({label: provenance, title: "Derived title", id: "job_1"}),
+  "Derived title"
+);
+assert.equal(
+  jobDisplayTitle({job: {label: provenance, goal: "Host-scoped catalog refresh", id: "job_9"}}),
+  "Host-scoped catalog refresh"
+);
+console.log("display-title-ok");
+"""
+        completed = subprocess.run(
+            [node, "-"], input=harness, capture_output=True, encoding="utf-8", timeout=30
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("display-title-ok", completed.stdout)
 
 
 if __name__ == "__main__":
