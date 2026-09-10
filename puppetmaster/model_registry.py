@@ -1589,10 +1589,17 @@ def apply_agentic_model_pin(
     Bare ``--model meta/muse-spark-1.1`` must carry ``provider=openrouter``
     from the catalog when present; without that, ``AgenticAdapter`` falls
     back to ``openai`` and OpenRouter-only models 400.
+
+    Codex-class GPT-5* pins are hardened to ``provider=openai-codex`` (never
+    ``openai-api``) and ``gpt-5.6-*-pro`` remaps to the base wire id while
+    preserving ``reasoning_effort``.
     """
-    return apply_model_pin(
+    stamped = apply_model_pin(
         payload, model, adapter="agentic", registry=registry
     )
+    from puppetmaster.openai_codex import harden_agentic_openai_payload
+
+    return harden_agentic_openai_payload(stamped)
 
 
 # Role-scorecard helpers live in :mod:`puppetmaster.scorecards` so this module

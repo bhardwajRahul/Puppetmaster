@@ -92,3 +92,131 @@ def merge_request_headers(
                 continue
             out[str(key)] = str(value)
     return out
+
+
+# Codex ChatGPT OAuth wire allow-list (curated catalog + common aliases).
+# *-pro variants are remapped to the base id; anything else fail-closes.
+CODEX_WIRE_MODELS = frozenset(
+    {
+        "gpt-5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.5",
+        "gpt-5.6",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+    }
+)
+
+# gpt-5.6-luna-pro / gpt-5.6-sol-pro / gpt-5.6-terra-pro → base tier id.
+_PRO_TIER_RE = re.compile(
+    r"^(gpt-5(?:\.\d+)?-(?:luna|sol|terra))-pro$",
+    re.IGNORECASE,
+)
+
+# Providers that must never carry Cary's Codex-class GPT-5* pins.
+_FORBIDDEN_OPENAI_API_PROVIDERS = frozenset({"openai-api", "openai"})
+
+
+class UnknownCodexModelError(ValueError):
+    """Raised when an openai-codex model id is not remappable and not allow-listed."""
+
+
+def is_codex_class_gpt_model(model: str) -> bool:
+    """True for bare gpt-5 / gpt-5.* ids (including -pro / registry prefixes)."""
+    bare = normalize_model_id(model).lower()
+    if not bare:
+        return False
+    return bare == "gpt-5" or bare.startswith("gpt-5.") or bare.startswith("gpt-5-")
+
+
+def remap_codex_pro_model(model: str) -> tuple[str, Optional[str]]:
+    """Remap ``gpt-5.6-*-pro`` → base tier; return ``(wire_id, remapped_from)``.
+
+    Prefer remap over hard-reject for ``*-pro`` so ``reasoning_effort`` (esp.
+    ``max``) can still ride the base Codex model. Non-pro ids are returned
+    unchanged with ``remapped_from=None``.
+    """
+    bare = normalize_model_id(model)
+    if not bare:
+        return "", None
+    match = _PRO_TIER_RE.match(bare)
+    if match:
+        return match.group(1), bare
+    return bare, None
+
+
+def harden_codex_model_id(model: str) -> tuple[str, Optional[str]]:
+    """Normalize + remap ``*-pro``, then fail-closed on unknown wire ids.
+
+    Returns ``(wire_model, remapped_from)``. Never returns a ``*-pro`` id.
+    """
+    wire, remapped_from = remap_codex_pro_model(model)
+    if not wire:
+        raise UnknownCodexModelError(
+            f"openai-codex model id is empty after normalizing {model!r}"
+        )
+    if wire.lower() not in {m.lower() for m in CODEX_WIRE_MODELS}:
+        raise UnknownCodexModelError(
+            f"openai-codex model {wire!r} (from {model!r}) is not supported "
+            f"on ChatGPT Codex OAuth. Allowed: {', '.join(sorted(CODEX_WIRE_MODELS))}."
+        )
+    return wire, remapped_from
+
+
+def refuse_openai_api_provider(provider: str, model: str) -> Optional[str]:
+    """If *provider* is openai-api for a Codex-class GPT model, return openai-codex.
+
+    Cary's OpenAI models must always use Codex auth (``OPENAI_CODEX_TOKEN``),
+    never ``openai-api`` / ``OPENAI_API_KEY``. Returns ``None`` when no remap
+    is required.
+    """
+    slug = (provider or "").strip().lower()
+    if slug not in _FORBIDDEN_OPENAI_API_PROVIDERS:
+        return None
+    if not is_codex_class_gpt_model(model):
+        return None
+    return PROVIDER_SLUG
+
+
+def harden_agentic_openai_payload(payload: dict) -> dict:
+    """Force Codex auth + remap ``*-pro`` for agentic GPT-5* pins.
+
+    Merges under the caller's keys except ``provider`` / ``model`` when a
+    harden rule applies. Preserves ``reasoning_effort`` unchanged.
+    """
+    merged = dict(payload or {})
+    model = str(merged.get("model") or "").strip()
+    provider = str(merged.get("provider") or "").strip().lower()
+    if not model:
+        return merged
+
+    forced = refuse_openai_api_provider(provider, model)
+    if forced is not None:
+        merged["provider"] = forced
+        provider = forced
+    elif not provider and is_codex_class_gpt_model(model):
+        # Bare GPT-5* agentic pins default to Codex OAuth, never openai-api.
+        merged["provider"] = PROVIDER_SLUG
+        provider = PROVIDER_SLUG
+
+    if provider == PROVIDER_SLUG or (
+        is_codex_class_gpt_model(model) and provider in ("", PROVIDER_SLUG)
+    ):
+        try:
+            wire, remapped_from = harden_codex_model_id(model)
+        except UnknownCodexModelError:
+            # Leave model as-is for non-codex providers; for openai-codex
+            # re-raise so dispatch fail-closes with a clear error.
+            if provider == PROVIDER_SLUG:
+                raise
+            return merged
+        if remapped_from:
+            merged["model"] = wire
+            merged["codex_pro_remapped_from"] = remapped_from
+            if merged.get("pinned_adapter_model_name") == remapped_from:
+                merged["pinned_adapter_model_name"] = wire
+        elif wire != model and normalize_model_id(model) == wire:
+            merged["model"] = wire
+    return merged

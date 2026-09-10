@@ -434,6 +434,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if not model:
             return [self._fail(task, worker_id, evidence_base, "no_model",
                                "No model name on the task payload.")]
+        if provider == "openai-codex":
+            from puppetmaster.openai_codex import (
+                UnknownCodexModelError,
+                harden_codex_model_id,
+            )
+            try:
+                model, _remapped = harden_codex_model_id(model)
+            except UnknownCodexModelError as exc:
+                return [self._fail(
+                    task, worker_id, evidence_base, "model_unavailable", str(exc),
+                )]
 
         if implement:
             return self._run_implement(task, goal, worker_id, provider, model, evidence_base)
@@ -447,8 +458,19 @@ class AgenticAdapter(FullEditWorkerAdapter):
         The catalog stamps ``payload_defaults.provider`` (merged into the task
         payload by the router), mirroring the Hermes provider-stamp pattern.
         Falls back to ``openai`` so a bare model still has a sane wire.
+
+        Codex-class GPT-5* models never ride ``openai-api`` / bare ``openai``:
+        they are remapped to ``openai-codex`` (OPENAI_CODEX_TOKEN).
         """
-        return str(task.payload.get("provider") or "openai").strip().lower()
+        from puppetmaster.openai_codex import (
+            PROVIDER_SLUG as CODEX_PROVIDER,
+            refuse_openai_api_provider,
+        )
+
+        provider = str(task.payload.get("provider") or "openai").strip().lower()
+        model = str(task.payload.get("model") or "").strip()
+        forced = refuse_openai_api_provider(provider, model)
+        return forced or provider
 
     def _extra_params(self, task: Task) -> dict:
         """Optional generation knobs, passed through when present."""
@@ -2426,7 +2448,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
             "failure": reason,
             "returncode": status,
             "stderr": detail[:8000],
+            "provider_body": detail[:8000],
         }
+        if status is not None:
+            payload["http_status"] = status
         if provider_reason is not None:
             payload["provider_reason"] = provider_reason
         return verification_artifact(
