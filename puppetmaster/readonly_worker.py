@@ -81,22 +81,20 @@ def same_store_write(before, after):
             before[:2] == after[:2] and before[2:4] != after[2:4])
 
 
-def open_stamp(stamp_tuple):
-    """Stamp compared after this helper opens the db for the lock.
+def adopt_darwin_open_ctime(before, descriptor_after_open):
+    """Rebase the pre-open main stamp after Darwin r+b LOCK_EX.
 
-    Darwin APFS updates ctime on a writable open of some files (the host
-    ``state.sqlite3`` under Application Support). That is not a replaced
-    inode. Windows ChangeTime stays in the comparison.
+    APFS can bump ctime on a writable open of the same inode (Application
+    Support ``state.sqlite3``). That is not a replaced file. Later full-tuple
+    compares still fence ABA. Keep a list so it stays type-equal to stamps().
     """
-    if stamp_tuple is None:
-        return None
-    if sys.platform == 'darwin':
-        return stamp_tuple[:4]
-    return stamp_tuple
-
-
-def open_stamps(rows):
-    return tuple(open_stamp(item) for item in rows)
+    main = before[0]
+    if (sys.platform != 'darwin' or main is None or descriptor_after_open is None
+            or main[:4] != descriptor_after_open[:4]):
+        return before
+    adopted = list(before)
+    adopted[0] = descriptor_after_open
+    return adopted
 
 
 def emit(value):
@@ -285,8 +283,14 @@ def main(path, *, wal_snapshot=False):
         uri = (path.resolve().as_uri() + ('?mode=ro' if wal_snapshot else '?mode=ro&immutable=1') if os.name == 'nt'
                else descriptor_uri(source.fileno()))
         descriptor_before = source_stamp(fd=source.fileno())
-        if ((descriptor_before[:2] if wal_snapshot else open_stamp(descriptor_before)) !=
-                (before[0][:2] if wal_snapshot else open_stamp(before[0]))):
+        if wal_snapshot:
+            bound = descriptor_before[:2] == before[0][:2]
+        elif sys.platform == 'darwin' and descriptor_before[:4] == before[0][:4]:
+            bound = True
+            before = adopt_darwin_open_ctime(before, descriptor_before)
+        else:
+            bound = descriptor_before == before[0]
+        if not bound:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       same_store_write=same_store_write(before[0], descriptor_before)))
             return
@@ -342,7 +346,7 @@ def main(path, *, wal_snapshot=False):
                 emit(dict(kind='OperationalError', error='database is locked'))
                 return
         after = _stamps_after_open(path)
-        if not wal_snapshot and open_stamps(after) != open_stamps(before):
+        if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
                       same_store_write=same_store_write(before[0], after[0])))
@@ -357,7 +361,7 @@ def main(path, *, wal_snapshot=False):
                       code=5))
             return
         after = _stamps_after_open(path)
-        if not wal_snapshot and open_stamps(after) != open_stamps(before):
+        if not wal_snapshot and after != before:
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
             return
@@ -378,13 +382,13 @@ def main(path, *, wal_snapshot=False):
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('BEGIN')
             c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
-            if not wal_snapshot and open_stamps(_stamps_after_open(path)) != open_stamps(before):
+            if not wal_snapshot and _stamps_after_open(path) != before:
                 emit(dict(kind='unavailable', error='unable to open database: source changed'))
                 return
             def unchanged():
                 current = source_stamp(fd=source.fileno())
                 return (current[:2] == descriptor_before[:2] if wal_snapshot
-                        else open_stamp(current) == open_stamp(descriptor_before))
+                        else current == descriptor_before)
             emit(dict(journal='wal' if header[18:20] == b'\x02\x02' else 'delete'))
             def event(name, args):
                 emit(dict(event=name, args=args))

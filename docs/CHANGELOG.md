@@ -8,10 +8,9 @@ Opening `state.sqlite3` `r+b` for LOCK_EX on APFS (including
 `~/Library/Application Support/.../state.sqlite3`) updates ctime without
 changing inode, size, or mtime. Stamp equality used the full 5-tuple, so
 MCP/CLI `doctor`, `jobs`, `status`, and `artifacts` failed with
-`unable to open database: source changed`. Darwin now compares
-`(dev, ino, size, mtime)` after the helper opens; Windows keeps ChangeTime.
-Replacement still changes inode. Tests cover Darwin ctime-only reads and
-Windows ctime rejection.
+`unable to open database: source changed`. Darwin rebases that one post-open
+ctime onto the bound stamp; later ABA still uses the full tuple. Windows
+keeps ChangeTime. Replacement still changes inode.
 
 ## v1.27.7 — 2026-09-10
 
