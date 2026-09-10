@@ -1,3 +1,14 @@
+## v1.27.5 — 2026-09-09
+
+**Dashboard Runs list: prefer human goal over Marionette provenance JSON.**
+
+- `renderIndex` used `jobHeadline`, which painted `job.label` (session/dispatch/origin
+  JSON) as the strong title. The list now uses `jobDisplayTitle` — goal first,
+  job id as the secondary line, full goal on hover.
+- Truncated provenance JSON that still starts with `{` and mentions
+  `session_id` / `dispatch_id` / `origin` is treated as provenance even when
+  `JSON.parse` fails.
+
 ## v1.27.4 — 2026-09-09
 
 **Same-job continuous planner: intent before fan-out, typed handoffs, kernel requeue.**

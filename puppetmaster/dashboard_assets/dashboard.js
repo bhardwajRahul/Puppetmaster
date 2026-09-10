@@ -45,7 +45,8 @@ function isProvenanceLabel(label) {
     const data = JSON.parse(text);
     return !!(data && typeof data === "object" && (data.session_id || data.dispatch_id || data.origin));
   } catch (_err) {
-    return false;
+    // List APIs may truncate mid-JSON; still treat `{` + host keys as provenance.
+    return text.includes("session_id") || text.includes("dispatch_id") || text.includes("origin");
   }
 }
 
@@ -158,7 +159,7 @@ function renderIndex() {
   const query = jobSearch.trim().toLowerCase();
   const shown = latestJobs.filter(job => {
     const statusMatch = jobFilter === "all" || job.status === jobFilter;
-    const text = [jobHeadline(job), job.goal, job.id, job.project].filter(Boolean).join(" ").toLowerCase();
+    const text = [jobDisplayTitle(job), job.goal, job.id, job.project].filter(Boolean).join(" ").toLowerCase();
     return statusMatch && (!query || text.includes(query));
   });
   const activeCount = latestJobs.filter(job => ["running", "queued", "stitching", "in_progress"].includes(job.status)).length;
@@ -177,7 +178,10 @@ function renderIndex() {
     html += '<div class="run-list">';
     for (const job of shown) {
       const href = jobHref(job.id, embedMode);
-      html += `<a class="run-row" href="${href}" aria-label="Open ${esc(jobHeadline(job))}">${statusLabel(job.status)}<span class="run-name"><strong title="${esc(job.goal)}">${esc(jobHeadline(job))}</strong><span>${esc(job.id)}</span></span><span class="run-project">${esc(job.project || projectLabel(meta) || "Local workspace")}</span><time class="run-time" datetime="${esc(job.created_at || "")}">${esc(fmtAgo(job.created_at))}</time></a>`;
+      const title = jobDisplayTitle(job);
+      const goalText = String(job.goal || "").trim();
+      const tooltip = goalText && !isProvenanceLabel(goalText) ? goalText : title;
+      html += `<a class="run-row" href="${href}" aria-label="Open ${esc(title)}">${statusLabel(job.status)}<span class="run-name"><strong title="${esc(tooltip)}">${esc(title)}</strong><span>${esc(job.id)}</span></span><span class="run-project">${esc(job.project || projectLabel(meta) || "Local workspace")}</span><time class="run-time" datetime="${esc(job.created_at || "")}">${esc(fmtAgo(job.created_at))}</time></a>`;
     }
     html += "</div>";
   }
