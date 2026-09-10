@@ -1,5 +1,13 @@
 ## Unreleased
 
+## v1.27.7 — 2026-09-10
+
+**openai-codex harden (#169).**
+
+Remap `gpt-5.6-{luna,sol,terra}-pro` pins to the base Codex wire id while keeping `reasoning_effort`. Refuse `openai-api` for GPT-5* agentic pins (force `openai-codex`). Verification HTTP 400 / failed execution_status marks the task FAILED and surfaces a short provider body in Alerts.
+
+Files: openai-codex routing / agentic verification paths from #169.
+
 ## v1.27.6 — 2026-09-09
 
 **Orchestration durability: command ledger, run journal, WorkspaceScope (#167).**

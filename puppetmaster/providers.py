@@ -2030,9 +2030,10 @@ def _openai_codex_chat(
 ) -> AssistantTurn:
     """ChatGPT Codex Responses call — always SSE (backend rejects non-stream)."""
     from puppetmaster.openai_codex import (
+        UnknownCodexModelError,
         driver_base_url,
+        harden_codex_model_id,
         merge_request_headers,
-        normalize_model_id,
     )
 
     if not api_key:
@@ -2040,7 +2041,10 @@ def _openai_codex_chat(
             "no OPENAI_CODEX_TOKEN for openai-codex",
             reason="not_authenticated",
         )
-    bare = normalize_model_id(model)
+    try:
+        bare, _remapped_from = harden_codex_model_id(model)
+    except UnknownCodexModelError as exc:
+        raise ProviderError(str(exc), reason="unsupported_model") from exc
     if not bare:
         raise ProviderError(
             f"empty openai-codex model id from {model!r}",
