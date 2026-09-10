@@ -2,7 +2,8 @@
 
 ## v1.27.9 — 2026-09-10
 
-**OpenCode Go swarm workers send `x-opencode-session`.**
+**OpenCode Go swarm workers send `x-opencode-session`. Inline worker
+BaseException cannot kill the host process.**
 
 Agentic `_post_json` / `_open_stream` / `_opencode_go_chat` stamp
 `x-opencode-session` on opencode.ai hosts. Sticky id prefers an explicit
@@ -11,6 +12,14 @@ session, then `PUPPETMASTER_JOB_SESSION_ID` / `PUPPETMASTER_JOB_ID` /
 header was HTTP 400 `MissingSessionID` on every Go swarm worker. The
 Marionette chat-pilot helper in `pmharness/drivers/` never ran on this
 path.
+
+Inline role workers (`ThreadPoolExecutor` + `future.result()`) now convert
+`SystemExit` / other `BaseException` into `RuntimeError` so
+`crash_after_claim` (exit 77) and similar aborts fail the job instead of
+taking down an in-process Marionette backend. Sibling roles still finish
+before the first exception is re-raised. Regular `Exception` still
+propagates. `ProviderError` (including HTTP 400) was already contained in
+`WorkerRuntime.run_once`; it is not a process killer.
 
 ## v1.27.8 — 2026-09-10
 
