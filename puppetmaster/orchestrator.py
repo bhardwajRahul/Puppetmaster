@@ -2520,19 +2520,39 @@ class Orchestrator:
             return 0
 
         def _run_role(role: str) -> int:
-            runtime = WorkerRuntime(
-                store=self.store,
-                job_id=job.id,
-                role=role,
-                worker_id=f"worker-{role}-inline",
-                lease_seconds=lease_seconds,
-            )
-            return runtime.run_until_idle()
+            try:
+                runtime = WorkerRuntime(
+                    store=self.store,
+                    job_id=job.id,
+                    role=role,
+                    worker_id=f"worker-{role}-inline",
+                    lease_seconds=lease_seconds,
+                )
+                return runtime.run_until_idle()
+            except Exception:
+                raise
+            except BaseException as exc:
+                # SystemExit(77) is the crash_after_claim test hook. Inline
+                # workers share the Marionette backend process — do not let
+                # BaseException kill the host. Re-raise as Exception so
+                # Orchestrator.run can mark the job failed.
+                raise RuntimeError(
+                    f"inline worker {role!r} aborted: {type(exc).__name__}: {exc}"
+                ) from exc
 
         pool_size = min(len(roles), _INLINE_ROLE_WORKER_POOL_CAP)
         with ThreadPoolExecutor(max_workers=pool_size) as executor:
             futures = [executor.submit(_run_role, role) for role in roles]
-            return sum(future.result() for future in futures)
+            completed = 0
+            errors: list[BaseException] = []
+            for future in futures:
+                try:
+                    completed += int(future.result() or 0)
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                raise errors[0]
+            return completed
 
     def _wait_for_daemon_workers(
         self,
