@@ -88,6 +88,80 @@ class GrokComposerEnabledRegistryTests(unittest.TestCase):
 
 
 class AllowedModelFilterTests(unittest.TestCase):
+    def test_canonical_agentic_id_does_not_match_other_provider(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, model_id_allowed
+        from puppetmaster.router import TaskSignals, route_task
+
+        opencode = ModelSpec(
+            id="agentic/deepseek-flash",
+            adapter="agentic",
+            adapter_model_name="deepseek-flash",
+            capability_score=70,
+            input_per_mtok_usd=1.0,
+            output_per_mtok_usd=1.0,
+            payload_defaults={"provider": "opencode-go"},
+        )
+        openrouter = ModelSpec(
+            id="agentic/openrouter/deepseek-flash",
+            adapter="agentic",
+            adapter_model_name="deepseek-flash",
+            capability_score=70,
+            input_per_mtok_usd=1.1,
+            output_per_mtok_usd=1.1,
+            payload_defaults={"provider": "openrouter"},
+        )
+        allowed = frozenset({"agentic/openrouter/deepseek-flash"})
+
+        self.assertFalse(model_id_allowed(opencode, allowed))
+        self.assertTrue(model_id_allowed(openrouter, allowed))
+        with mock.patch("puppetmaster.providers.available_providers", return_value={"opencode-go", "openrouter"}):
+            decision = route_task(
+                TaskSignals(
+                    instruction="implement a small fix",
+                    role="implement",
+                    allowed_model_ids=allowed,
+                ),
+                [opencode, openrouter],
+                policy="cheap",
+            )
+        self.assertEqual(decision.model.id, "agentic/openrouter/deepseek-flash")
+
+    def test_qualified_provider_model_only_matches_same_provider(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, model_id_allowed
+
+        spec = ModelSpec(
+            id="agentic/openrouter/deepseek-flash",
+            adapter="agentic",
+            adapter_model_name="deepseek-flash",
+            payload_defaults={"provider": "openrouter"},
+        )
+        self.assertTrue(model_id_allowed(spec, ["openrouter:deepseek-flash"]))
+        self.assertTrue(model_id_allowed(spec, ["openrouter/deepseek-flash"]))
+        self.assertFalse(model_id_allowed(spec, ["opencode-go:deepseek-flash"]))
+
+    def test_bare_adapter_model_alias_remains_supported(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, model_id_allowed
+
+        spec = ModelSpec(
+            id="codex/gpt-5-6-luna",
+            adapter="codex",
+            adapter_model_name="gpt-5.6-luna",
+        )
+        self.assertTrue(model_id_allowed(spec, ["gpt-5.6-luna"]))
+
+    def test_provider_alias_preserves_namespaced_sdk_model(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, model_id_allowed
+
+        spec = ModelSpec(
+            id="agentic/google/gemini-flash",
+            adapter="agentic",
+            adapter_model_name="google/gemini-flash",
+            payload_defaults={"provider": "openrouter"},
+        )
+        self.assertTrue(model_id_allowed(spec, ["openrouter:google/gemini-flash"]))
+        self.assertFalse(model_id_allowed(spec, ["opencode-go:google/gemini-flash"]))
+        self.assertFalse(model_id_allowed(spec, ["agentic/google-gemini-flash"]))
+
     def test_allowed_model_ids_accept_adapter_names_and_registry_ids(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
 
