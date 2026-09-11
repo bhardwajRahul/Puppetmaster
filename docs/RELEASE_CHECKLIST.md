@@ -17,7 +17,7 @@ resume that; every bump now carries semver meaning.
 Use this before sharing Puppetmaster publicly.
 
 - CI passes on the default branch.
-- `python -m unittest discover -s tests -v` passes locally.
+- `python -m unittest discover -s tests -v` passes locally. CI Windows uses `UNITTEST_SHARD` via `python -m tests.ci_shard`; the local full suite stays discover.
 - `python -m puppetmaster doctor` has no unexpected warnings.
 - `python -m puppetmaster crash-demo` completes.
 - Cursor adapter smoke test has been run locally with a real `CURSOR_API_KEY`.

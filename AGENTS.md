@@ -153,7 +153,7 @@ Puppetmaster keeps a **read-only, local, numbers-only** ledger of what it saved,
 - Tests live under `tests/` (`test_*.py`). New behavior gets a focused hermetic `unittest`; mock subprocess calls for adapter coverage.
 - The `SwarmStore` abstract base is the storage seam — the SQLite implementation lives in `puppetmaster/sqlite_store.py` and overrides hot methods for O(1) cursor reads. Don't break that contract.
 - Don't commit provider keys, `.cursor/mcp.json` user-specific paths, or anything in `.puppetmaster/` runtime state.
-- Run `python -m unittest discover -s tests -v` before suggesting a commit. CI is unittest discover, not pytest.
+- Run `python -m unittest discover -s tests -v` before suggesting a commit. CI is unittest discover, not pytest. Windows CI shards via `UNITTEST_SHARD` and `python -m tests.ci_shard`; the local full suite stays unsharded discover.
 
 ## MCP surface (quick reference)
 

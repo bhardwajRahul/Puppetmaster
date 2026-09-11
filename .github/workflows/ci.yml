@@ -7,26 +7,23 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # All three OSes are required and must stay green. Windows was hardened
-    # (sqlite handle close, non-POSIX path splitting, msvcrt advisory lock,
-    # crash-proof doctor) and now passes as a blocking leg.
+    # Linux and macOS stay unsharded here. Windows is the sharded
+    # test-windows job below and remains a required green leg.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.9", "3.12"]
         exclude:
           # Keep the matrix lean: exercise the full OS spread on the current
-          # Python, and the version spread on Linux. (3.9 + macOS/Windows is
-          # covered transitively by 3.12 on those OSes and 3.9 on Linux.)
+          # Python, and the version spread on Linux. (3.9 + macOS is covered
+          # transitively by 3.12 on macOS and 3.9 on Linux.)
           - os: macos-latest
-            python-version: "3.9"
-          - os: windows-latest
             python-version: "3.9"
     defaults:
       run:
-        # GitHub provides bash on every runner (Git Bash on Windows), so the
-        # heredoc-based steps below run identically across all three OSes.
+        # GitHub provides bash on macOS/Linux; Windows shards use Git Bash
+        # in test-windows so heredoc steps stay identical.
         shell: bash
     steps:
       - uses: actions/checkout@v6
@@ -61,6 +58,79 @@ jobs:
           python -m puppetmaster crash-demo
           python -m puppetmaster clean --completed
       - name: Check README links
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          missing = []
+          for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", readme):
+              target = match.group(1)
+              if target.startswith(("http://", "https://", "#")):
+                  continue
+              if not Path(target).exists():
+                  missing.append(target)
+          if missing:
+              print("missing README links:", ", ".join(missing))
+              sys.exit(1)
+          print("README local links ok")
+          PY
+
+  test-windows:
+    # CI_WINDOWS_RUNNER is an optional hosted-runner swap. Unset, this job
+    # stays on GitHub-hosted windows-latest so CI never queues on a missing
+    # label. Set the repo variable later if a hosted Windows runner is added.
+    runs-on: ${{ vars.CI_WINDOWS_RUNNER || 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Install optional Node dependencies
+        run: npm install --package-lock=false --no-audit
+      - name: Smoke check Cursor runner syntax
+        run: npm run smoke:cursor-runner
+      - name: Run Python tests (shard ${{ matrix.shard }}/4)
+        env:
+          UNITTEST_SHARD: ${{ matrix.shard }}/4
+        run: python -m tests.ci_shard
+      - name: Smoke check CLI metadata
+        if: ${{ matrix.shard == 1 }}
+        run: |
+          python -m puppetmaster --help
+          python -m puppetmaster adapters
+      - name: Run doctor
+        if: ${{ matrix.shard == 1 }}
+        run: python -m puppetmaster doctor
+      - name: Run SQLite demo
+        if: ${{ matrix.shard == 1 }}
+        run: python -m puppetmaster run "CI enterprise workflow" --config examples/enterprise-workflow.json
+      - name: Smoke check memory retrieval
+        if: ${{ matrix.shard == 1 }}
+        run: python -m puppetmaster run "CI memory reuse independent workers" --config examples/memory-reuse.json
+      - name: Smoke check daily-driver CLI
+        if: ${{ matrix.shard == 1 }}
+        run: |
+          python -m puppetmaster last
+          python -m puppetmaster logs
+          python -m puppetmaster diff
+          python -m puppetmaster rerun --config examples/enterprise-workflow.json
+          python -m puppetmaster crash-demo
+          python -m puppetmaster clean --completed
+      - name: Check README links
+        if: ${{ matrix.shard == 1 }}
         run: |
           python - <<'PY'
           from pathlib import Path

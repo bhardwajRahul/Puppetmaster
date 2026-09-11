@@ -11,6 +11,8 @@ python -m puppetmaster run "Contributor smoke test" --config examples/enterprise
 python -m puppetmaster crash-demo
 ```
 
+CI Windows shards unittest with `UNITTEST_SHARD` via `python -m tests.ci_shard`; the local full suite stays `python -m unittest discover -s tests -v`.
+
 ## Patch Expectations
 
 - Keep worker outputs structured.
