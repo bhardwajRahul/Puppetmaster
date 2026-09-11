@@ -1618,9 +1618,14 @@ def _build_tools() -> list[McpTool]:
         ),
         McpTool(
             name="puppetmaster_last_job",
-            description="Return the most recent Puppetmaster job id.",
+            description=(
+                "Return the most recent job IN THIS STATE DIR as a bind object "
+                "(job_id, status, state_dir, goal_preview, role_count, "
+                "finding_count). Not a global last job — Marionette app swarms "
+                "often live in a different store."
+            ),
             input_schema=base_schema(),
-            handler=lambda args: run_cli(["last"], args),
+            handler=lambda args: run_cli(["last", "--json"], args),
         ),
         McpTool(
             name="puppetmaster_status",

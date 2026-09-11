@@ -72,6 +72,48 @@ from puppetmaster.workers import WorkerSpec
 
 from puppetmaster.cli.helpers import _registry_path_from_args
 
+_LAST_GOAL_PREVIEW_CHARS = 160
+_LAST_STORE_SCOPE = (
+    "This id is from THIS state_dir only. Marionette app jobs often live in "
+    "~/.pmharness; Cursor MCP last uses the workspace store. artifacts on a "
+    "foreign job_id fail closed."
+)
+
+
+def last_job_bind(store, job, state_dir=None):
+    """Structured bind for `last --json` / MCP last_job. Never a naked id."""
+    job_id = str(getattr(job, "id", "") or "")
+    goal = str(getattr(job, "goal", "") or "")
+    root = Path(state_dir) if state_dir is not None else Path(getattr(store, "root", "") or "")
+    try:
+        root = root.resolve()
+    except Exception:
+        pass
+    tasks = []
+    artifacts = []
+    try:
+        tasks = list(store.list_tasks(job_id) or [])
+    except Exception:
+        tasks = []
+    try:
+        artifacts = list(store.list_artifacts(job_id) or [])
+    except Exception:
+        artifacts = []
+    finding_count = 0
+    for art in artifacts:
+        kind = str(getattr(art, "type", "") or "").lower()
+        if kind in {"finding", "risk", "decision"}:
+            finding_count += 1
+    return {
+        "job_id": job_id,
+        "status": str(getattr(job, "status", "") or ""),
+        "state_dir": str(root),
+        "goal_preview": goal[:_LAST_GOAL_PREVIEW_CHARS],
+        "role_count": len(tasks),
+        "finding_count": finding_count,
+        "store_scope": _LAST_STORE_SCOPE,
+    }
+
 
 def read_job_state(store, job_id: str, *, timed_out: bool = False, stall_after_seconds=None,
                    reference=None) -> dict:

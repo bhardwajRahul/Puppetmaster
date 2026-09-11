@@ -1,5 +1,17 @@
 ## Unreleased
 
+## v1.27.10 — 2026-09-10
+
+**`last --json` / MCP `puppetmaster_last_job` return a store-scoped bind, not a naked id.**
+
+A Cursor MCP `last` call uses the workspace store. Marionette app swarms often
+live in `~/.pmharness`. The bare id made agents treat another store's latest
+job as the swarm they just launched — including another job's roles, route,
+and findings. CLI `puppetmaster last` still prints only the id. `--json` and
+the MCP tool now include `job_id`, `status`, `state_dir`, `goal_preview`,
+`role_count`, `finding_count`, and a store-scope note. Cross-store
+`artifacts` already fail closed.
+
 ## v1.27.9 — 2026-09-10
 
 **OpenCode Go swarm workers send `x-opencode-session`. Inline worker
