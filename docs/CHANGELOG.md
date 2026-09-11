@@ -1,5 +1,19 @@
 ## Unreleased
 
+## v1.27.12 — 2026-09-11
+
+**First-run probe reads the persisted adapter wire name, not a stripped registry id.**
+
+- `setup --verify-first-run` compared the persisted Codex wire name against
+  the registry id with `codex/` stripped. Canonical ids are dashed aliases
+  (`codex/gpt-5-6-sol`); the run stamps the dotted adapter name (`gpt-5.6-sol`).
+  Every live pin failed with "Persisted model identity differs from the exact
+  requested pin".
+- Read the expected wire from `pinned_adapter_model_name` on the persisted
+  payload. Registry id to wire stays at launch in `routing_authority`; a
+  registry edit between run and validation cannot change the verdict.
+- Absorbed from #181 (@kbentonferguson).
+
 ## v1.27.11 — 2026-09-11
 
 **DeepSeek tool reasoning and provider-scoped model selection.**
