@@ -1,5 +1,21 @@
 ## Unreleased
 
+## v1.27.11 — 2026-09-11
+
+**DeepSeek tool reasoning and provider-scoped model selection.**
+
+- Preserve the provider's `reasoning_content` field through both Chat
+  Completions parsers and replay it on assistant tool messages, including
+  whitespace and empty values. DeepSeek previously rejected the next request
+  with HTTP 400 because the field had been renamed to `reasoning`.
+- Match qualified model allowlists by their complete provider/registry identity,
+  so enabling one provider cannot authorize the same model through another.
+  Preserve bare SDK aliases for standalone callers.
+- Keep existing `reasoning` and encrypted `reasoning_details` handling intact.
+- Cover the provider-to-worker round trip with a regression test. Live OpenCode
+  Go `deepseek-flash` completed a read-file and submit-findings tool loop with
+  the required field present on the second request.
+
 ## v1.27.10 — 2026-09-10
 
 **`last --json` / MCP `puppetmaster_last_job` return a store-scoped bind, not a naked id.**
@@ -3399,5 +3415,4 @@ Polish pass after v0.7.0 â diagnostics, doctor honesty, and README freshnes
 - Broaden provider adapters beyond Cursor.
 - Improve patch artifact generation and isolated apply flows.
 - Add richer watch output and scripting-friendly JSON modes.
-
 

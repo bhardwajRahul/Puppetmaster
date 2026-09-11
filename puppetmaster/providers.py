@@ -543,7 +543,7 @@ class AssistantTurn:
     ``arguments`` is a parsed dict. ``text`` is the assistant's prose (may be
     empty when the turn is purely tool calls).
 
-    ``reasoning`` / ``reasoning_details`` carry provider reasoning blocks that
+    ``reasoning`` / ``reasoning_content`` / ``reasoning_details`` carry provider reasoning blocks that
     some models (notably Meta Muse Spark) require echoed back on later turns so
     encrypted chain-of-thought continuity is preserved across tool loops.
     """
@@ -558,6 +558,7 @@ class AssistantTurn:
     # Raw present fields for the invocation ledger; normalized usage stays compatible.
     accounting_usage: Optional[dict] = None
     accounting_complete: bool = True
+    reasoning_content: Optional[str] = None
 
 
 class ProviderError(Exception):
@@ -796,9 +797,12 @@ def _openai_chat(
             args = {"__raw__": raw_args}
         tool_calls.append({"id": call.get("id") or "", "name": fn.get("name") or "", "arguments": args})
     usage = data.get("usage") or {}
+    reasoning_content = message.get("reasoning_content") if "reasoning_content" in message else None
+    if reasoning_content is not None:
+        reasoning_content = str(reasoning_content)
     reasoning_raw = message.get("reasoning")
     if reasoning_raw is None:
-        reasoning_raw = message.get("reasoning_content")
+        reasoning_raw = reasoning_content
     reasoning_text = str(reasoning_raw or "").strip()
     details = message.get("reasoning_details")
     if details is not None and not isinstance(details, list):
@@ -811,6 +815,7 @@ def _openai_chat(
         usage=_openai_usage_fields(usage),
         raw=data,
         reasoning=reasoning_text,
+        reasoning_content=reasoning_content,
         reasoning_details=details if isinstance(details, list) else None,
     )
 
@@ -1229,6 +1234,8 @@ def _openai_chat_stream(
     )
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    reasoning_content_parts: list[str] = []
+    reasoning_content_seen = False
     reasoning_details_acc: list = []
     tool_acc: dict[int, dict] = {}
     complete = False
@@ -1252,7 +1259,13 @@ def _openai_chat_stream(
                     text_parts.append(piece)
                     if on_delta:
                         on_delta("text", piece)
-                reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                if "reasoning_content" in delta:
+                    reasoning_content_seen = True
+                    if delta["reasoning_content"] is not None:
+                        reasoning_content_parts.append(str(delta["reasoning_content"]))
+                reasoning = delta.get("reasoning")
+                if reasoning is None:
+                    reasoning = delta.get("reasoning_content")
                 if reasoning:
                     reasoning_parts.append(str(reasoning))
                     if on_delta:
@@ -1294,6 +1307,7 @@ def _openai_chat_stream(
         usage=_openai_usage_fields(usage),
         raw={},
         reasoning="".join(reasoning_parts).strip(),
+        reasoning_content=("".join(reasoning_content_parts) if reasoning_content_seen else None),
         reasoning_details=reasoning_details_acc or None,
     )
 

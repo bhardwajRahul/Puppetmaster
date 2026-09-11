@@ -1375,22 +1375,34 @@ def model_identity_tokens(value: str) -> set[str]:
 
 
 def model_id_allowed(spec: ModelSpec, allowed: Optional[Iterable[str]]) -> bool:
-    """True when ``spec`` matches any entry in an explicit allowed-model set.
+    """Match qualified identities exactly; retain bare SDK slug aliases.
 
-    An empty/None allowlist means "no restriction". Matching is deliberately
-    loose across registry id, adapter model name, and slug-normalized forms so
-    callers can pass either ``grok-4.5`` or ``cursor/grok-4-5``.
+    Empty/None means unrestricted here; routing admission rejects an explicit
+    empty allowlist before calling this helper.
     """
     if allowed is None:
         return True
     allowed_list = [str(item).strip() for item in allowed if str(item).strip()]
     if not allowed_list:
         return True
-    spec_tokens: set[str] = set()
-    for value in (spec.id, spec.adapter_model_name):
-        spec_tokens |= model_identity_tokens(value)
+    provider = str((spec.payload_defaults or {}).get("provider") or "").strip()
+    spec_id = tuple(_normalize_model_token(part) for part in spec.id.split("/"))
+    model_id = tuple(_normalize_model_token(part) for part in spec.adapter_model_name.split("/"))
     for raw in allowed_list:
-        if model_identity_tokens(raw) & spec_tokens:
+        if ":" in raw or "/" in raw:
+            # Preserve namespace boundaries while allowing punctuation aliases
+            # within each component (gpt-5.6-luna and gpt-5-6-luna).
+            if ":" not in raw and tuple(_normalize_model_token(part) for part in raw.split("/")) == spec_id:
+                return True
+            raw_provider, _, raw_model = raw.partition(":" if ":" in raw else "/")
+            if (
+                provider
+                and _normalize_model_token(raw_provider) == _normalize_model_token(provider)
+                and tuple(_normalize_model_token(part) for part in raw_model.split("/")) == model_id
+            ):
+                return True
+            continue
+        if model_identity_tokens(raw) & model_identity_tokens(spec.adapter_model_name):
             return True
     return False
 

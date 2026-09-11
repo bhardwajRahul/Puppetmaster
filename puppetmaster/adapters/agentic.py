@@ -1430,6 +1430,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             }
             if turn.reasoning_details:
                 assistant_msg["reasoning_details"] = turn.reasoning_details
+            if turn.reasoning_content is not None:
+                assistant_msg["reasoning_content"] = turn.reasoning_content
             if turn.reasoning:
                 assistant_msg["reasoning"] = turn.reasoning
             messages.append(assistant_msg)

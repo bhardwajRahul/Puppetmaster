@@ -2592,6 +2592,77 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertEqual(assistant.get("reasoning_details"), details)
         self.assertEqual(assistant.get("reasoning"), "think")
 
+    def test_deepseek_reasoning_content_survives_provider_parse_and_tool_loop(self) -> None:
+        from puppetmaster.adapters import agentic
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        captured_messages = []
+        responses = iter([
+            {"choices": [{"message": {
+                "role": "assistant", "content": "", "reasoning_content": "  keep bytes  ",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {
+                    "name": "read_file", "arguments": '{"path":"a.py"}',
+                }}],
+            }}]},
+            {"choices": [{"message": {
+                "role": "assistant", "content": "done", "tool_calls": [{
+                    "id": "s1", "type": "function", "function": {
+                        "name": "submit_findings", "arguments": '{"artifacts":[]}',
+                    },
+                }],
+            }}]},
+        ])
+
+        def fake_post_json(url, *, headers, body, timeout):
+            return next(responses)
+
+        def parse_provider_turn(*, provider, model, messages, tools, extra, timeout):
+            captured_messages.append([dict(m) for m in messages])
+            return providers._openai_chat(
+                base_url="https://api.deepseek.com/v1", api_key="test-key", model=model,
+                messages=messages, tools=tools, extra=extra, headers={}, timeout=timeout,
+            )
+
+        task = Task(
+            job_id="deepseek-reasoning-content", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "deepseek", "model": "deepseek-reasoner",
+                     "disable_codegraph": True},
+        )
+        with mock.patch.object(providers, "_post_json", side_effect=fake_post_json), \
+                mock.patch.object(agentic, "provider_chat", side_effect=parse_provider_turn):
+            self.adapter().run(task, task.instruction, "w1")
+
+        self.assertGreaterEqual(len(captured_messages), 2)
+        assistant = next(m for m in captured_messages[1]
+                         if m.get("role") == "assistant" and m.get("tool_calls"))
+        self.assertEqual(assistant.get("reasoning_content"), "  keep bytes  ")
+        self.assertEqual(assistant.get("reasoning"), "keep bytes")
+
+    def test_openai_stream_preserves_reasoning_content_identity_and_empty_value(self) -> None:
+        class Response:
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"reasoning_content":"  "}}]}\n',
+                    b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+                    b'data: [DONE]\n',
+                ])
+
+            def close(self):
+                pass
+
+        with mock.patch.object(providers, "_open_stream", return_value=Response()):
+            turn = providers._openai_chat_stream(
+                base_url="https://api.deepseek.com/v1", api_key="test-key", model="deepseek-reasoner",
+                messages=[{"role": "user", "content": "hi"}], tools=None, extra={}, headers={},
+                timeout=30, on_delta=None,
+            )
+        self.assertEqual(turn.text, "ok")
+        self.assertEqual(turn.reasoning_content, "  ")
+
     def adapter(self):
         from puppetmaster.adapters.agentic import AgenticAdapter
         return AgenticAdapter()
