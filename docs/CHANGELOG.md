@@ -1,5 +1,19 @@
 ## Unreleased
 
+## v1.27.13 — 2026-09-12
+
+**OpenCode Go thinking models no longer die on a forced named `tool_choice`.**
+
+- `tool_choice_force_supported` now uses the provider. OpenCode Go thinking
+  builds (`deepseek-flash`, `deepseek-v*`, `kimi-k2*`, `glm-5.3`) stay on the
+  existing Muse-style nudge-only submit path instead of a named force.
+- `_provider_rejects_tool_choice_force` treats any HTTP 400 whose body
+  mentions `tool_choice` as a strip-and-retry. Go's wording is "Thinking
+  mode does not support this tool_choice"; the old Muse-only phrases missed
+  it, so pinned `deepseek-flash` workers hard-failed after ~25 successful
+  turns (`job_77181745385a`, `job_233f680e9e55`).
+- OpenRouter DeepSeek force support is unchanged.
+
 ## v1.27.12 — 2026-09-11
 
 **First-run probe reads the persisted adapter wire name, not a stripped registry id.**
