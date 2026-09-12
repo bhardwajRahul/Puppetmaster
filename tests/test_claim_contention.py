@@ -15,10 +15,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 import hermetic_env  # noqa: F401
 from puppetmaster.contracts import ContractConflict
 from puppetmaster.identity import StoreIdentityError
-from puppetmaster.models import AgentRun, Task, TaskStatus
+from dataclasses import replace
+
+from puppetmaster.models import AgentRun, Task, TaskStatus, seconds_from_now
 from puppetmaster.readonly import ReadUnavailable
 from puppetmaster.sqlite_store import SQLiteSwarmStore
-from puppetmaster.store import SwarmStore
+from puppetmaster.store import ProjectionWriteAdmissionError, SwarmStore
 from puppetmaster.store_contracts import task_binding
 from puppetmaster.worker_runtime import WorkerRuntime
 
@@ -196,6 +198,45 @@ class ClaimContentionTests(unittest.TestCase):
             saved = store.read_json(store.job_dir(job.id) / 'runs' / f'{run.id}.json')
             self.assertEqual(saved['id'], run.id)
             self.assertGreaterEqual(calls, 2)
+
+    def test_file_save_task_retries_projection_writer_admission_timeout(self):
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp))
+            job = store.create_job('projection admission task')
+            task = Task(job_id=job.id, role='explore', instruction='test', adapter='local')
+            from puppetmaster import projections
+            original = projections._reserve_writer
+            calls = 0
+
+            def reserve(connection, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise sqlite3.OperationalError('database is locked')
+                return original(connection, *args, **kwargs)
+
+            with patch.object(projections, '_reserve_writer', side_effect=reserve):
+                store.save_task(task)
+            saved = store.get_task_by_id(task.id)
+            self.assertEqual(saved.id, task.id)
+            self.assertGreaterEqual(calls, 2)
+
+    def test_recover_stale_treats_exhausted_admission_as_lost_tick(self):
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp))
+            job = store.create_job('recover admission')
+            task = Task(job_id=job.id, role='explore', instruction='test', adapter='local')
+            store.save_task(task)
+            claimed = store.claim_task(task.id, 'worker-a', lease_seconds=60)
+            store.save_task(replace(claimed, lease_expires_at=seconds_from_now(-1)))
+            with patch.object(
+                store,
+                'save_task',
+                side_effect=ProjectionWriteAdmissionError('database is locked'),
+            ):
+                recovered = store.recover_stale_tasks(job.id)
+            self.assertEqual(recovered, [])
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.RUNNING)
 
     def test_file_claim_does_not_swallow_nonlock_projection_failure(self):
         with TemporaryDirectory() as tmp:
