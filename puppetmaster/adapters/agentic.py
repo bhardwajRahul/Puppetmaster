@@ -329,20 +329,40 @@ def _budget_force_threshold(token_budget: int, reserve: float) -> float:
     return float(token_budget) * (1.0 - reserve)
 
 
+def _opencode_go_rejects_named_tool_choice(model: str) -> bool:
+    """Go thinking builds 400 on named ``tool_choice`` (deepseek-flash jobs)."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if not bare:
+        return False
+    if "deepseek-flash" in bare:
+        return True
+    if bare.startswith("deepseek-v") and not bare.startswith("deepseek-v3"):
+        return True
+    if bare.startswith("kimi-k2"):
+        return True
+    if "glm-5.3" in bare or "glm-5-3" in bare:
+        return True
+    return False
+
+
 def tool_choice_force_supported(provider: str, model: str) -> bool:
     """False when the model rejects named/required ``tool_choice``.
 
     Meta Muse Spark (direct Meta API and OpenRouter) only accepts
-    ``tool_choice="auto"``. Named force / ``required`` / ``none`` return HTTP
-    400. Detect by model slug so OpenRouter's Meta provider still matches.
+    ``tool_choice="auto"``. OpenCode Go thinking builds (deepseek-flash,
+    deepseek-v*, kimi-k2*, glm-5.3) reject a named force with HTTP 400
+    ("Thinking mode does not support this tool_choice"). Those stay on the
+    existing nudge-only path.
     """
-    del provider  # reserved for future provider-specific overrides
     slug = (model or "").strip().lower()
     if not slug:
         return True
     if "muse-spark" in slug or "muse/spark" in slug:
         return False
     if slug.startswith("meta/") and "muse" in slug:
+        return False
+    provider_slug = (provider or "").strip().lower().replace("_", "-")
+    if provider_slug in ("opencode-go", "console-go") and _opencode_go_rejects_named_tool_choice(slug):
         return False
     return True
 
@@ -381,15 +401,14 @@ def model_is_tool_less(
 
 
 def _provider_rejects_tool_choice_force(exc: ProviderError) -> bool:
-    """True when a 400 body indicates only ``tool_choice=auto`` is allowed."""
+    """True when a 400 body says the named ``tool_choice`` was rejected.
+
+    Caller already requires ``exc.status == 400`` and an in-flight
+    ``force_tool``. Wording varies: Muse "only auto", Go "Thinking mode
+    does not support this tool_choice". Any tool_choice mention is enough.
+    """
     blob = f"{exc} {getattr(exc, 'body', '') or ''}".lower()
-    if "tool_choice" not in blob:
-        return False
-    return (
-        ("only" in blob and "auto" in blob)
-        or "not currently supported" in blob
-        or "named function" in blob
-    )
+    return "tool_choice" in blob
 
 
 def _with_first_turn_tool_nudge(prompt: str) -> str:
