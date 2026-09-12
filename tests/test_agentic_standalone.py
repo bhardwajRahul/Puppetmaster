@@ -2423,6 +2423,10 @@ class AgenticLoopTests(unittest.TestCase):
             tool_choice_force_supported("openrouter", "agentic/meta/muse-spark-1.1")
         )
         self.assertTrue(tool_choice_force_supported("openrouter", "deepseek/deepseek-v4-pro"))
+        self.assertFalse(tool_choice_force_supported("opencode-go", "deepseek-flash"))
+        self.assertFalse(tool_choice_force_supported("opencode-go", "deepseek-v4-flash"))
+        self.assertFalse(tool_choice_force_supported("opencode-go", "kimi-k2"))
+        self.assertTrue(tool_choice_force_supported("opencode-go", "gpt-5.6-luna"))
 
     def test_muse_analyze_never_sends_force_tool(self) -> None:
         from puppetmaster.adapters import agentic
@@ -2517,6 +2521,59 @@ class AgenticLoopTests(unittest.TestCase):
             turn = adapter._provider_call(
                 provider="openrouter",
                 model="some-other-model",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"type": "function", "function": {"name": "submit_findings"}}],
+                extra={"force_tool": "submit_findings", "max_tokens": 32},
+                timeout=30,
+                max_retries=0,
+            )
+        self.assertEqual(turn.text, "ok")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(calls["extras"][0].get("force_tool"), "submit_findings")
+        self.assertNotIn("force_tool", calls["extras"][1])
+
+    def test_provider_call_strips_force_tool_on_opencode_go_thinking_400(self) -> None:
+        """Live job_77181745385a / job_233f680e9e55: Go thinking + named tool_choice."""
+        from puppetmaster.adapters.agentic import (
+            AgenticAdapter,
+            _provider_rejects_tool_choice_force,
+        )
+        from puppetmaster.providers import AssistantTurn, ProviderError
+
+        go_body = (
+            '{"error":{"param":null,"type":"invalid_request_error",'
+            '"code":"invalid_request_error","message":"Error from provider '
+            "(Console Go): Upstream request failed: [invalid_request_error] "
+            'Thinking mode does not support this tool_choice"}}'
+        )
+        go_exc = ProviderError(
+            "HTTP 400",
+            reason="http_status:400",
+            status=400,
+            body=go_body,
+        )
+        self.assertTrue(_provider_rejects_tool_choice_force(go_exc))
+
+        calls = {"n": 0, "extras": []}
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            calls["n"] += 1
+            calls["extras"].append(dict(extra))
+            if calls["n"] == 1:
+                raise go_exc
+            return AssistantTurn(
+                text="ok",
+                tool_calls=[],
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            )
+
+        adapter = AgenticAdapter()
+        with mock.patch(
+            "puppetmaster.adapters.agentic.provider_chat", side_effect=fake_chat
+        ):
+            turn = adapter._provider_call(
+                provider="opencode-go",
+                model="deepseek-flash",
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[{"type": "function", "function": {"name": "submit_findings"}}],
                 extra={"force_tool": "submit_findings", "max_tokens": 32},
