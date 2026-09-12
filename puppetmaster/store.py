@@ -766,7 +766,9 @@ class SwarmStore(StoreContracts):
 
     def save_task(self, task: Task) -> None:
         mkdir_private(self.job_dir(task.job_id) / "edges")
-        self.write_json(self.job_dir(task.job_id) / "tasks" / f"{task.id}.json", task)
+        self._write_json_retrying_admission(
+            self.job_dir(task.job_id) / "tasks" / f"{task.id}.json", task
+        )
         self.emit(
             task.job_id,
             "task.saved",
@@ -1676,7 +1678,11 @@ class SwarmStore(StoreContracts):
         )
 
     def _atomic_recover_stale(self, task: Task, queued: Task) -> bool:
-        self.save_task(queued)
+        try:
+            self.save_task(queued)
+        except ProjectionWriteAdmissionError:
+            # Same lost-tick contract as claim: the task file is unchanged.
+            return False
         return True
 
     def refresh_blocked_tasks(self, job_id: str) -> list[Task]:
