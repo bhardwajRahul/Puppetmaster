@@ -30,8 +30,9 @@ Two modes, one loop:
   still produces no diff.
 
 The worker-grade guardrails are lifted (as patterns, not vendored code) from the
-Hermes agent core: filesystem tools are confined to the worker ``cwd`` with
-symlink-escape and binary-write protection; the headless ``run_terminal`` is
+Hermes agent core: mutating filesystem tools are confined to the worker ``cwd``
+with symlink-escape and binary-write protection; read tools may also use
+operator ``extra_read_roots``; the headless ``run_terminal`` is
 gated by a destructive-command denylist because there is no human to confirm;
 and a budget governor bounds turns, wall time, and (optionally) total tokens so
 a runaway model can never spin forever. All tool output, diffs, and provider
@@ -209,6 +210,7 @@ _SEARCH_FILE_CAP = 400  # files scanned per search_code call
 _SEARCH_HIT_CAP = 60
 _TERMINAL_TIMEOUT_SECONDS = 120
 _MUTATING_TOOLS = frozenset({"write_file", "edit_file", "delete_file", "apply_hashline"})
+_EXTRA_READ_ROOTS_ENV = "PUPPETMASTER_EXTRA_READ_ROOTS"
 
 # Terminal "submit" tools. The parity fix (v2 overhaul): structured output rides
 # the provider-native tool-calling channel -- the model calls ``submit_findings``
@@ -1730,7 +1732,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "parameters": {"type": "object", "properties": props, "required": required},
             }}
 
-        read_file_desc = "Read a UTF-8 text file within the workspace."
+        read_file_desc = (
+            "Read a UTF-8 text file within the workspace or an operator extra-read root."
+        )
         if hashline_enabled():
             read_file_desc = (
                 "Read a UTF-8 text file within the workspace. Returns `[path#TAG]` "
@@ -1753,9 +1757,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "start_line": {"type": "integer", "description": "1-indexed start line (optional)"},
                 "limit": {"type": "integer", "description": "max lines to read (optional)"}},
                ["path"]),
-            fn("list_dir", "List entries of a directory within the workspace.",
+            fn("list_dir", "List entries of a directory within the workspace or an operator extra-read root.",
                {"path": {"type": "string"}}, ["path"]),
-            fn("search_code", "Plain-text/regex search over the workspace; returns matching path:line snippets. Best for log strings, config values, and comments.",
+            fn("search_code", "Plain-text/regex search over the workspace and operator extra-read roots; returns matching path:line snippets. Best for log strings, config values, and comments.",
                {"query": {"type": "string"}, "glob": {"type": "string", "description": "optional filename filter, e.g. *.py"}},
                ["query"]),
         ]
@@ -2063,6 +2067,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         self, name: str, args: dict, cwd: Path, implement: bool, task: Task
     ) -> str:
         """Dispatch one tool call. Returns a text result (never raises)."""
+        self._extra_read_roots = self._collect_extra_read_roots(task)
         try:
             if name == "read_file":
                 return self._tool_read_file(args, cwd)
@@ -2162,21 +2167,67 @@ class AgenticAdapter(FullEditWorkerAdapter):
 
     # --- confined filesystem tools -----------------------------------------
 
-    def _confine(self, cwd: Path, rel: str) -> Path:
+    def _collect_extra_read_roots(self, task: Optional[Task] = None) -> list[Path]:
+        """Operator-owned extra roots for read_file/list_dir/search_code only."""
+        raw: list = []
+        payload = getattr(task, "payload", None) or {}
+        if isinstance(payload, dict):
+            extra = payload.get("extra_read_roots") or []
+            if isinstance(extra, str):
+                extra = extra.split(os.pathsep)
+            if isinstance(extra, (list, tuple)):
+                raw.extend(extra)
+        env = os.environ.get(_EXTRA_READ_ROOTS_ENV, "")
+        if str(env).strip():
+            raw.extend(str(env).split(os.pathsep))
+        out: list[Path] = []
+        seen = set()
+        for item in raw:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            try:
+                path = Path(text).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if not path.exists():
+                continue
+            root = path if path.is_dir() else path.parent
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(root)
+        return out
+
+    def _confine(self, cwd: Path, rel: str, extra_roots: Optional[list] = None) -> Path:
         """Resolve ``rel`` under ``cwd``, rejecting traversal outside the tree.
 
         Both sides are fully resolved before comparison so symlinked temp roots
         (macOS ``/var`` -> ``/private/var``) and ``..`` segments can't smuggle a
-        path outside the workspace.
+        path outside the workspace. Read-only tools may also pass ``extra_roots``
+        (operator evidence dirs). Mutating tools must omit that list.
         """
         root = cwd.resolve()
         target = (root / rel).resolve() if not os.path.isabs(rel) else Path(rel).resolve()
-        if root != target and root not in target.parents:
-            raise ValueError(f"path {rel!r} escapes the workspace")
-        return target
+        if root == target or root in target.parents:
+            return target
+        for extra in extra_roots or ():
+            try:
+                extra_root = Path(extra).resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if extra_root == target or extra_root in target.parents:
+                return target
+        raise ValueError(f"path {rel!r} escapes the workspace")
+
+    def _read_confine(self, cwd: Path, rel: str) -> Path:
+        return self._confine(
+            cwd, rel, extra_roots=getattr(self, "_extra_read_roots", None) or [],
+        )
 
     def _tool_read_file(self, args: dict, cwd: Path) -> str:
-        path = self._confine(cwd, str(args.get("path", "")))
+        path = self._read_confine(cwd, str(args.get("path", "")))
         if _looks_binary(path):
             return "error: refusing to read an apparent binary file as text"
         text = self._read_text_cached(path)
@@ -2230,7 +2281,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         return text
 
     def _tool_list_dir(self, args: dict, cwd: Path) -> str:
-        path = self._confine(cwd, str(args.get("path", ".")))
+        path = self._read_confine(cwd, str(args.get("path", ".")))
         entries = sorted(
             (f"{e.name}/" if e.is_dir() else e.name) for e in path.iterdir()
         )
@@ -2250,26 +2301,38 @@ class AgenticAdapter(FullEditWorkerAdapter):
         hits: list[str] = []
         scanned = 0
         skip_dirs = {".git", "node_modules", ".venv", "__pycache__", "dist", "build", ".codegraph"}
-        for root, dirs, files in os.walk(cwd):
-            dirs[:] = [d for d in dirs if d not in skip_dirs]
-            for fname in files:
-                if glob and not fnmatch.fnmatch(fname, glob):
-                    continue
-                scanned += 1
-                if scanned > _SEARCH_FILE_CAP:
-                    hits.append("... (search file cap reached)")
-                    return "\n".join(hits)
-                fpath = Path(root) / fname
-                try:
-                    for i, line in enumerate(fpath.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
-                        if pattern.search(line):
-                            rel = fpath.relative_to(cwd)
-                            hits.append(f"{rel}:{i}: {line.strip()[:200]}")
-                            if len(hits) >= _SEARCH_HIT_CAP:
-                                hits.append("... (hit cap reached)")
-                                return "\n".join(hits)
-                except (OSError, ValueError):
-                    continue
+        search_roots = [cwd]
+        for extra in getattr(self, "_extra_read_roots", None) or []:
+            try:
+                extra_root = Path(extra).resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if extra_root not in search_roots:
+                search_roots.append(extra_root)
+        for search_root in search_roots:
+            for root, dirs, files in os.walk(search_root):
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                for fname in files:
+                    if glob and not fnmatch.fnmatch(fname, glob):
+                        continue
+                    scanned += 1
+                    if scanned > _SEARCH_FILE_CAP:
+                        hits.append("... (search file cap reached)")
+                        return "\n".join(hits)
+                    fpath = Path(root) / fname
+                    try:
+                        for i, line in enumerate(fpath.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                            if pattern.search(line):
+                                try:
+                                    rel = fpath.relative_to(cwd)
+                                except ValueError:
+                                    rel = fpath
+                                hits.append(f"{rel}:{i}: {line.strip()[:200]}")
+                                if len(hits) >= _SEARCH_HIT_CAP:
+                                    hits.append("... (hit cap reached)")
+                                    return "\n".join(hits)
+                    except (OSError, ValueError):
+                        continue
         return "\n".join(hits) if hits else "(no matches)"
 
     def _tool_graph_search(self, args: dict, cwd: Path, task: Task) -> str:

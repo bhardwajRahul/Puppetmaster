@@ -1,5 +1,17 @@
 ## Unreleased
 
+## v1.27.15 — 2026-09-12
+
+**Read tools accept operator extra-read roots; writes stay workspace-confined.**
+
+- Analyze workers were failing `read_file` / `list_dir` on operator evidence
+  dirs (`~/Downloads/...`) with `ValueError: path escapes the workspace`, then
+  substituting in-repo copies. They have no general shell in analyze mode, so
+  the confine was the whole read boundary.
+- `PUPPETMASTER_EXTRA_READ_ROOTS` and task `payload.extra_read_roots` widen
+  `read_file`, `list_dir`, and `search_code` only. `write_file` / `edit_file` /
+  `delete_file` / `apply_hashline` still require the worker cwd.
+
 ## v1.27.14 — 2026-09-12
 
 **File-backend `save_task` retries a locked projection writer the same way `save_run` already does.**
