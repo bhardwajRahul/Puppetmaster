@@ -761,6 +761,48 @@ class AgenticToolTests(unittest.TestCase):
         escaped = self.adapter._execute_tool("read_file", {"path": "../../etc/hosts"}, self.cwd, False, _task())
         self.assertIn("escapes the workspace", escaped)
 
+    def test_read_file_allows_payload_extra_read_roots(self) -> None:
+        extra = Path(self.tmp.name + "_extra")
+        extra.mkdir()
+        target = extra / "note.md"
+        target.write_text("VISITOR_KIT\n", encoding="utf-8")
+        task = _task({"extra_read_roots": [str(extra)]})
+        out = self.adapter._execute_tool(
+            "read_file", {"path": str(target)}, self.cwd, False, task,
+        )
+        self.assertIn("VISITOR_KIT", out)
+        listing = self.adapter._execute_tool(
+            "list_dir", {"path": str(extra)}, self.cwd, False, task,
+        )
+        self.assertIn("note.md", listing)
+        wrote = self.adapter._execute_tool(
+            "write_file",
+            {"path": str(extra / "hack.txt"), "content": "nope"},
+            self.cwd,
+            True,
+            task,
+        )
+        self.assertIn("escapes the workspace", wrote)
+        self.assertFalse((extra / "hack.txt").exists())
+
+    def test_read_file_allows_env_extra_read_roots(self) -> None:
+        extra = Path(self.tmp.name + "_env_extra")
+        extra.mkdir()
+        (extra / "env.md").write_text("ENV_ROOT\n", encoding="utf-8")
+        with mock.patch.dict(
+            os.environ,
+            {"PUPPETMASTER_EXTRA_READ_ROOTS": str(extra)},
+            clear=False,
+        ):
+            out = self.adapter._execute_tool(
+                "read_file",
+                {"path": str(extra / "env.md")},
+                self.cwd,
+                False,
+                _task(),
+            )
+        self.assertIn("ENV_ROOT", out)
+
     def test_read_offload_self_blob_and_refusal(self) -> None:
         """Agentic read_offload serves only self-created confined offload blobs."""
         from puppetmaster.tool_offload import mark_offload_blob
