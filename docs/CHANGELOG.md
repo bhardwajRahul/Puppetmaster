@@ -1,5 +1,16 @@
 ## Unreleased
 
+## v1.27.16 — 2026-09-12
+
+**Exact `agentic/openai/` identities stay on the funded API lane.**
+
+- v1.27.7 remapped every agentic GPT-5 `openai` / `openai-api` provider to
+  `openai-codex`. That overwrote provider-qualified registry ids such as
+  `agentic/openai/gpt-5-6-sol`, so the #161 Codex spend-cap fallback
+  returned to the exhausted Codex family instead of `OPENAI_API_KEY`.
+- Generic / ambiguous pins (`agentic/gpt-5.6-luna`, bare `gpt-5.6-sol`)
+  still harden to Codex OAuth. Extra-read-roots (v1.27.15) is unchanged.
+
 ## v1.27.15 — 2026-09-12
 
 **Read tools accept operator extra-read roots; writes stay workspace-confined.**

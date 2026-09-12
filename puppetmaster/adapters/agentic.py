@@ -480,8 +480,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
         payload by the router), mirroring the Hermes provider-stamp pattern.
         Falls back to ``openai`` so a bare model still has a sane wire.
 
-        Codex-class GPT-5* models never ride ``openai-api`` / bare ``openai``:
-        they are remapped to ``openai-codex`` (OPENAI_CODEX_TOKEN).
+        Generic/ambiguous GPT-5* pins still remap to ``openai-codex``
+        (OPENAI_CODEX_TOKEN). Exact ``agentic/openai/`` and
+        ``agentic/openai-api/`` identities keep the declared API provider.
         """
         from puppetmaster.openai_codex import (
             PROVIDER_SLUG as CODEX_PROVIDER,
@@ -490,7 +491,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
 
         provider = str(task.payload.get("provider") or "openai").strip().lower()
         model = str(task.payload.get("model") or "").strip()
-        forced = refuse_openai_api_provider(provider, model)
+        forced = refuse_openai_api_provider(
+            provider,
+            model,
+            identities=(
+                task.payload.get("pinned_model"),
+                task.payload.get("router_model_id"),
+            ),
+        )
         return forced or provider
 
     def _extra_params(self, task: Task) -> dict:
