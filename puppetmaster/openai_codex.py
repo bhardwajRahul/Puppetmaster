@@ -12,7 +12,7 @@ non-browser hosts are not Cloudflare-403'd.
 import base64
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 PROVIDER_SLUG = "openai-codex"
 API_KEY_ENV = "OPENAI_CODEX_TOKEN"
@@ -165,13 +165,45 @@ def harden_codex_model_id(model: str) -> tuple[str, Optional[str]]:
     return wire, remapped_from
 
 
-def refuse_openai_api_provider(provider: str, model: str) -> Optional[str]:
+def openai_api_identity_provider(*identities: Any) -> Optional[str]:
+    """Return ``openai`` / ``openai-api`` when it is a non-leaf identity segment.
+
+    ``agentic/openai/gpt-5-6-sol`` → ``openai``.
+    ``agentic/openai-api/gpt-5-6-sol`` → ``openai-api``.
+    ``agentic/openai-codex/...``, ``agentic/gpt-5.6-luna``, and bare model
+    ids return ``None``.
+    """
+    for raw in identities:
+        if raw is None:
+            continue
+        text = str(raw).strip().replace("\\", "/")
+        if not text:
+            continue
+        parts = [part for part in text.split("/") if part]
+        if len(parts) < 2:
+            continue
+        for segment in parts[:-1]:
+            slug = segment.lower()
+            if slug in _FORBIDDEN_OPENAI_API_PROVIDERS:
+                return slug
+    return None
+
+
+def refuse_openai_api_provider(
+    provider: str,
+    model: str,
+    *,
+    identities: Optional[Iterable[Any]] = None,
+) -> Optional[str]:
     """If *provider* is openai-api for a Codex-class GPT model, return openai-codex.
 
     Cary's OpenAI models must always use Codex auth (``OPENAI_CODEX_TOKEN``),
-    never ``openai-api`` / ``OPENAI_API_KEY``. Returns ``None`` when no remap
-    is required.
+    never ``openai-api`` / ``OPENAI_API_KEY``. Exact ``agentic/openai/`` and
+    ``agentic/openai-api/`` identities stay on the declared API lane.
+    Returns ``None`` when no remap is required.
     """
+    if openai_api_identity_provider(*(identities or ()), model) is not None:
+        return None
     slug = (provider or "").strip().lower()
     if slug not in _FORBIDDEN_OPENAI_API_PROVIDERS:
         return None
@@ -184,7 +216,9 @@ def harden_agentic_openai_payload(payload: dict) -> dict:
     """Force Codex auth + remap ``*-pro`` for agentic GPT-5* pins.
 
     Merges under the caller's keys except ``provider`` / ``model`` when a
-    harden rule applies. Preserves ``reasoning_effort`` unchanged.
+    harden rule applies. Preserves ``reasoning_effort`` unchanged. Exact
+    ``agentic/openai/`` and ``agentic/openai-api/`` identities keep the
+    declared API provider and skip Codex wire remaps.
     """
     merged = dict(payload or {})
     model = str(merged.get("model") or "").strip()
@@ -192,14 +226,20 @@ def harden_agentic_openai_payload(payload: dict) -> dict:
     if not model:
         return merged
 
-    forced = refuse_openai_api_provider(provider, model)
+    identities = (merged.get("pinned_model"), merged.get("router_model_id"))
+    api_lane = openai_api_identity_provider(*identities, model)
+    forced = refuse_openai_api_provider(provider, model, identities=identities)
     if forced is not None:
         merged["provider"] = forced
         provider = forced
     elif not provider and is_codex_class_gpt_model(model):
-        # Bare GPT-5* agentic pins default to Codex OAuth, never openai-api.
-        merged["provider"] = PROVIDER_SLUG
-        provider = PROVIDER_SLUG
+        if api_lane is not None:
+            merged["provider"] = api_lane
+            provider = api_lane
+        else:
+            # Bare GPT-5* agentic pins default to Codex OAuth, never openai-api.
+            merged["provider"] = PROVIDER_SLUG
+            provider = PROVIDER_SLUG
 
     if provider == PROVIDER_SLUG or (
         is_codex_class_gpt_model(model) and provider in ("", PROVIDER_SLUG)

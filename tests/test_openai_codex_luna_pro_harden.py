@@ -10,6 +10,23 @@ from unittest import mock
 
 
 class CodexProRemapTests(unittest.TestCase):
+    def test_openai_api_identity_provider_segments(self) -> None:
+        from puppetmaster.openai_codex import openai_api_identity_provider
+
+        self.assertEqual(
+            openai_api_identity_provider("agentic/openai/gpt-5-6-sol"),
+            "openai",
+        )
+        self.assertEqual(
+            openai_api_identity_provider("agentic/openai-api/gpt-5-6-sol"),
+            "openai-api",
+        )
+        self.assertIsNone(
+            openai_api_identity_provider("agentic/openai-codex/gpt-5.6-luna")
+        )
+        self.assertIsNone(openai_api_identity_provider("agentic/gpt-5.6-luna"))
+        self.assertIsNone(openai_api_identity_provider("gpt-5.6-sol"))
+
     def test_remap_luna_sol_terra_pro_to_base(self) -> None:
         from puppetmaster.openai_codex import harden_codex_model_id, remap_codex_pro_model
 
@@ -71,6 +88,63 @@ class CodexProRemapTests(unittest.TestCase):
         self.assertEqual(stamped["provider"], "openai-codex")
         self.assertEqual(stamped["model"], "gpt-5.6-luna")
         self.assertEqual(stamped["reasoning_effort"], "max")
+
+    def test_exact_openai_identity_survives_agentic_pin(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, apply_agentic_model_pin
+
+        for provider, registry_id in (
+            ("openai", "agentic/openai/gpt-5-6-sol"),
+            ("openai-api", "agentic/openai-api/gpt-5-6-sol"),
+        ):
+            registry = [
+                ModelSpec(
+                    id=registry_id,
+                    adapter="agentic",
+                    adapter_model_name="gpt-5.6-sol",
+                    enabled=True,
+                    billing="api",
+                    payload_defaults={"provider": provider},
+                )
+            ]
+            stamped = apply_agentic_model_pin(
+                {"mode": "analyze", "provider": provider},
+                registry_id,
+                registry=registry,
+            )
+            self.assertEqual(stamped["provider"], provider)
+            self.assertEqual(stamped["model"], "gpt-5.6-sol")
+            self.assertEqual(stamped["pinned_model"], registry_id)
+            self.assertEqual(stamped["billing"], "api")
+
+    def test_exact_openai_identity_survives_durable_bind(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.routing_authority import resolve_and_bind_explicit_pin
+
+        registry_id = "agentic/openai/gpt-5-6-sol"
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id=registry_id,
+                        adapter="agentic",
+                        adapter_model_name="gpt-5.6-sol",
+                        enabled=True,
+                        billing="api",
+                        payload_defaults={"provider": "openai"},
+                    )
+                ],
+                registry_path,
+            )
+            payload = resolve_and_bind_explicit_pin(
+                {"model": registry_id, "provider": "openai", "mode": "analyze"},
+                adapter="agentic",
+                registry_path=registry_path,
+            )
+        self.assertEqual(payload["provider"], "openai")
+        self.assertEqual(payload["model"], "gpt-5.6-sol")
+        self.assertEqual(payload["pinned_model"], registry_id)
+        self.assertEqual(payload["billing"], "api")
 
     def test_wire_path_remaps_pro_before_codex_request(self) -> None:
         from puppetmaster import providers
@@ -271,6 +345,30 @@ class AgenticResolveProviderTests(unittest.TestCase):
             payload={"provider": "openai-api", "model": "gpt-5.6-luna"},
         )
         self.assertEqual(adapter._resolve_provider(task), "openai-codex")
+
+    def test_resolve_provider_keeps_exact_openai_identity(self) -> None:
+        from puppetmaster.adapters.agentic import AgenticAdapter
+        from puppetmaster.models import Task
+
+        adapter = AgenticAdapter()
+        for provider, pinned in (
+            ("openai", "agentic/openai/gpt-5-6-sol"),
+            ("openai-api", "agentic/openai-api/gpt-5-6-sol"),
+        ):
+            task = Task(
+                job_id="j",
+                id="t",
+                role="analyze",
+                instruction="x",
+                adapter="agentic",
+                payload={
+                    "provider": provider,
+                    "model": "gpt-5.6-sol",
+                    "pinned_model": pinned,
+                    "router_model_id": pinned,
+                },
+            )
+            self.assertEqual(adapter._resolve_provider(task), provider)
 
 
 class FailPayloadPersistsBodyTests(unittest.TestCase):

@@ -1602,9 +1602,10 @@ def apply_agentic_model_pin(
     from the catalog when present; without that, ``AgenticAdapter`` falls
     back to ``openai`` and OpenRouter-only models 400.
 
-    Codex-class GPT-5* pins are hardened to ``provider=openai-codex`` (never
+    Generic GPT-5* pins harden to ``provider=openai-codex`` (never
     ``openai-api``) and ``gpt-5.6-*-pro`` remaps to the base wire id while
-    preserving ``reasoning_effort``.
+    preserving ``reasoning_effort``. Provider-qualified exact identities
+    (``agentic/openai/...``, ``agentic/openai-api/...``) remain authoritative.
     """
     stamped = apply_model_pin(
         payload, model, adapter="agentic", registry=registry
