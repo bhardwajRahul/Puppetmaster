@@ -1,5 +1,16 @@
 ## Unreleased
 
+## v1.27.14 — 2026-09-12
+
+**File-backend `save_task` retries a locked projection writer the same way `save_run` already does.**
+
+- Windows CI `test_crash_recovery_demo_reclaims_abandoned_task` died with
+  `ProjectionWriteAdmissionError: database is locked` because recover_stale
+  called `save_task` → `write_json` with no admission retry. Claim already
+  treats that as a lost tick; `save_run` already retries.
+- `save_task` uses `_write_json_retrying_admission`. Exhausted admission on
+  recover_stale returns False instead of crashing the supervisor.
+
 ## v1.27.13 — 2026-09-12
 
 **OpenCode Go thinking models no longer die on a forced named `tool_choice`.**
