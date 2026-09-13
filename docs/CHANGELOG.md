@@ -1,5 +1,16 @@
 ## Unreleased
 
+## v1.27.17 — 2026-09-12
+
+**Read-only workers never claim another process's repository edits.**
+
+- Shared CLI snapshot attribution now respects each prepared invocation's
+  write capability. Codex read-only, Claude Code plan, and Antigravity plan
+  runs cannot emit PATCH artifacts from ambient concurrent changes.
+- Read-only verification records `repository_diff_attribution=none` and omits
+  worker diff, changed-file, and revision evidence. Write-capable success,
+  failure, timeout, and output-budget runs retain partial patch capture.
+
 ## v1.27.16 — 2026-09-12
 
 **Exact `agentic/openai/` identities stay on the funded API lane.**
@@ -3477,4 +3488,3 @@ Polish pass after v0.7.0 â diagnostics, doctor honesty, and README freshnes
 - Broaden provider adapters beyond Cursor.
 - Improve patch artifact generation and isolated apply flows.
 - Add richer watch output and scripting-friendly JSON modes.
-
