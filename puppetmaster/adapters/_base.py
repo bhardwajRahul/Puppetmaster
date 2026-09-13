@@ -92,8 +92,10 @@ def snapshot_has_diff(snapshot: dict) -> bool:
     )
 
 
-def diff_source_payload(before: dict, after: dict) -> dict[str, bool]:
+def diff_source_payload(before: dict, after: dict) -> dict[str, Any]:
     """Label whether a diff existed before the worker and whether it changed."""
+    if after.get("write_capable") is False:
+        return {"repository_diff_attribution": "none"}
     worker_diff = after.get("worker_diff")
     if worker_diff is not None:
         worker_diff_present = bool(str(worker_diff).strip())
@@ -358,6 +360,13 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
             accounting_model=prepared.extras.get("model"),
         )
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
+        # Snapshot deltas can belong to a concurrent writer. Only adapters
+        # declared write-capable may attribute them to this invocation.
+        if prepared.extras.get("write_capable", True) is False:
+            if isinstance(after, dict):
+                after = {**after, "write_capable": False}
+            else:
+                setattr(after, "write_capable", False)
         # Strict identity: unittest MagicMock is truthy, so a mock that never
         # set output_limit_hit must not look like a real budget stop. Timeouts
         # stay timeouts (result=failed) unless the streamed run actually tripped
@@ -542,6 +551,12 @@ def verification_artifact(
         "result": result,
         **payload,
     }
+    if body.get("repository_diff_attribution") == "none":
+        for key in (
+            "baseline_diff_present", "worker_diff_present", "base_sha", "head_sha",
+            "base_tree", "head_tree", "changed_files", "untracked_files",
+        ):
+            body.pop(key, None)
     if evaluator_slot:
         body["evaluator_slot"] = evaluator_slot
     if evaluator_version:
@@ -630,6 +645,8 @@ def tool_list(value: object) -> str:
 
 def _should_emit_patch_artifact(before: dict, after: dict) -> bool:
     """True when a PATCH can be attributed to the worker run."""
+    if after.get("write_capable") is False:
+        return False
     worker_diff = after.get("worker_diff")
     if worker_diff is not None:
         return bool(str(worker_diff).strip())
