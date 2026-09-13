@@ -1,4 +1,4 @@
-## Unreleased
+## v1.27.20 — 2026-09-13
 
 **Registry refresh persists the fallback epoch; workers cannot self-ground or blanket-verify (#203, #204, #205).**
 
