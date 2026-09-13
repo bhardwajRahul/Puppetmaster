@@ -1,5 +1,7 @@
 ## Unreleased
 
+## v1.27.19 — 2026-09-13
+
 **Provider-qualified agentic identities skip discovery-slug membership (#197).**
 
 - Preflight still fail-closes bare / two-segment names against a fresh
