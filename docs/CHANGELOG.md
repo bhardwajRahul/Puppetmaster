@@ -1,5 +1,7 @@
 ## Unreleased
 
+## v1.27.18 — 2026-09-13
+
 **Generated auto-routed swarms can leave a spent launch adapter (#195).**
 
 - `build_analysis_swarm_specs` still pins `allowed_adapters` to the launch
