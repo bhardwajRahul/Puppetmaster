@@ -77,6 +77,32 @@ class ArtifactStatusCompatTests(unittest.TestCase):
         self.assertEqual(artifact.claim_support_status, CLAIM_SUPPORT_WORKER_ASSERTED)
         self.assertFalse(durable_admission_allowed(artifact, peers=[]))
 
+    def test_worker_payload_cannot_self_certify_grounding(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("worker grounding")
+            artifact = _finding(
+                job_id=job.id,
+                payload={
+                    "claim": "I am grounded",
+                    "grounding_status": "grounded",
+                },
+                evidence=["adapter:agentic"],
+            )
+            store.save_artifact(artifact)
+            self.assertEqual(artifact.grounding_status, GROUNDING_CITED)
+            self.assertFalse(durable_admission_allowed(artifact, store=store))
+            self.assertIsNone(maybe_admit_finding_as_gist(store, artifact))
+
+    def test_worker_top_level_grounded_cannot_self_certify(self) -> None:
+        artifact = _finding(
+            payload={"claim": "I stamped grounded"},
+            evidence=["adapter:agentic"],
+            grounding_status="grounded",
+        )
+        self.assertFalse(durable_admission_allowed(artifact, peers=[]))
+
     def test_verification_result_is_criterion_status_not_parse_probability(self) -> None:
         artifact = Artifact(
             job_id="j",
@@ -137,6 +163,56 @@ class SelfRatingCannotAdmitTests(unittest.TestCase):
             self.assertIsNotNone(gist)
             assert gist is not None
             self.assertEqual(gist.payload["admission"], "admitted")
+
+    def test_unrelated_same_task_verification_does_not_admit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("unrelated verify")
+            finding = _finding(
+                job_id=job.id,
+                task_id="task-v",
+                payload={"claim": "unreviewed leftover"},
+            )
+            store.save_artifact(finding)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id="task-v",
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker",
+                    confidence=0.9,
+                    evidence=["adapter:agentic"],
+                    payload={"check": "worker completed", "result": "passed"},
+                )
+            )
+            self.assertFalse(durable_admission_allowed(finding, store=store))
+            self.assertIsNone(maybe_admit_finding_as_gist(store, finding))
+
+    def test_exact_claim_pointer_still_admits(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("exact claim")
+            finding = _finding(
+                job_id=job.id,
+                task_id="task-v",
+                payload={"claim": "named leftover"},
+            )
+            store.save_artifact(finding)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id="task-v",
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker",
+                    confidence=0.9,
+                    evidence=["file.py:3"],
+                    payload={"check": "named leftover", "result": "passed"},
+                )
+            )
+            self.assertTrue(durable_admission_allowed(finding, store=store))
+            self.assertIsNotNone(maybe_admit_finding_as_gist(store, finding))
 
 
 class CompactRefDisplayTests(unittest.TestCase):

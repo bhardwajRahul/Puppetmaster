@@ -228,9 +228,6 @@ def infer_grounding_status(artifact: Any) -> str:
     )
     if existing:
         return normalize_grounding_status(existing)
-    payload = _payload_of(artifact)
-    if payload.get("grounding_status"):
-        return normalize_grounding_status(payload.get("grounding_status"))
     evidence = (
         artifact.get("evidence")
         if isinstance(artifact, dict)
@@ -354,13 +351,12 @@ def finding_has_independent_support(
 ) -> bool:
     """True only for named independent support — never self-rating/confidence.
 
-    Independent means a same-task accepting VERIFICATION in ``peers`` / the
-    store, or a PM-persisted ``claim_support_status=independently_supported``.
-    Worker payload aliases are coerced to ``worker_asserted`` and do not pass.
+    Independent means an accepting VERIFICATION that names this artifact
+    id or exact claim, or a PM-persisted
+    ``claim_support_status=independently_supported``. Worker payload
+    aliases and a same-task pass with no pointer do not count.
     """
     if infer_claim_support_status(finding) == CLAIM_SUPPORT_INDEPENDENT:
-        return True
-    if infer_grounding_status(finding) == GROUNDING_GROUNDED:
         return True
     task_id = (
         finding.get("task_id")
@@ -379,8 +375,6 @@ def finding_has_independent_support(
         except Exception:
             pass
     seen: set[int] = set()
-    pointed = False
-    same_task_accept = False
     for artifact in candidates:
         marker = id(artifact)
         if marker in seen:
@@ -395,12 +389,9 @@ def finding_has_independent_support(
         )
         if task_id and other_task != task_id:
             continue
-        same_task_accept = True
         if _points_at_finding(artifact, finding):
-            pointed = True
-            break
-    # Same-task accept with no pointer still counts (existing cheap default).
-    return pointed or same_task_accept
+            return True
+    return False
 
 
 def independently_supported_ids(artifacts: Iterable[Any]) -> set[str]:

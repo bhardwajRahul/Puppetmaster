@@ -958,13 +958,17 @@ def reconcile_agentic_catalog(
             "agentic", "api", existing, allowed_providers=allowed
         )
         added = list(report.get("added") or [])
+        refreshed = list(report.get("refreshed") or [])
         base = {
             "available_providers": sorted(allowed),
             "discovered_count": report.get("discovered_count"),
             "skipped": report.get("skipped") or [],
+            "refreshed": refreshed,
         }
         if added:
             return merged, {"action": "merged", "added": added, **base}
+        if merged != existing:
+            return merged, {"action": "refreshed", "added": [], **base}
         return merged, {"action": "skip", "reason": "agentic_catalog_current", **base}
     except Exception as exc:  # never block a run on catalog reconciliation
         return existing, {"action": "unavailable", "error": str(exc)}
