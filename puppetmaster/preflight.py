@@ -25,7 +25,7 @@ import os
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from puppetmaster.platform_billing import (
     BillingStatus,
@@ -95,6 +95,131 @@ def _cursor_pin_catalog_fallback_reason(
         f"plan-billed; catalog unverified ({detail}); "
         f"attempting pinned registry model {pin.registry_id!r} "
         f"({pin.adapter_model_name!r})"
+    )
+
+
+def provider_binding_from_identity(identity: str, adapter: str) -> Optional[str]:
+    """Return the provider slug from ``adapter/provider/leaf``, else ``None``.
+
+    ``agentic/openai/gpt-5-6-sol`` → ``openai``.
+    ``agentic/gpt-5.6-sol`` and bare wire names → ``None``.
+    The first known provider segment after the adapter is the binding, so
+    ``agentic/openrouter/openai/gpt-4o`` stays on OpenRouter.
+    """
+    from puppetmaster.providers import get_provider
+
+    text = str(identity or "").strip().replace("\\", "/")
+    parts = [part for part in text.split("/") if part]
+    if len(parts) < 3:
+        return None
+    if parts[0].lower() != str(adapter or "").strip().lower():
+        return None
+    for segment in parts[1:-1]:
+        if get_provider(segment) is not None:
+            return segment.strip().lower()
+    return None
+
+
+def _identity_texts(model: Optional[str], identities: Iterable[Any]) -> list[str]:
+    texts: list[str] = []
+    seen = set()
+    for raw in list(identities or ()) + [model]:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        texts.append(text)
+    return texts
+
+
+def _provider_qualified_wire_matches(spec: Any, model: Optional[str]) -> bool:
+    if not model:
+        return True
+    if model == spec.id:
+        return True
+    from puppetmaster.model_registry import normalize_model_token
+
+    needle = normalize_model_token(model)
+    if normalize_model_token(spec.adapter_model_name) == needle:
+        return True
+    leaf = spec.id.rsplit("/", 1)[-1]
+    return normalize_model_token(leaf) == needle
+
+
+def provider_qualified_identity_verdict(
+    adapter: str,
+    model: Optional[str],
+    identities: Iterable[Any] = (),
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[tuple[bool, str, list[str]]]:
+    """Admit or reject an exact provider-qualified registry identity.
+
+    Discovery snapshots list provider-published slugs. They do not list
+    Marionette marketing names bound by ``adapter/provider/leaf`` registry
+    ids. Returns ``None`` when this path does not apply (bare names,
+    two-segment ids, or an ambiguous wire name without an identity).
+    """
+    if adapter != "agentic":
+        return None
+
+    from puppetmaster.model_registry import load_registry, normalize_model_token
+    from puppetmaster.providers import available_providers
+
+    try:
+        specs = [spec for spec in load_registry() if spec.adapter == adapter]
+    except (OSError, RuntimeError, ValueError):
+        return None
+    by_id = {spec.id: spec for spec in specs}
+
+    resolved = None
+    for text in _identity_texts(model, identities):
+        provider = provider_binding_from_identity(text, adapter)
+        if provider is None:
+            continue
+        spec = by_id.get(text)
+        if spec is None or not _provider_qualified_wire_matches(spec, model):
+            continue
+        resolved = (spec, provider)
+        break
+
+    if resolved is None and model and provider_binding_from_identity(
+        str(model), adapter
+    ) is None:
+        needle = normalize_model_token(model)
+        matches = []
+        for spec in specs:
+            provider = provider_binding_from_identity(spec.id, adapter)
+            if provider is None:
+                continue
+            if normalize_model_token(spec.adapter_model_name) != needle:
+                continue
+            matches.append((spec, provider))
+        if len(matches) == 1:
+            resolved = matches[0]
+
+    if resolved is None:
+        return None
+
+    spec, provider = resolved
+    if not spec.is_routable:
+        return (
+            False,
+            f"registry model {spec.id!r} is disabled or retired",
+            ["preflight:provider_qualified_disabled"],
+        )
+    if provider not in available_providers(env):
+        return (
+            False,
+            f"provider {provider!r} is not available for {spec.id!r}",
+            ["preflight:provider_qualified_unready"],
+        )
+    return (
+        True,
+        f"provider-qualified identity {spec.id!r} admitted ({provider} ready)",
+        ["preflight:provider_qualified_identity"],
     )
 
 
@@ -585,6 +710,7 @@ def preflight_check(
     run: Optional[CommandRunner] = None,
     catalog_fetcher: Optional[CatalogFetcher] = None,
     billing_status: Optional[BillingStatus] = None,
+    identities: Iterable[Any] = (),
 ) -> PreflightResult:
     """Return a :class:`PreflightResult` for ``adapter`` (and ``model``).
 
@@ -593,6 +719,10 @@ def preflight_check(
     proves the routed model is absent. Catalog lookup failures and stale
     snapshots degrade to a pass with a note — discovery never becomes a
     single point of failure.
+
+    ``identities`` are registry ids (``router_model_id`` / ``pinned_model``).
+    An exact enabled ``adapter/provider/leaf`` id whose provider is ready is
+    admitted without requiring that marketing slug in a discovery snapshot.
     """
     status = billing_status or detect_adapter_billing(
         adapter, env=env, home=home, run=run
@@ -642,6 +772,21 @@ def preflight_check(
                 billing=status.billing,
                 reason=f"ambiguous model pin: {exc}",
                 evidence=[*status.evidence, "preflight:ambiguous_model_pin"],
+            )
+
+    if adapter == "agentic" and catalog_fetcher is None and not live:
+        qualified = provider_qualified_identity_verdict(
+            adapter, catalog_model, identities, env=env
+        )
+        if qualified is not None:
+            qualified_ok, qualified_reason, qualified_evidence = qualified
+            return PreflightResult(
+                ok=qualified_ok,
+                adapter=adapter,
+                model=catalog_model,
+                billing=status.billing,
+                reason=qualified_reason,
+                evidence=[*status.evidence, *pin_evidence, *qualified_evidence],
             )
 
     if catalog_model and catalog_fetcher is None and not live:

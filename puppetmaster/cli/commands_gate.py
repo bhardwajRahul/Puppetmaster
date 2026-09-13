@@ -263,6 +263,7 @@ def _run_preflight_command(args) -> int:
         allow_api_billing=not args.no_api_billing,
         live=getattr(args, "live", False),
         catalog_fetcher=catalog_fetcher,
+        identities=(args.model,),
     )
 
     if args.json:
