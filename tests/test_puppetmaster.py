@@ -17866,15 +17866,13 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
             evidence=["e"],
         )
 
-    def _promoted_statements(self, artifacts):
-        from puppetmaster.models import ArtifactType
+    def _promoted_memories(self, artifacts):
         from puppetmaster.stitcher import Stitcher
 
-        store = object()
-        return [
-            memory.statement
-            for memory in Stitcher(store)._promote_memories(artifacts)
-        ]
+        return Stitcher(object())._promote_memories(artifacts)
+
+    def _promoted_statements(self, artifacts):
+        return [memory.statement for memory in self._promoted_memories(artifacts)]
 
     def test_prompt_echo_verification_is_not_promoted(self) -> None:
         from puppetmaster.models import ArtifactType
@@ -17937,9 +17935,9 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
             artifact_type=ArtifactType.VERIFICATION,
             payload={"check": "race in task claim path", "result": "passed"},
         )
-        statements = self._promoted_statements([finding, decision, verification])
-        self.assertIn("race in task claim path", statements)
-        self.assertNotIn("use sqlite for hot path", statements)
+        memories = self._promoted_memories([finding, decision, verification])
+        self.assertIn("race in task claim path", [memory.statement for memory in memories])
+        self.assertNotIn("swarm.decisions", [memory.scope for memory in memories])
 
     def test_independently_supported_finding_and_decision_are_promoted(self) -> None:
         from puppetmaster.models import ArtifactType
@@ -17960,11 +17958,14 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
             artifact_type=ArtifactType.VERIFICATION,
             payload={"check": "use sqlite for hot path", "result": "passed"},
         )
-        statements = self._promoted_statements(
+        memories = self._promoted_memories(
             [finding, decision, finding_check, decision_check]
         )
-        self.assertIn("race in task claim path", statements)
-        self.assertIn("use sqlite for hot path", statements)
+        self.assertEqual(
+            [memory.statement for memory in memories if memory.scope == "swarm.decisions"],
+            ["use sqlite for hot path"],
+        )
+        self.assertIn("race in task claim path", [memory.statement for memory in memories])
 
     def test_six_hundred_char_guard_trips(self) -> None:
         from puppetmaster.models import ArtifactType
