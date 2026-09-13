@@ -2,9 +2,10 @@
 
 **Registry refresh persists the fallback epoch; workers cannot self-ground or blanket-verify (#203, #204, #205).**
 
-- Auto-routing persists any agentic catalog refresh whose digest changes,
-  not only newly added models. Reconciliation reports `refreshed` when
-  existing rows change without adds. Fallback reloads that exact epoch.
+- Auto-routing persists any agentic catalog refresh that changes the
+  in-memory registry, not only newly added models. Reconciliation
+  reports `refreshed` when existing rows change without adds. Fallback
+  reloads that exact bound epoch.
 - `grounding_status` is host/evidence-owned. A worker payload or top-level
   `grounded` label cannot grant independent support or gist admission.
 - Durable claim support requires a verification that names the artifact id
