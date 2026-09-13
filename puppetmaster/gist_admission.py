@@ -326,8 +326,10 @@ def maybe_admit_finding_as_gist(
 
     Called after a successful ``save_artifact`` of a FINDING. Self-rating /
     ``confidence`` / ``min_confidence`` never admit. Requires independent
-    support (same-task accepting VERIFICATION or PM
-    ``claim_support_status=independently_supported``). ``min_confidence`` is
+    support (an accepting VERIFICATION that names this artifact id or
+    exact claim/risk/decision text, or PM
+    ``claim_support_status=independently_supported``).
+    ``min_confidence`` is
     retained for call-compat only and is ignored.
     """
     if _artifact_type(finding) != ArtifactType.FINDING:

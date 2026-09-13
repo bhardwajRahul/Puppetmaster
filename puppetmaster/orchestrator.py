@@ -728,6 +728,20 @@ class Orchestrator:
                     ),
                 },
             )
+        elif action == "refreshed":
+            self.store.emit(
+                job.id,
+                "router.agentic_catalog_refreshed",
+                {
+                    "refreshed": report.get("refreshed"),
+                    "discovered_count": report.get("discovered_count"),
+                    "available_providers": report.get("available_providers"),
+                    "detail": (
+                        "Refreshed existing agentic catalog rows without adding "
+                        "models so fallback reloads the same registry epoch."
+                    ),
+                },
+            )
         elif action == "unavailable":
             self.store.emit(
                 job.id,
@@ -2018,13 +2032,13 @@ class Orchestrator:
                 registry_cache = load_registry(registry_path)
                 from puppetmaster.static_catalog import reconcile_agentic_catalog
 
+                registry_before_agentic = list(registry_cache)
                 registry_cache, agentic_report = reconcile_agentic_catalog(
                     registry_cache
                 )
-                if agentic_report.get("action") == "merged":
-                    # Persist the merged catalog so the next run (and CLI
-                    # inspect) sees the added agentic models. Best-effort —
-                    # a write failure must never block routing.
+                if registry_cache != registry_before_agentic:
+                    # Persist every refreshed authority, not only newly added
+                    # models. Fallback reloads this exact bound epoch.
                     try:
                         save_registry(registry_cache, registry_path)
                     except Exception:
