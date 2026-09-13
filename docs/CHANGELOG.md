@@ -1,5 +1,14 @@
 ## Unreleased
 
+**Provider-qualified agentic identities skip discovery-slug membership (#197).**
+
+- Preflight still fail-closes bare / two-segment names against a fresh
+  nonempty agentic snapshot. An exact enabled `adapter/provider/leaf`
+  registry id such as `agentic/openai/gpt-5-6-sol` is admitted when that
+  provider is ready, even if the marketing wire name is absent from
+  `models discover --probe`. Discovery does not invent provider-qualified
+  variants. Credit @kbentonferguson.
+
 ## v1.27.18 — 2026-09-13
 
 **Generated auto-routed swarms can leave a spent launch adapter (#195).**

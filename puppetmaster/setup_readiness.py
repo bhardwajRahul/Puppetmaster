@@ -6,7 +6,11 @@ from typing import Optional
 from puppetmaster import diagnostics, platform_lock
 from puppetmaster.model_registry import load_registry
 from puppetmaster.platform_billing import detect_adapter_billing
-from puppetmaster.preflight import _cached_catalog_membership, preflight_check
+from puppetmaster.preflight import (
+    _cached_catalog_membership,
+    preflight_check,
+    provider_qualified_identity_verdict,
+)
 from puppetmaster.providers import available_providers, get_provider
 
 
@@ -31,6 +35,18 @@ def _model_check(spec) -> dict:
     if not spec.enabled or spec.retired:
         return check("fail", f"Registry model {spec.id} is disabled or retired.",
                      "Select an enabled, non-retired registry model.")
+    qualified = provider_qualified_identity_verdict(
+        spec.adapter, spec.adapter_model_name, (spec.id,)
+    )
+    if qualified is not None:
+        ok, reason, _evidence = qualified
+        if ok:
+            return check("pass", reason)
+        return check(
+            "fail",
+            reason,
+            "Configure credentials for the identity provider, then re-run setup.",
+        )
     cached = _cached_catalog_membership(spec.adapter, spec.adapter_model_name)
     if cached is None:
         return check("unknown", "No usable discovery snapshot for this model.", remedy)
@@ -111,7 +127,13 @@ def collect_setup_readiness(
             elif spec is None or model["status"] == "fail":
                 preflight = check("fail", "No available registry model.", model["remedy"])
             else:
-                result = preflight_check(adapter, spec.adapter_model_name, live=False, billing_status=billing)
+                result = preflight_check(
+                    adapter,
+                    spec.adapter_model_name,
+                    live=False,
+                    billing_status=billing,
+                    identities=(spec.id,),
+                )
                 preflight = check("pass" if result.ok else "fail", result.reason,
                                   "" if result.ok else "Run `puppetmaster preflight --help` and resolve the reported failure.")
             rows.append({

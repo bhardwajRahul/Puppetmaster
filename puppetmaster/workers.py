@@ -355,6 +355,10 @@ class LocalWorker:
                 allow_api_billing=bool(payload.get("allow_api_billing", True)),
                 live=bool(payload.get("live_preflight")),
                 catalog_fetcher=catalog_fetcher,
+                identities=(
+                    payload.get("router_model_id"),
+                    payload.get("pinned_model"),
+                ),
             )
         except AmbiguousModelPinError as exc:
             return verification_artifact(
