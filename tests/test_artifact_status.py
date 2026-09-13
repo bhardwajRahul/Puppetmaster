@@ -214,6 +214,44 @@ class SelfRatingCannotAdmitTests(unittest.TestCase):
             self.assertTrue(durable_admission_allowed(finding, store=store))
             self.assertIsNotNone(maybe_admit_finding_as_gist(store, finding))
 
+    def test_exact_decision_pointer_admits_decision_not_sibling_finding(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("exact decision")
+            finding = _finding(
+                job_id=job.id,
+                task_id="task-v",
+                payload={"claim": "race in task claim path"},
+            )
+            decision = Artifact(
+                job_id=job.id,
+                task_id="task-v",
+                type=ArtifactType.DECISION,
+                created_by="worker",
+                payload={
+                    "decision": "use sqlite for hot path",
+                    "why": "claim support names the decision text",
+                },
+                confidence=0.9,
+                evidence=["e"],
+            )
+            store.save_artifact(finding)
+            store.save_artifact(decision)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id="task-v",
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker",
+                    confidence=0.9,
+                    evidence=["file.py:3"],
+                    payload={"check": "use sqlite for hot path", "result": "passed"},
+                )
+            )
+            self.assertTrue(durable_admission_allowed(decision, store=store))
+            self.assertFalse(durable_admission_allowed(finding, store=store))
+
 
 class CompactRefDisplayTests(unittest.TestCase):
     def test_compact_ref_keeps_confidence_and_adds_statuses(self) -> None:

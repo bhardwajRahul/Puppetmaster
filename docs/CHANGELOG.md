@@ -9,8 +9,9 @@
 - `grounding_status` is host/evidence-owned. A worker payload or top-level
   `grounded` label cannot grant independent support or gist admission.
 - Durable claim support requires a verification that names the artifact id
-  or exact claim. A same-task pass with no pointer is execution truth, not
-  claim truth. Credit @kbentonferguson.
+  or exact statement (finding claim, decision, or risk). A same-task pass
+  with no pointer is execution truth, not claim truth. Credit
+  @kbentonferguson.
 
 ## v1.27.19 — 2026-09-13
 

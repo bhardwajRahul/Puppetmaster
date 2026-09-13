@@ -322,6 +322,16 @@ def verification_accepts(artifact: Any) -> bool:
     return result in _PASSED
 
 
+def _statement_text(artifact: Any) -> str:
+    """Claim text for FINDING / DECISION / RISK pointer matching."""
+    payload = _payload_of(artifact)
+    for key in ("claim", "decision", "risk"):
+        text = str(payload.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _points_at_finding(verification: Any, finding: Any) -> bool:
     payload = _payload_of(verification)
     evidence = list(
@@ -335,7 +345,7 @@ def _points_at_finding(verification: Any, finding: Any) -> bool:
     finding_id = (
         finding.get("id") if isinstance(finding, dict) else getattr(finding, "id", None)
     )
-    claim = str(_payload_of(finding).get("claim") or "").strip()
+    claim = _statement_text(finding)
     if finding_id and str(finding_id) in haystack:
         return True
     if claim and claim in haystack:
@@ -352,9 +362,10 @@ def finding_has_independent_support(
     """True only for named independent support — never self-rating/confidence.
 
     Independent means an accepting VERIFICATION that names this artifact
-    id or exact claim, or a PM-persisted
-    ``claim_support_status=independently_supported``. Worker payload
-    aliases and a same-task pass with no pointer do not count.
+    id or exact statement (``claim`` / ``decision`` / ``risk``), or a
+    PM-persisted ``claim_support_status=independently_supported``.
+    Worker payload aliases and a same-task pass with no pointer do not
+    count.
     """
     if infer_claim_support_status(finding) == CLAIM_SUPPORT_INDEPENDENT:
         return True

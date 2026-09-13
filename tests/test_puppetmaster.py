@@ -17922,7 +17922,7 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
         statements = self._promoted_statements([finding, decision])
         self.assertEqual(statements, [])
 
-    def test_independently_supported_finding_and_decision_are_promoted(self) -> None:
+    def test_same_task_pass_without_decision_pointer_does_not_promote_decision(self) -> None:
         from puppetmaster.models import ArtifactType
 
         finding = self._artifact(
@@ -17939,8 +17939,32 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
         )
         statements = self._promoted_statements([finding, decision, verification])
         self.assertIn("race in task claim path", statements)
-        self.assertIn("use sqlite for hot path", statements)
+        self.assertNotIn("use sqlite for hot path", statements)
+
+    def test_independently_supported_finding_and_decision_are_promoted(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        finding = self._artifact(
+            artifact_type=ArtifactType.FINDING,
+            payload={"claim": "race in task claim path"},
+        )
+        decision = self._artifact(
+            artifact_type=ArtifactType.DECISION,
+            payload={"decision": "use sqlite for hot path"},
+        )
+        finding_check = self._artifact(
+            artifact_type=ArtifactType.VERIFICATION,
+            payload={"check": "race in task claim path", "result": "passed"},
+        )
+        decision_check = self._artifact(
+            artifact_type=ArtifactType.VERIFICATION,
+            payload={"check": "use sqlite for hot path", "result": "passed"},
+        )
+        statements = self._promoted_statements(
+            [finding, decision, finding_check, decision_check]
+        )
         self.assertIn("race in task claim path", statements)
+        self.assertIn("use sqlite for hot path", statements)
 
     def test_six_hundred_char_guard_trips(self) -> None:
         from puppetmaster.models import ArtifactType
