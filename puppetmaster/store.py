@@ -1581,6 +1581,11 @@ class SwarmStore(StoreContracts):
             capabilities=capabilities,
             persist_blocked=True,
         ):
+            # Peers can drain the queue while this sweep holds an old snapshot.
+            # Avoid a known-losing claim; claim_task still fences races after
+            # this advisory read under the backend's normal claim protection.
+            if self.get_task_by_id(task.id).status != TaskStatus.QUEUED:
+                continue
             claimed = self.claim_task(
                 task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
             )
@@ -2683,7 +2688,7 @@ class SwarmStore(StoreContracts):
             not record["done"] and record["task"]["id"] == task.id
             and record["task"].get("lease_id") == task.lease_id
             and record["run"]["worker_id"] == task.lease_owner
-            for record in self._completion_records(task.job_id)
+            for record in self._pending_completion_records(task.job_id)
         )
 
     def _save_completion(self, job_id: str, record: dict[str, Any]) -> None:
@@ -2694,6 +2699,9 @@ class SwarmStore(StoreContracts):
             self.read_json(path)
             for path in sorted((self.job_dir(job_id) / "completions").glob("*.json"))
         ]
+
+    def _pending_completion_records(self, job_id: str) -> list[dict[str, Any]]:
+        return [record for record in self._completion_records(job_id) if not record["done"]]
 
     def _get_completion(self, job_id: str, run_id: str):
         path = self._assert_safe_job_dir(job_id) / "completions" / f"{self._safe_key(run_id)}.json"
@@ -2776,14 +2784,14 @@ class SwarmStore(StoreContracts):
         return receipt
 
     def reconcile_completions(self, job_id: str) -> None:
-        if not any(not record["done"] for record in self._completion_records(job_id)):
+        if not self._pending_completion_records(job_id):
             return
         with self._completion_scope(job_id) as acquired:
             if not acquired:
                 return
-            for record in self._completion_records(job_id):
-                if record["done"]:
-                    continue
+            # Re-read after acquiring publication ownership: a peer may have
+            # published the probe's records or accepted another durable intent.
+            for record in self._pending_completion_records(job_id):
                 task = task_from_dict(record["task"])
                 run = AgentRun(**{**record["run"], "status": TaskStatus.COMPLETE})
                 current = self.get_task_by_id(task.id)

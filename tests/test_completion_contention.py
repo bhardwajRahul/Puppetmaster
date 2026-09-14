@@ -1,5 +1,6 @@
 """Completion intent contention must not lose accepted worker output."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -37,6 +38,117 @@ class CompletionContentionTests(unittest.TestCase):
             ) as completion_scope:
                 store.reconcile_completions(job.id)
             completion_scope.assert_not_called()
+
+    def test_reconciliation_reads_only_pending_records(self):
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp))
+            job = store.create_job('historical completions')
+            task, run = self.make_task(store, job)
+            store.complete_task(task, run, [], {'task_id': task.id})
+            pending_task, pending_run = self.make_task(store, job)
+            with patch.object(store, 'reconcile_completions'):
+                store.complete_task(pending_task, pending_run, [], {'task_id': pending_task.id})
+            original_all = store._all
+            loaded = []
+
+            def read(query, *args, **kwargs):
+                rows = original_all(query, *args, **kwargs)
+                if query.startswith('SELECT data FROM completions WHERE job_id = ?'):
+                    loaded.extend(rows)
+                return rows
+
+            with patch.object(store, '_all', side_effect=read):
+                store.reconcile_completions(job.id)
+            # One unlocked probe and one authoritative read under the writer.
+            self.assertEqual(len(loaded), 2)
+            self.assertTrue(all(pending_run.id in row['data'] for row in loaded))
+            self.assertEqual(len(store._completion_records(job.id)), 2)
+            self.assertEqual(store.get_completion_receipt(store.job_ref(job.id), run.id).outcome,
+                             'published')
+            self.assertEqual(store.get_task_by_id(pending_task.id).status, TaskStatus.COMPLETE)
+            loaded.clear()
+            with patch.object(store, '_all', side_effect=read), \
+                    patch.object(store, '_completion_scope', side_effect=AssertionError('no pending work')):
+                store.reconcile_completions(job.id)
+            self.assertEqual(loaded, [])
+
+    def test_claim_sweep_skips_candidates_taken_since_snapshot(self):
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=backend.backend_name), TemporaryDirectory() as tmp:
+                store = backend(Path(tmp))
+                job = store.create_job('stale queue snapshot')
+                for _ in range(4):
+                    store.save_task(Task(job_id=job.id, role='explore', instruction='claim'))
+                original_list = store.list_tasks
+                original_claim = store.claim_task
+                stolen = []
+                scanned = False
+
+                def snapshot(job_id):
+                    nonlocal scanned
+                    tasks = original_list(job_id)
+                    if scanned:
+                        return tasks
+                    scanned = True
+                    # A peer wins every task after this reader takes its snapshot.
+                    for task in tasks:
+                        stolen.append(original_claim(task.id, 'peer'))
+                    return tasks
+
+                with patch.object(store, 'list_tasks', side_effect=snapshot), \
+                        patch.object(store, 'claim_task', wraps=original_claim) as claim:
+                    self.assertIsNone(store.claim_next_task(job.id, 'loser'))
+                self.assertEqual(claim.call_count, 0)
+                self.assertTrue(all(task.lease_owner == 'peer' for task in stolen))
+
+    def test_reconciliation_refreshes_pending_records_under_publication_lock(self):
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=backend.backend_name), TemporaryDirectory() as tmp:
+                store = backend(Path(tmp))
+                job = store.create_job('publication race')
+                first, first_run = self.make_task(store, job)
+                second, second_run = self.make_task(store, job)
+                with patch.object(store, 'reconcile_completions'):
+                    store.complete_task(first, first_run, [], {'task_id': first.id})
+                peer = backend(Path(tmp))
+                scope = store._completion_scope
+
+                @contextmanager
+                def raced_scope(job_id):
+                    # The unlocked probe saw first; a peer publishes it and
+                    # accepts second before this publisher acquires ownership.
+                    peer.reconcile_completions(job_id)
+                    with patch.object(peer, 'reconcile_completions'):
+                        peer.complete_task(second, second_run, [], {'task_id': second.id})
+                    with scope(job_id) as acquired:
+                        yield acquired
+
+                with patch.object(store, '_completion_scope', raced_scope), \
+                        patch.object(store, 'save_run', wraps=store.save_run) as save:
+                    store.reconcile_completions(job.id)
+                self.assertEqual([call.args[0].id for call in save.call_args_list], [second_run.id])
+                self.assertTrue(all(record['done'] for record in store._completion_records(job.id)))
+                events = [e for e in store.read_events(job.id) if e['event'] == 'worker.completed_task']
+                self.assertEqual(len(events), 2)
+
+    def test_claim_race_after_advisory_read_still_respects_peer_lease(self):
+        for backend in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=backend.backend_name), TemporaryDirectory() as tmp:
+                store = backend(Path(tmp))
+                job = store.create_job('claim race')
+                task = Task(job_id=job.id, role='explore', instruction='claim')
+                store.save_task(task)
+                original_claim = store.claim_task
+
+                def race(task_id, worker_id, **kwargs):
+                    self.assertIsNotNone(original_claim(task_id, 'peer'))
+                    return original_claim(task_id, worker_id, **kwargs)
+
+                with patch.object(store, 'claim_task', side_effect=race):
+                    self.assertIsNone(store.claim_next_task(job.id, 'loser'))
+                current = store.get_task_by_id(task.id)
+                self.assertEqual(current.lease_owner, 'peer')
+                self.assertEqual(current.attempts, 1)
 
     def test_simultaneous_completions(self):
         for backend in (SwarmStore, SQLiteSwarmStore):
