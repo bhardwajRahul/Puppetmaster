@@ -1367,6 +1367,12 @@ class SQLiteSwarmStore(SwarmStore):
             "SELECT data FROM completions WHERE job_id = ? ORDER BY id", (job_id,)
         )]
 
+    def _pending_completion_records(self, job_id: str) -> list[dict[str, Any]]:
+        return [json.loads(row["data"]) for row in self._all(
+            "SELECT data FROM completions WHERE job_id = ? "
+            "AND json_extract(data, '$.done') = 0 ORDER BY id", (job_id,)
+        )]
+
     def _record_ledger_sql(self, record: Union[ExecutionAttempt, UsageObservation]) -> bool:
         self._ensure_attached()
         self._assert_safe_job_dir(record.job_id)
