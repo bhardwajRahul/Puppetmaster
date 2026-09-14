@@ -1,3 +1,14 @@
+## v1.27.22 — 2026-09-14
+
+**Keep advertised Codex workers executable on the OAuth path.**
+
+- Accept the shipped `gpt-6-astra` and `gpt-5.3-codex` model identities without
+  substitution; unknown wire IDs remain fail-closed.
+- Recognize GPT-6+ pins in the existing provider identity guard while preserving
+  explicit provider-qualified API selections.
+- Add exhaustive shipped Codex/OAuth catalog parity tests and an Astra/low
+  mocked wire regression so future catalog/validator drift fails CI.
+
 ## v1.27.21 — 2026-09-13
 
 **Implement workers must begin editing before they exhaust the run budget.**

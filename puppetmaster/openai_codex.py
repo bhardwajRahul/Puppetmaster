@@ -95,9 +95,13 @@ def merge_request_headers(
 
 
 # Codex ChatGPT OAuth wire allow-list (curated catalog + common aliases).
+# Tests enforce parity with shipped Codex / openai-codex catalog rows, never
+# user-editable registries or model names advertised by other providers.
 # *-pro variants are remapped to the base id; anything else fail-closes.
 CODEX_WIRE_MODELS = frozenset(
     {
+        "gpt-6-astra",
+        "gpt-5.3-codex",
         "gpt-5",
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -124,11 +128,10 @@ class UnknownCodexModelError(ValueError):
 
 
 def is_codex_class_gpt_model(model: str) -> bool:
-    """True for bare gpt-5 / gpt-5.* ids (including -pro / registry prefixes)."""
+    """Recognize GPT-5+ family ids, including provider-qualified pins."""
     bare = normalize_model_id(model).lower()
-    if not bare:
-        return False
-    return bare == "gpt-5" or bare.startswith("gpt-5.") or bare.startswith("gpt-5-")
+    match = re.match(r"^gpt-(\d+)(?:$|[.-])", bare)
+    return bool(match and int(match.group(1)) >= 5)
 
 
 def remap_codex_pro_model(model: str) -> tuple[str, Optional[str]]:
