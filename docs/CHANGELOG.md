@@ -1,3 +1,14 @@
+## v1.27.23 — 2026-09-14
+
+**High-contention SQLite workers stop reserving the writer for stale work.**
+
+- Recheck queued tasks before entering the atomic claim path so workers do not
+  convoy on writer reservations for tasks a peer already claimed.
+- Filter completed journal rows in SQLite before reconciliation while retaining
+  the authoritative re-read under publication ownership.
+- Add deterministic stale-snapshot and publication-race coverage across the
+  file and SQLite stores; keep the 32-worker Windows canary unchanged.
+
 ## v1.27.22 — 2026-09-14
 
 **Keep advertised Codex workers executable on the OAuth path.**
