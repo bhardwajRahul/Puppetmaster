@@ -1,3 +1,14 @@
+## v1.27.21 — 2026-09-13
+
+**Implement workers must begin editing before they exhaust the run budget.**
+
+- Agentic implement runs now receive one explicit edit-now recovery turn after
+  eight non-mutating turns or 100,000 aggregate tokens, then stop with
+  `edit_progress_exhausted` if they still have not changed the worktree.
+- Terminal verification artifacts retain bounded tool-activity diagnostics,
+  mutation attempts, stop reason, turns, and token totals without preserving
+  prompts, tool arguments, or secrets.
+
 ## v1.27.20 — 2026-09-13
 
 **Registry refresh persists the fallback epoch; workers cannot self-ground or blanket-verify (#203, #204, #205).**

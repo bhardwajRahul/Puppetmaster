@@ -135,6 +135,15 @@ from .cursor import (
 # starving the actual work, so implement runs a generous turn budget.
 DEFAULT_ANALYZE_MAX_TURNS = 16
 DEFAULT_IMPLEMENT_MAX_TURNS = 64
+DEFAULT_EDIT_PROGRESS_MAX_TURNS = 8
+DEFAULT_EDIT_PROGRESS_MAX_TOKENS = 100_000
+_EDIT_PROGRESS_NUDGE = (
+    "Edit-progress limit reached before any successful mutation. EDIT NOW: "
+    "use write_file, edit_file, delete_file, or apply_hashline to make the "
+    "smallest justified implementation change. You have one recovery turn; "
+    "further exploration without a successful mutation will terminate this run."
+)
+_RECENT_TOOL_NAMES_LIMIT = 12
 DEFAULT_ANALYZE_TIMEOUT_SECONDS = 300
 DEFAULT_IMPLEMENT_TIMEOUT_SECONDS = 900
 
@@ -1290,6 +1299,16 @@ class AgenticAdapter(FullEditWorkerAdapter):
         budget_force_attempted = False
         submit_forced_budget = False
         consecutive_no_tool_turns = 0
+        edit_progress_max_turns = max(1, int(task.payload.get(
+            "edit_progress_max_turns", DEFAULT_EDIT_PROGRESS_MAX_TURNS)))
+        edit_progress_max_tokens = max(1, int(task.payload.get(
+            "edit_progress_max_tokens", DEFAULT_EDIT_PROGRESS_MAX_TOKENS)))
+        progress_governor_fired = False
+        total_tool_calls = 0
+        mutating_tool_attempts = 0
+        mutating_tool_successes = 0
+        last_tool_names: list[str] = []
+        known_names = {t["function"]["name"] for t in tools}
 
         # Cancellation points: a host that requested cancel (see
         # puppetmaster.cancellation) stops this worker (a) mid-stream, by the
@@ -1309,6 +1328,15 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if job_id and is_cancelled(job_id):
                 stop_reason = "cancelled"
                 break
+            if implement and not mutated and (
+                turns > edit_progress_max_turns
+                or usage_total["total_tokens"] >= edit_progress_max_tokens
+            ):
+                progress_governor_fired = True
+                messages.append({"role": "user", "content": _EDIT_PROGRESS_NUDGE})
+                # The recovery turn must be free to edit, not forced to submit.
+                force_submit_next = False
+                budget_force_pending = False
             # Shed older tool outputs before the call when the running
             # conversation is nearing the context budget *or* the turn count
             # crosses the compaction threshold, so a long run degrades
@@ -1364,8 +1392,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 else:
                     usage_total[key] += int(turn.usage.get(key, 0) or 0)
             final_text = turn.text or final_text
+            total_tool_calls += len(turn.tool_calls)
+            # Persist only schema tool names, never arguments or arbitrary names.
+            last_tool_names = (last_tool_names + [
+                c["name"] if c["name"] in known_names else "unknown"
+                for c in turn.tool_calls
+            ])[-_RECENT_TOOL_NAMES_LIMIT:]
 
             if not turn.tool_calls:
+                if progress_governor_fired and not mutated:
+                    stop_reason = "edit_progress_exhausted"
+                    break
                 text_present = bool((turn.text or "").strip())
                 # A model that returns nothing right after a tool result usually
                 # just needs a poke to keep going or to submit -- recover once.
@@ -1534,8 +1571,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         )
                     for call, output in results:
                         tname = call["name"]
-                        if tname in _MUTATING_TOOLS and not output.startswith("error"):
-                            mutated = True
+                        if tname in _MUTATING_TOOLS:
+                            mutating_tool_attempts += 1
+                            if not output.startswith("error"):
+                                mutating_tool_successes += 1
+                                mutated = True
                         messages.append({
                             "role": "tool",
                             "tool_call_id": call["id"],
@@ -1545,6 +1585,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                                 tool_name=tname, tool_call_id=call["id"],
                             ),
                         })
+            if progress_governor_fired and not mutated:
+                stop_reason = "edit_progress_exhausted"
+                break
             if submitted_this_turn:
                 stop_reason = "submitted"
                 if this_turn_budget_force:
@@ -1617,6 +1660,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     else:
                         usage_total[key] += int(turn.usage.get(key, 0) or 0)
                 final_text = turn.text or final_text
+                total_tool_calls += len(turn.tool_calls)
+                last_tool_names = (last_tool_names + [
+                    c["name"] if c["name"] in known_names else "unknown"
+                    for c in turn.tool_calls
+                ])[-_RECENT_TOOL_NAMES_LIMIT:]
                 for call in turn.tool_calls or []:
                     if call.get("name") == _SUBMIT_FINDINGS_TOOL:
                         items, criteria = _coerce_submit_findings(call.get("arguments"))
@@ -1640,6 +1688,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
             "tokens_in": usage_total["prompt_tokens"],
             "tokens_out": usage_total["completion_tokens"],
             "tokens_total": usage_total["total_tokens"],
+            "total_tool_calls": total_tool_calls,
+            "mutating_tool_attempts": mutating_tool_attempts,
+            "mutating_tool_successes": mutating_tool_successes,
+            "last_tool_names": last_tool_names,
+            "progress_governor_fired": progress_governor_fired,
             "context_compressions": context_compressions,
             "tokens_cached": usage_total["cached_tokens"],
             "submit_forced_budget": submit_forced_budget,

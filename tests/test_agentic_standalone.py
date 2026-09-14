@@ -1332,6 +1332,84 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertIn("retry:recovered", verif.evidence)
         self.assertIn(ArtifactType.FINDING, [a.type for a in arts])
 
+    def _progress_run(self, names, **payload):
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        seen = []
+
+        def fake_chat(*, messages, **kwargs):
+            seen.append(list(messages))
+            name = names[min(len(seen) - 1, len(names) - 1)]
+            args = {"path": "progress.txt", "content": "implemented\n"}
+            if name == "edit_file":
+                args = {"path": "missing.txt", "old_string": "x", "new_string": "y"}
+            return AssistantTurn(text="", tool_calls=[
+                {"id": str(len(seen)), "name": name, "arguments": args}
+            ], usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6})
+
+        task = Task(job_id="j", role="build", instruction="implement a thing",
+                    payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                             "mode": "implement", "disable_codegraph": True,
+                             "max_turns": 20, "edit_progress_max_turns": 2,
+                             **payload})
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+        verification = next(a.payload for a in arts if a.type == ArtifactType.VERIFICATION)
+        return verification, seen, arts, cwd
+
+    def test_edit_progress_stops_exploration_with_one_recovery(self):
+        from puppetmaster.adapters.agentic import _EDIT_PROGRESS_NUDGE
+        v, seen, _, _ = self._progress_run(["list_dir"])
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(sum(m.get("content") == _EDIT_PROGRESS_NUDGE
+                             for m in seen[-1]), 1)
+        self.assertEqual(v["stop_reason"], "edit_progress_exhausted")
+        self.assertEqual(v["turns"], 3)
+        self.assertEqual(v["total_tool_calls"], 3)
+        self.assertEqual(v["mutating_tool_attempts"], 0)
+        self.assertEqual(v["mutating_tool_successes"], 0)
+        self.assertEqual(v["last_tool_names"], ["list_dir"] * 3)
+        self.assertEqual((v["tokens_in"], v["tokens_out"], v["tokens_total"]), (12, 6, 18))
+        self.assertTrue(v["progress_governor_fired"])
+
+    def test_edit_progress_failed_mutation_does_not_disable_guard(self):
+        v, seen, _, _ = self._progress_run(["edit_file"])
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(v["mutating_tool_attempts"], 3)
+        self.assertEqual(v["mutating_tool_successes"], 0)
+        self.assertEqual(v["stop_reason"], "edit_progress_exhausted")
+
+    def test_edit_progress_recovery_mutation_continues_and_keeps_patch(self):
+        v, seen, arts, cwd = self._progress_run(
+            ["list_dir", "list_dir", "write_file", "list_dir"], max_turns=6)
+        self.assertEqual(len(seen), 6)
+        self.assertEqual(v["stop_reason"], "max_turns")
+        self.assertEqual(v["mutating_tool_successes"], 1)
+        self.assertTrue(v["progress_governor_fired"])
+        self.assertTrue(any(a.type == ArtifactType.PATCH for a in arts))
+        self.assertEqual((cwd / "progress.txt").read_text(), "implemented\n")
+
+    def test_edit_progress_early_mutation_disables_guard(self):
+        v, seen, _, _ = self._progress_run(["write_file", "list_dir"], max_turns=15)
+        self.assertEqual(len(seen), 15)
+        self.assertFalse(v["progress_governor_fired"])
+        self.assertEqual(len(v["last_tool_names"]), 12)
+
+    def test_edit_progress_token_limit(self):
+        v, seen, _, _ = self._progress_run(
+            ["list_dir"], edit_progress_max_turns=15, edit_progress_max_tokens=6)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(v["stop_reason"], "edit_progress_exhausted")
+
+    def test_edit_progress_analysis_is_exempt(self):
+        v, seen, _, _ = self._progress_run(
+            ["list_dir"], mode="analyze", max_turns=5)
+        self.assertGreaterEqual(len(seen), 5)
+        self.assertFalse(v["progress_governor_fired"])
+        self.assertNotEqual(v["stop_reason"], "edit_progress_exhausted")
+
     def test_implement_noop_is_degraded_and_nudged(self) -> None:
         from puppetmaster.adapters import agentic
         from puppetmaster.providers import AssistantTurn
