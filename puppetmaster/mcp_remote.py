@@ -114,6 +114,8 @@ IMPLEMENT_TOOL_NAMES = frozenset(
         "puppetmaster_reset_subgraph",
         "puppetmaster_cut_task",
         "puppetmaster_restore_task",
+        "puppetmaster_steer",
+        "puppetmaster_broadcast",
         "puppetmaster_gc",
         "puppetmaster_codegraph_init",
         "puppetmaster_codegraph_index",

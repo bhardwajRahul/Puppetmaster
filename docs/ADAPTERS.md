@@ -312,6 +312,21 @@ MCP verbs: `puppetmaster_agentic` (sync) and `puppetmaster_start_agentic` (async
 
 When an agentic implement worker edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
+## Universal runtime contracts
+
+These apply to every registered adapter (`local`, `shell`, `openai`, `agentic`,
+`cursor`, `claude-code`, `codex`, `hermes`, `antigravity` / `agy`):
+
+- Optional terminal `VERDICT: PASS|FAIL|PARTIAL - reason` lines and structured
+  `worker_verdict` objects. Missing or conflicting verdicts stay absent.
+- File-claim admission around write-capable runs.
+- `payload.failure_policy` / spec `on_fail`: `abort`, `continue` (`SKIPPED`),
+  or `retry(n)` with `n<=10`.
+- `puppetmaster steer <job> "<msg>"` / `broadcast` queue follow-ups. Mid-turn
+  delivery is used when the adapter has a live channel; otherwise the next
+  boundary or a successor task consumes the command.
+- Opt-in `payload.review_loop` and `payload.cleanup`.
+
 ## Adding A Provider
 
 1. Implement a class with `run(task, goal, worker_id) -> list[Artifact]`.

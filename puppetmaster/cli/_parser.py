@@ -197,6 +197,31 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
+    def _add_quality_flags(adapter_parser: argparse.ArgumentParser) -> None:
+        group = adapter_parser.add_argument_group("quality")
+        group.add_argument(
+            "--review-loop",
+            action="store_true",
+            help="Re-run the same adapter/model on a dirty tree when review rejects (bounded).",
+        )
+        group.add_argument(
+            "--review-loop-limit",
+            type=int,
+            default=None,
+            help="Max same-adapter review repairs (default 3, cap 10).",
+        )
+        group.add_argument(
+            "--cleanup",
+            action="store_true",
+            help="Best-effort lint --fix on edited paths after the worker returns.",
+        )
+        group.add_argument(
+            "--cleanup-max-usd",
+            type=float,
+            default=None,
+            help="Optional USD cap for a cheap-model cleanup pass.",
+        )
+
     def _add_budget_arguments(job_parser: argparse.ArgumentParser) -> None:
         for field, kind in BUDGET_FIELDS.items():
             job_parser.add_argument(
@@ -1267,6 +1292,19 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("job_id")
     restore.add_argument("--task", required=True, dest="task_id")
 
+    steer = subcommands.add_parser(
+        "steer", help="Queue a follow-up instruction for a running job or task."
+    )
+    steer.add_argument("job_id")
+    steer.add_argument("message")
+    steer.add_argument("--task", dest="task_id", help="Limit the steer to one task.")
+
+    broadcast = subcommands.add_parser(
+        "broadcast", help="Queue the same steer for every live task in a job."
+    )
+    broadcast.add_argument("job_id")
+    broadcast.add_argument("message")
+
     memory = subcommands.add_parser("memory", help="List or prune promoted memory.")
     memory.add_argument("--json", action="store_true", help="Emit full JSON dump.")
     memory.add_argument("--prune", action="store_true", help="Delete matching memory records.")
@@ -1381,6 +1419,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(cursor)
+    _add_quality_flags(cursor)
     _add_label_argument(cursor)
     _add_playbook_argument(cursor, extras=True)
 
@@ -1425,6 +1464,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(claude)
+    _add_quality_flags(claude)
     _add_label_argument(claude)
     _add_playbook_argument(claude, extras=True)
 
@@ -1495,6 +1535,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(openai)
+    _add_quality_flags(openai)
     _add_label_argument(openai)
     _add_playbook_argument(openai, extras=True)
 
@@ -1557,6 +1598,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(codex)
+    _add_quality_flags(codex)
+    codex.add_argument(
+        "--native-steer",
+        action="store_true",
+        help="Use Codex app-server so queued steers can reach the active turn.",
+    )
     _add_label_argument(codex)
     _add_playbook_argument(codex, extras=True)
 
@@ -1618,6 +1665,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
     _add_routing_flags(hermes)
+    _add_quality_flags(hermes)
     _add_label_argument(hermes)
     _add_playbook_argument(hermes, extras=True)
 
@@ -1677,6 +1725,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
     _add_routing_flags(antigravity)
+    _add_quality_flags(antigravity)
     _add_label_argument(antigravity)
     _add_playbook_argument(antigravity, extras=True)
 
@@ -1746,6 +1795,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(agentic)
+    _add_quality_flags(agentic)
     _add_label_argument(agentic)
     _add_playbook_argument(agentic, extras=True)
 
@@ -1803,6 +1853,7 @@ def build_parser() -> argparse.ArgumentParser:
             "adapter name). Repeatable."
         ),
     )
+    _add_quality_flags(edit)
     _add_label_argument(edit)
 
     prewalk = subcommands.add_parser(

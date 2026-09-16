@@ -14,7 +14,16 @@ from typing import Callable, Optional
 from puppetmaster.budget import BudgetPolicy
 from puppetmaster.hermes_spawn_tree import emit_spawn_tree
 from puppetmaster.liveness import record_orchestrator_heartbeat
-from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus, now_iso
+from puppetmaster.models import (
+    Artifact,
+    ArtifactType,
+    Job,
+    JobStatus,
+    SATISFIED_TASK_STATUSES,
+    Task,
+    TaskStatus,
+    now_iso,
+)
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
 from puppetmaster.swarm_reasoning import apply_swarm_reasoning
@@ -447,7 +456,9 @@ class Orchestrator:
             self._ensure_job_brief(job, goal, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
-            self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
+            self._run_workers_and_successors(
+                job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode
+            )
             # Explicit failure edges are coordinator-owned. Apply them before
             # fallback/review so retry/continue cannot be multiplied by those
             # older recovery mechanisms, and let retry generations run.
@@ -457,13 +468,16 @@ class Orchestrator:
                 retryable = [t for t in changed if t.status == TaskStatus.QUEUED]
                 if not retryable:
                     break
-                self._run_workers(
+                self._run_workers_and_successors(
                     job, retryable, lease_seconds=lease_seconds, worker_mode=worker_mode
                 )
             if swarm_mode(specs) == "analysis":
                 self._enforce_analysis_no_worker_diff(job, tasks)
             rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
             rerouted += self._auto_escalate(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
+            rerouted += self._quality_review_repair(
+                job, lease_seconds=lease_seconds, worker_mode=worker_mode
+            )
             rerouted += self._auto_review_escalate(
                 job, lease_seconds=lease_seconds, worker_mode=worker_mode
             )
@@ -849,7 +863,7 @@ class Orchestrator:
                 break
             total += rerouted
             self.store.emit(job.id, "job.auto_fallback_round", {"rerouted": rerouted})
-            self._run_workers(
+            self._run_workers_and_successors(
                 job,
                 self.store.list_tasks(job.id),
                 lease_seconds=lease_seconds,
@@ -1094,7 +1108,7 @@ class Orchestrator:
                 break
             total += rerouted
             self.store.emit(job.id, "job.auto_escalate_round", {"rerouted": rerouted})
-            self._run_workers(
+            self._run_workers_and_successors(
                 job,
                 self.store.list_tasks(job.id),
                 lease_seconds=lease_seconds,
@@ -1300,7 +1314,7 @@ class Orchestrator:
                 break
             total += rerouted
             self.store.emit(job.id, "job.auto_review_escalate_round", {"rerouted": rerouted})
-            self._run_workers(
+            self._run_workers_and_successors(
                 job,
                 self.store.list_tasks(job.id),
                 lease_seconds=lease_seconds,
@@ -1328,10 +1342,16 @@ class Orchestrator:
         pending: set[str] = set()
         for task in self.store.list_tasks(job.id):
             payload = task.payload or {}
+            if task.id not in rejected or task.status != TaskStatus.FAILED:
+                continue
+            if payload.get("review_loop"):
+                from puppetmaster.quality_loop import review_loop_limit
+
+                if int(payload.get("review_loop_attempts") or 0) < review_loop_limit(payload):
+                    pending.add(task.id)
+                continue
             if (
-                task.id in rejected
-                and task.status == TaskStatus.FAILED
-                and payload.get("router_model_id")
+                payload.get("router_model_id")
                 and not _payload_has_explicit_model_pin(payload)
                 and int(payload.get("review_escalation_attempts", 0))
                 < _MAX_ESCALATION_ATTEMPTS
@@ -1388,6 +1408,8 @@ class Orchestrator:
             if task.status != TaskStatus.FAILED or task.id not in failed_review:
                 continue
             payload = task.payload or {}
+            if payload.get("review_loop"):
+                continue
             if int(payload.get("review_escalation_attempts", 0)) >= _MAX_ESCALATION_ATTEMPTS:
                 continue
             # Only re-route work the router placed — never override a hand-pinned
@@ -1643,7 +1665,7 @@ class Orchestrator:
             return False
 
         for task in by_id.values():
-            if task.id not in allowed_task_ids or task.status == TaskStatus.COMPLETE:
+            if task.id not in allowed_task_ids or task.status in SATISFIED_TASK_STATUSES:
                 continue
             if task.id in recoverable:
                 continue
@@ -2419,6 +2441,68 @@ class Orchestrator:
 
         for task in tasks:
             visit(task.id)
+
+    def _run_workers_and_successors(
+        self,
+        job: Job,
+        tasks: list[Task],
+        lease_seconds: int = 5,
+        allowed_task_ids: Optional[set[str]] = None,
+        worker_mode: str = "subprocess",
+    ) -> None:
+        """Run the ready set, then any steering successors those workers spawned."""
+        from puppetmaster.steering import spawn_successors_for_job
+
+        self._run_workers(
+            job,
+            tasks,
+            lease_seconds=lease_seconds,
+            allowed_task_ids=allowed_task_ids,
+            worker_mode=worker_mode,
+        )
+        for _ in range(8):
+            spawn_successors_for_job(self.store, job.id)
+            extra = [
+                task
+                for task in self.store.list_tasks(job.id)
+                if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+                and (task.payload or {}).get("steering_successor")
+            ]
+            if not extra:
+                break
+            extra_ids = {task.id for task in extra}
+            if allowed_task_ids is not None:
+                extra_ids |= set(allowed_task_ids)
+            self._run_workers(
+                job,
+                extra,
+                lease_seconds=lease_seconds,
+                allowed_task_ids=extra_ids,
+                worker_mode=worker_mode,
+            )
+
+    def _quality_review_repair(
+        self, job: Job, *, lease_seconds: int, worker_mode: str
+    ) -> int:
+        """Same-adapter dirty repair for opt-in ``review_loop`` tasks."""
+        from puppetmaster.quality_loop import maybe_requeue_review_repair
+
+        total = 0
+        for _ in range(10):
+            repaired = maybe_requeue_review_repair(self.store, job.id)
+            if not repaired:
+                break
+            total += len(repaired)
+            self.store.emit(
+                job.id, "job.quality_review_repair_round", {"rerouted": len(repaired)}
+            )
+            self._run_workers_and_successors(
+                job,
+                repaired,
+                lease_seconds=lease_seconds,
+                worker_mode=worker_mode,
+            )
+        return total
 
     def _run_workers(
         self,

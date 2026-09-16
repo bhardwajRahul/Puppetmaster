@@ -141,26 +141,14 @@ def _owner(store, task, worker_id, registry, cwd, claims, ttl=2.0):
 
 
 def _adapter_may_write(adapter: str, payload: dict) -> bool:
-    """Mirror the registry's effective permissions, conservatively."""
+    """Same write matrix as ``spec_edits_files`` / dirty-tree guards."""
     try:
         from puppetmaster.platform_lock import canonicalize_adapter
         adapter = canonicalize_adapter(adapter)
     except Exception:
         adapter = str(adapter).lower()
-    if adapter in {"local", "openai"}:
-        return False
-    if adapter == "shell":
-        return True
-    if adapter in {"agentic", "cursor", "hermes"}:
-        return True
-    if adapter == "claude-code":
-        permission = str(payload.get("permission_mode", "plan" if (payload.get("read_only") or payload.get("sandbox") == "read-only") else "acceptEdits"))
-        return permission != "plan"
-    if adapter == "codex":
-        return str(payload.get("sandbox", "workspace-write")) != "read-only" or bool(payload.get("dangerously_bypass_approvals_and_sandbox"))
-    if adapter in {"antigravity", "agy"}:
-        return str(payload.get("mode", "plan" if (payload.get("read_only") or payload.get("sandbox") == "read-only") else "accept-edits")) != "plan"
-    return True
+    from puppetmaster.write_intent import adapter_may_write
+    return adapter_may_write(adapter, payload)
 
 
 def _cancelled(store, task, payload) -> bool:

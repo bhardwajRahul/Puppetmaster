@@ -319,6 +319,24 @@ def routing_payload_from_args(args, *, adapter: str) -> dict:
         payload["allowed_model_ids"] = allowed_models
     return payload
 
+
+def quality_payload_from_args(args) -> dict:
+    """Opt-in review-loop / cleanup flags shared by every write-capable command."""
+    payload: dict[str, Any] = {}
+    if getattr(args, "review_loop", False):
+        payload["review_loop"] = True
+        limit = getattr(args, "review_loop_limit", None)
+        if limit is not None:
+            payload["review_loop_limit"] = int(limit)
+    if getattr(args, "cleanup", False):
+        payload["cleanup"] = True
+        cap = getattr(args, "cleanup_max_usd", None)
+        if cap is not None:
+            payload["cleanup_max_usd"] = float(cap)
+    if getattr(args, "native_steer", False):
+        payload["native_steer"] = True
+    return payload
+
 def artifact_feed(store, job_id: str, limit: Optional[int] = None) -> list[dict]:
     items, _ = artifact_feed_since(store, job_id, since=0, limit=limit)
     return items

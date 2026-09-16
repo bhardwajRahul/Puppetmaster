@@ -1329,6 +1329,20 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if job_id and is_cancelled(job_id):
                 stop_reason = "cancelled"
                 break
+            try:
+                from puppetmaster.state import resolve_state_dir
+                from puppetmaster.steering import BOUNDARY_MID_TURN, drain_pending
+                from puppetmaster.store_factory import create_store
+
+                store = create_store("sqlite", resolve_state_dir())
+                steers = drain_pending(store, task, boundary=BOUNDARY_MID_TURN)
+                if steers:
+                    messages.append({
+                        "role": "user",
+                        "content": "Host steering:\n" + "\n".join("- %s" % item for item in steers),
+                    })
+            except Exception:
+                pass
             if implement and not mutated and (
                 turns > edit_progress_max_turns
                 or usage_total["total_tokens"] >= edit_progress_max_tokens

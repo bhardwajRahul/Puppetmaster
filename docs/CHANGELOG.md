@@ -1,3 +1,20 @@
+## v1.27.24 — 2026-09-16
+
+**Universal worker contracts: verdicts, claims, steering, failure edges, and opt-in quality loops.**
+
+- Persist optional structured worker verdicts (`PASS` / `FAIL` / `PARTIAL`) as
+  advisory `VERIFICATION` artifacts. Absence is never a pass.
+- Shared write-intent + edit admission fences every registered writer;
+  `SKIPPED` (explicit `on_fail=continue`) satisfies dependents and does not
+  fail-close the job.
+- Host `steer` / `broadcast` consume the session command ledger at the next
+  execution boundary. One-shot adapters queue a successor; Codex `native_steer`
+  can deliver mid-turn. A native ack is not model-applied.
+- Opt-in `review_loop` repairs the same adapter on a dirty tree with reviewer
+  reasons and does not multiply with model-tier auto-escalation. Opt-in
+  `cleanup` is best-effort lint `--fix` on edited paths and cannot fail the
+  implement.
+
 ## v1.27.23 — 2026-09-14
 
 **High-contention SQLite workers stop reserving the writer for stale work.**

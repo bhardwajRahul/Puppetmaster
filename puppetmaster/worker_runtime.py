@@ -224,15 +224,77 @@ class WorkerRuntime:
                     reused = []
 
             if not reused:
+                from puppetmaster.edit_admission import EditAdmissionTimeout, edit_admission
                 from puppetmaster.invocation import execution_scope
+                from puppetmaster.steering import (
+                    BOUNDARY_PRE_DISPATCH,
+                    apply_steering_to_task,
+                    drain_pending,
+                )
 
-                with execution_scope(self.store, run, task, lease_lost=self._lease_lost.is_set):
-                    worker_run, artifacts = LocalWorker(
-                        task.role, worker_id=self.worker_id
-                    ).run(
-                        task,
-                        self.store.get_job(self.job_id).goal,
+                native_steer = (
+                    task.adapter == "codex"
+                    and bool((task.payload or {}).get("native_steer"))
+                )
+                if not native_steer:
+                    steered = drain_pending(
+                        self.store, task, boundary=BOUNDARY_PRE_DISPATCH
                     )
+                    if steered:
+                        task = apply_steering_to_task(task, steered)
+                        self.store.save_task(task)
+                try:
+                    with edit_admission(self.store, task, self.worker_id) as admission:
+                        with execution_scope(
+                            self.store, run, task, lease_lost=self._lease_lost.is_set
+                        ):
+                            worker_run, artifacts = LocalWorker(
+                                task.role, worker_id=self.worker_id
+                            ).run(
+                                task,
+                                self.store.get_job(self.job_id).goal,
+                            )
+                        if admission.lost:
+                            from puppetmaster.adapters import verification_artifact
+
+                            artifacts = list(artifacts) + [
+                                verification_artifact(
+                                    task=task,
+                                    worker_id=self.worker_id,
+                                    adapter=task.adapter,
+                                    check="edit_admission",
+                                    result="failed",
+                                    confidence=1.0,
+                                    evidence=["edit_admission:lost"],
+                                    payload={"failure": "edit_admission_lost"},
+                                )
+                            ]
+                except EditAdmissionTimeout as exc:
+                    from puppetmaster.adapters import verification_artifact
+
+                    worker_run = AgentRun(
+                        job_id=self.job_id,
+                        task_id=task.id,
+                        role=task.role,
+                        worker_id=self.worker_id,
+                        status=TaskStatus.FAILED,
+                        completed_at=now_iso(),
+                    )
+                    artifacts = [
+                        verification_artifact(
+                            task=task,
+                            worker_id=self.worker_id,
+                            adapter=task.adapter,
+                            check="edit_admission",
+                            result="blocked",
+                            confidence=1.0,
+                            evidence=["edit_admission:timeout"],
+                            payload={
+                                "failure": "edit_admission_timeout",
+                                "reason": str(exc),
+                            },
+                        )
+                    ]
                 if self._lease_lost.is_set():
                     self.store.emit(
                         self.job_id,
@@ -257,6 +319,20 @@ class WorkerRuntime:
                 from puppetmaster.worker_verdict import verdict_artifacts
 
                 artifacts = verdict_artifacts(task, self.worker_id, artifacts)
+                try:
+                    from puppetmaster.quality_loop import run_cleanup_pass
+
+                    artifacts = run_cleanup_pass(
+                        task, artifacts, store=self.store
+                    )
+                except Exception:
+                    pass
+                try:
+                    from puppetmaster.steering import BOUNDARY_POST_OUTPUT, drain_pending
+
+                    drain_pending(self.store, task, boundary=BOUNDARY_POST_OUTPUT)
+                except Exception:
+                    pass
                 for artifact in artifacts:
                     try:
                         from puppetmaster.negative_claims import stamp_failed_gate

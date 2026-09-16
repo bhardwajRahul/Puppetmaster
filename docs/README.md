@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.27.0](CHANGELOG.md#v1270--2026-09-08) — community observations order already-sufficient models; preference stays taste; ROUTING names the winning source. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.24](CHANGELOG.md#v12724--2026-09-16) — universal worker contracts (verdicts, claims, steering, failure edges, opt-in quality loops). See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 

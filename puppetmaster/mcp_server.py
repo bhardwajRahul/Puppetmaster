@@ -1724,6 +1724,22 @@ def _build_tools() -> list[McpTool]:
             handler=run_restore_task,
         ),
         McpTool(
+            name="puppetmaster_steer",
+            description=(
+                "Queue a follow-up instruction for a running job or one task. "
+                "Adapters without a mid-turn channel apply it at the next "
+                "execution boundary or spawn a successor."
+            ),
+            input_schema=steer_schema(),
+            handler=run_steer,
+        ),
+        McpTool(
+            name="puppetmaster_broadcast",
+            description="Queue the same steer for every live task in a job.",
+            input_schema=broadcast_schema(),
+            handler=run_broadcast,
+        ),
+        McpTool(
             name="puppetmaster_show",
             description="Return the stitched summary for a Puppetmaster job.",
             input_schema=job_schema(required=True),
@@ -2352,6 +2368,7 @@ def cursor_command(
     if disable_memory is True or (disable_memory is None and (review or plan)):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
 
@@ -2441,6 +2458,7 @@ def codex_command(args: JsonObject) -> list[str]:
     if args.get("disable_memory"):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
 
@@ -2470,6 +2488,7 @@ def hermes_command(args: JsonObject, implement: bool = True) -> list[str]:
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
     _append_routing_cli_flags(command, args)
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
 
@@ -2493,6 +2512,7 @@ def antigravity_command(args: JsonObject, implement: bool = True) -> list[str]:
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
     _append_routing_cli_flags(command, args)
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
 
@@ -2657,6 +2677,7 @@ def edit_command(args: JsonObject) -> list[str]:
     append_allowed_models_cli_flags(
         command, allowed_model_ids_list_from_mapping(args)
     )
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
 
@@ -2915,8 +2936,51 @@ def agentic_command(args: JsonObject, implement: Optional[bool] = None) -> list[
     if args.get("disable_memory"):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
+
+
+def _quality_schema_properties() -> JsonObject:
+    return {
+        "review_loop": {
+            "type": "boolean",
+            "description": (
+                "Re-run the same adapter/model on a dirty tree when review "
+                "rejects the diff. Bounded; does not multiply with model-tier "
+                "auto-escalation."
+            ),
+        },
+        "review_loop_limit": {
+            "type": "integer",
+            "description": "Max same-adapter review repairs (default 3, cap 10).",
+        },
+        "cleanup": {
+            "type": "boolean",
+            "description": "Best-effort lint --fix on edited paths after the worker returns.",
+        },
+        "cleanup_max_usd": {
+            "type": "number",
+            "description": "Optional USD cap for a cheap-model cleanup pass.",
+        },
+        "native_steer": {
+            "type": "boolean",
+            "description": "Codex only: use app-server so queued steers can reach the active turn.",
+        },
+    }
+
+
+def _append_quality_cli_flags(command: list[str], args: JsonObject) -> None:
+    if args.get("review_loop"):
+        command.append("--review-loop")
+    if args.get("review_loop_limit") is not None:
+        command.extend(["--review-loop-limit", str(args["review_loop_limit"])])
+    if args.get("cleanup"):
+        command.append("--cleanup")
+    if args.get("cleanup_max_usd") is not None:
+        command.extend(["--cleanup-max-usd", str(args["cleanup_max_usd"])])
+    if args.get("native_steer"):
+        command.append("--native-steer")
 
 
 def _append_routing_cli_flags(command: list[str], args: JsonObject) -> None:
@@ -2960,6 +3024,7 @@ def claude_command(args: JsonObject) -> list[str]:
     if args.get("disable_memory"):
         command.append("--disable-memory")
     _append_routing_cli_flags(command, args)
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
 
@@ -3001,6 +3066,7 @@ def openai_command(args: JsonObject) -> list[str]:
         command.append("--disable-codegraph")
     if args.get("disable_memory"):
         command.append("--disable-memory")
+    _append_quality_cli_flags(command, args)
     _append_budget_cli_flags(command, args)
     return command
 
@@ -3634,6 +3700,43 @@ def run_restore_task(args: JsonObject) -> JsonObject:
         body = {"job_id": job_id, "reset_count": len(reset),
                 "tasks": [{"id": t.id, "status": str(t.status)} for t in reset],
                 "superseded_artifact_ids": list(reset.superseded_artifact_ids)}
+        return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+
+
+def run_steer(args: JsonObject) -> JsonObject:
+    from puppetmaster.store_factory import create_store
+    from puppetmaster.steering import enqueue_steer
+
+    job_id = require_job_id(args)
+    message = str(args.get("message") or "").strip()
+    if not message:
+        return {"content": [{"type": "text", "text": "message is required"}], "isError": True}
+    try:
+        store = create_store(str(args.get("backend") or "sqlite"), mcp_state_dir(args))
+        if args.get("job_ref") is not None:
+            store.bind_job_ref(args["job_ref"])
+        task_id = str(args.get("task_id") or "").strip() or None
+        body = enqueue_steer(store, job_id, message, task_id=task_id)
+        return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+
+
+def run_broadcast(args: JsonObject) -> JsonObject:
+    from puppetmaster.store_factory import create_store
+    from puppetmaster.steering import broadcast_steer
+
+    job_id = require_job_id(args)
+    message = str(args.get("message") or "").strip()
+    if not message:
+        return {"content": [{"type": "text", "text": "message is required"}], "isError": True}
+    try:
+        store = create_store(str(args.get("backend") or "sqlite"), mcp_state_dir(args))
+        if args.get("job_ref") is not None:
+            store.bind_job_ref(args["job_ref"])
+        body = broadcast_steer(store, job_id, message)
         return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
@@ -4646,6 +4749,30 @@ def restore_task_schema() -> JsonObject:
     return schema
 
 
+def steer_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["message"] = {
+        "type": "string",
+        "description": "Follow-up instruction for the running worker.",
+    }
+    schema["properties"]["task_id"] = {
+        "type": "string",
+        "description": "Limit the steer to one task. Omit to target the job.",
+    }
+    schema["required"] = ["job_id", "message"]
+    return schema
+
+
+def broadcast_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["message"] = {
+        "type": "string",
+        "description": "Follow-up instruction fanned out to every live task.",
+    }
+    schema["required"] = ["job_id", "message"]
+    return schema
+
+
 def dashboard_schema() -> JsonObject:
     schema = job_schema()
     schema["properties"]["job_id"]["description"] = (
@@ -5404,6 +5531,7 @@ def codex_schema() -> JsonObject:
                 "description": "Optional Codex CLI command override (e.g. path to codex binary).",
             },
             **_auto_route_schema_properties(include_required_tags=False),
+            **_quality_schema_properties(),
         }
     )
     return schema
@@ -5448,6 +5576,7 @@ def claude_schema() -> JsonObject:
                 "description": "Optional Claude Code command, such as npx -y @anthropic-ai/claude-code.",
             },
             **_auto_route_schema_properties(include_required_tags=False),
+            **_quality_schema_properties(),
         }
     )
     return schema
@@ -5471,6 +5600,7 @@ def cursor_implement_schema() -> JsonObject:
                 ),
             },
             **_auto_route_schema_properties(include_required_tags=False),
+            **_quality_schema_properties(),
         }
     )
     return schema
@@ -5557,6 +5687,7 @@ def edit_schema() -> JsonObject:
                 "description": "Override the adapter executable / command.",
             },
             "allowed_model_ids": _allowed_model_ids_schema_property(),
+            **_quality_schema_properties(),
         },
         "required": ["instruction"],
     }
@@ -5801,6 +5932,7 @@ def agentic_schema() -> JsonObject:
                 "description": "Skip CodeGraph context injection.",
             },
             **_auto_route_schema_properties(),
+            **_quality_schema_properties(),
         }
     )
     return schema
@@ -5848,6 +5980,7 @@ def openai_schema() -> JsonObject:
                 "default": False,
                 "description": "Skip CodeGraph context injection (e.g. for non-repo prompts).",
             },
+            **_quality_schema_properties(),
         }
     )
     return schema
