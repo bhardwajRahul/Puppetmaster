@@ -215,6 +215,43 @@ class CodexAdapter(CliWorkerAdapter):
             return None, facade("git_snapshot")(cwd)
         return super()._apply_pre_run_guards(task, worker_id, cwd, prepared)
 
+    def _invoke_cli(
+        self,
+        task: Task,
+        prepared: CliInvocation,
+        cwd: Path,
+        timeout_seconds: int,
+    ) -> StreamedProcess:
+        if not bool((task.payload or {}).get("native_steer")):
+            return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+        try:
+            from puppetmaster.adapters.codex_session import run_codex_session
+            from puppetmaster.state import resolve_state_dir
+            from puppetmaster.steering import native_steer_items
+            from puppetmaster.store_factory import create_store
+
+            store = create_store("sqlite", resolve_state_dir())
+            pending = lambda: native_steer_items(store, task)
+            result = run_codex_session(
+                command_prefix=prepared.command[:1],
+                cwd=cwd,
+                prompt=str(prepared.extras.get("prompt") or task.instruction or ""),
+                model=str(prepared.extras.get("model") or DEFAULT_CODEX_MODEL),
+                sandbox=str(prepared.extras.get("sandbox") or "workspace-write"),
+                timeout=float(timeout_seconds),
+                pending_steering=pending,
+            )
+            text = "\n".join(result.messages)
+            return StreamedProcess(
+                returncode=0 if result.status == "completed" else 1,
+                stdout=text,
+                stderr=result.error or "",
+                timed_out=result.status == "timeout",
+                spawn_error=None if result.status != "failed" or text else result.error,
+            )
+        except Exception:
+            return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+
     def _finalize_cli_run(
         self,
         task: Task,

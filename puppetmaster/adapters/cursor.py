@@ -12,6 +12,11 @@ from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.ports import apply_worktree_ports
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import token_usage
+from puppetmaster.worker_verdict import (
+    extract_worker_output,
+    parse_structured_verdict,
+    worker_verdict_artifact,
+)
 
 from ._base import (
     CliInvocation,
@@ -382,7 +387,11 @@ class CursorAdapter(CliWorkerAdapter):
         # declaring the run degraded, so a real review isn't lost to a manual
         # log read.
         if not parsed_artifacts:
-            salvaged = cursor_result_artifacts(task, worker_id, completed.stdout)
+            # Raw SDK stdout can contain echoed prompts/tool output. It remains
+            # eligible for legacy artifact salvage, but never for verdicts.
+            salvaged = cursor_result_artifacts(
+                task, worker_id, completed.stdout, allow_verdict=False
+            )
             if salvaged:
                 parsed_artifacts = salvaged
         degraded = completed.returncode == 0 and not parsed_artifacts
@@ -499,12 +508,30 @@ def implement_report_artifacts(
     typed artifacts; anything else is preserved verbatim as a FINDING so the
     report survives synthesis instead of dying in a log nobody reads.
     """
+    output = extract_worker_output(result_text)
     parsed = cursor_result_artifacts(task, worker_id, result_text, adapter=adapter)
-    if parsed:
+    if output.verdict is not None and not any(
+        (artifact.payload or {}).get("kind") == "worker_verdict"
+        for artifact in parsed
+    ):
+        # A free-text implement report has no JSON payload for
+        # cursor_result_artifacts to inspect, but its adapter-native final
+        # line is still a valid terminal verdict.
+        parsed.append(
+            worker_verdict_artifact(
+                task, worker_id, output.verdict, source=adapter + ":terminal"
+            )
+        )
+    semantic = [
+        artifact
+        for artifact in parsed
+        if (artifact.payload or {}).get("kind") != "worker_verdict"
+    ]
+    if semantic:
         return parsed
-    report = redact_secrets(result_text or "").strip()
+    report = redact_secrets(output.body or "").strip()
     if not report:
-        return []
+        return parsed
     headline = next(
         (line.strip().lstrip("#").strip() for line in report.splitlines() if line.strip()),
         "Worker report",
@@ -521,7 +548,8 @@ def implement_report_artifacts(
                 "claim": headline[:300],
                 "report": report[-_REPORT_TAIL_CHARS:],
             },
-        )
+        ),
+        *parsed,
     ]
 
 
@@ -531,10 +559,11 @@ def cursor_result_artifacts(
     result_text: object,
     *,
     adapter: str = "cursor-sdk",
+    allow_verdict: bool = True,
 ) -> list[Artifact]:
-    payload = parse_cursor_artifact_payload(result_text)
-    if payload is None:
-        return []
+    output = extract_worker_output(result_text) if allow_verdict else None
+    body = output.body if output is not None else result_text
+    payload = parse_cursor_artifact_payload(body)
 
     raw_artifacts = []
     if isinstance(payload, list):
@@ -552,6 +581,24 @@ def cursor_result_artifacts(
         artifact = cursor_artifact_from_item(task, worker_id, item, adapter=adapter)
         if artifact is not None:
             artifacts.append(artifact)
+    if allow_verdict:
+        structured = (
+            parse_structured_verdict(payload.get("worker_verdict"))
+            if isinstance(payload, dict)
+            else None
+        )
+        # One output must use one verdict channel. A duplicated structured +
+        # terminal claim is ambiguous even when both happen to agree.
+        if structured is not None and output is not None and output.verdict is not None:
+            structured = None
+        elif structured is not None:
+            artifacts.append(
+                worker_verdict_artifact(task, worker_id, structured, source=adapter + ":structured")
+            )
+        elif output is not None and output.verdict is not None:
+            artifacts.append(
+                worker_verdict_artifact(task, worker_id, output.verdict, source=adapter + ":terminal")
+            )
     return artifacts
 
 
@@ -797,4 +844,3 @@ def _confidence(value: object) -> float:
     except (TypeError, ValueError):
         return 0.75
     return min(1.0, max(0.0, parsed))
-

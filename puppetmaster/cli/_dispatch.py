@@ -87,6 +87,7 @@ from puppetmaster.cli.helpers import (
     print_watch_snapshot,
     reject_target,
     require_latest_job_id,
+    quality_payload_from_args,
     routing_payload_from_args,
     run_deltas_follow,
     run_feed_follow,
@@ -935,6 +936,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_memory or args.review or args.plan:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="cursor"))
+        payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
@@ -976,6 +978,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if getattr(args, "effort", None):
             payload["extra_args"] = ["--effort", args.effort]
         payload.update(routing_payload_from_args(args, adapter="claude-code"))
+        payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
@@ -1023,6 +1026,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_memory:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="openai"))
+        payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
@@ -1070,6 +1074,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         ):
             payload["read_only"] = True
         payload.update(routing_payload_from_args(args, adapter="codex"))
+        payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
@@ -1117,6 +1122,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
         payload.update(routing_payload_from_args(args, adapter="hermes"))
+        payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
@@ -1158,6 +1164,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
         payload.update(routing_payload_from_args(args, adapter="antigravity"))
+        payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
@@ -1215,6 +1222,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_memory:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="agentic"))
+        payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
@@ -1272,6 +1280,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         )
         if args.executable:
             spec.payload["executable"] = args.executable
+        spec.payload.update(quality_payload_from_args(args))
         result = cli.Orchestrator(store).run(
             args.instruction,
             specs=[spec],
@@ -1875,6 +1884,58 @@ def _main(argv: Optional[list[str]] = None) -> int:
             ),
         }
         print(json.dumps(body, indent=2))
+        return 0
+
+    if args.command == "cut":
+        try:
+            body = store.cut_task(
+                args.job_id, args.task_id, request_id=getattr(args, "request_id", None)
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(body, indent=2, default=str))
+        return 0 if body.get("outcome") not in {"busy", "stale_binding"} else 2
+
+    if args.command == "restore":
+        try:
+            reset = store.restore_task(args.job_id, args.task_id)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({
+            "job_id": args.job_id,
+            "reset_count": len(reset),
+            "tasks": [{"id": t.id, "status": str(t.status)} for t in reset],
+            "superseded_artifact_ids": list(reset.superseded_artifact_ids),
+        }, indent=2))
+        return 0
+
+    if args.command == "steer":
+        from puppetmaster.steering import enqueue_steer
+
+        try:
+            body = enqueue_steer(
+                store,
+                args.job_id,
+                args.message,
+                task_id=getattr(args, "task_id", None),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(body, indent=2, default=str))
+        return 0
+
+    if args.command == "broadcast":
+        from puppetmaster.steering import broadcast_steer
+
+        try:
+            body = broadcast_steer(store, args.job_id, args.message)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(body, indent=2, default=str))
         return 0
 
     if args.command == "memory":

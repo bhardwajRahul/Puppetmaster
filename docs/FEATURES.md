@@ -32,6 +32,7 @@ Six production adapters live plus the keys-only `agentic` standalone worker; cur
 
 | Area | Status |
 | --- | --- |
+| Universal worker contracts (v1.27.24) | Structured verdicts, file-claim admission, `on_fail` abort/continue/retry, live `steer`/`broadcast` at the next execution boundary, and opt-in `review_loop` / `cleanup`. Enforced in the shared runtime for every registered adapter, not a single CLI path. |
 | Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
 | SQLite backend | Default backend with WAL, integrity checks, and persisted events. Supervisor initialization migrates to schema v5 and repairs stale triggers; restart all long-lived processes at cutover. No historical consumption is invented |
 | Embedded store contracts (v1.24.0) | Bounded metadata projections and change pages, JobRef validation and origin/project/session scope, immutable completion receipts, scoped durable cancellation with queued-task fairness, and opt-in effect replay fences. SQLite transactional projections; file pending-write detection. [Guarantees and limits](STORE_CONTRACTS.md) |

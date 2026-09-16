@@ -36,6 +36,16 @@ def _worker_spec_from_dict(data: dict[str, Any]) -> WorkerSpec:
     if adapter not in ADAPTERS:
         raise ValueError(f"unsupported adapter: {adapter}")
     payload = dict(data.get("payload", {}))
+    from puppetmaster.failure_policy import normalize_failure_policy
+
+    if "on_fail" in data and "failure_policy" in payload:
+        raise ValueError("set worker.on_fail or payload.failure_policy, not both")
+    if "on_fail" in data:
+        payload["failure_policy"] = normalize_failure_policy(data["on_fail"])
+    elif "failure_policy" in payload:
+        payload["failure_policy"] = normalize_failure_policy(
+            payload["failure_policy"]
+        )
     if data.get("source_scope") is not None:
         payload["source_scope"] = list(data["source_scope"])
     if data.get("negative_scope") is not None:
@@ -46,5 +56,5 @@ def _worker_spec_from_dict(data: dict[str, Any]) -> WorkerSpec:
         adapter=adapter,
         payload=payload,
         depends_on_roles=data.get("depends_on", []),
+        on_fail=data.get("on_fail"),
     )
-

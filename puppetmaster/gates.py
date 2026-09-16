@@ -486,7 +486,8 @@ def build_review_prompt(task: Task, diff: str, rubric: str) -> str:
         f"`{_REVIEW_VERDICT_MARKER}` immediately followed by a single-line JSON "
         'object: {"pass": <true|false>, "severity": '
         '"none"|"minor"|"major"|"critical", "reasons": ["..."]}. '
-        "Emit the marker and JSON exactly once."
+        "Emit the marker and JSON exactly once, then make the final non-blank "
+        "line `VERDICT: PASS - reason` or `VERDICT: FAIL - reason`."
     )
 
 
@@ -699,9 +700,12 @@ def default_judge_review(
             },
         )
     reasons = verdict.get("reasons")
+    passed = verdict.get("pass")
     return ReviewVerdict(
         available=True,
-        passed=bool(verdict.get("pass")),
+        # ``bool(\"false\")`` used to let malformed judge JSON waive a gate.
+        # Only the JSON boolean ``true`` is an approval.
+        passed=passed is True,
         severity=str(verdict.get("severity", "none")),
         reasons=[str(r) for r in reasons] if isinstance(reasons, list) else [],
         detail={
