@@ -151,7 +151,10 @@ def run_codex_session(
             except queue.Empty: continue
             if line is None:
                 stdout_eof |= source == "stdout"; stderr_eof |= source == "stderr"
-                if stdout_eof and proc.poll() is not None and result.status == "failed": result.error = result.error or "app-server EOF"
+                if stdout_eof and proc.poll() is not None:
+                    if result.status == "failed":
+                        result.error = result.error or "app-server EOF"
+                    break
                 continue
             _bounded(captured, ("! " if source == "stderr" else "< ") + line.rstrip())
             if log: log(line.rstrip())

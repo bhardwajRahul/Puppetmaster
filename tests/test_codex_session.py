@@ -10,9 +10,17 @@ from puppetmaster.adapters.codex_session import run_codex_session
 
 
 FAKE = r'''
-import json, os, sys, time
+import json, os, sys, threading, time
 mode=os.environ.get("FAKE_MODE","normal")
+beta=[False]
 def send(x): print(json.dumps(x), flush=True)
+def finish(word):
+  send({"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"th","turnId":"one","tokenUsage":{"last":{"inputTokens":3,"outputTokens":5,"cachedInputTokens":1,"reasoningOutputTokens":0,"totalTokens":8},"total":{"inputTokens":7,"outputTokens":11,"cachedInputTokens":2,"reasoningOutputTokens":0,"totalTokens":18}}}})
+  send({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","text":word}}})
+  send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th","turnId":"one"}})
+def finish_later():
+  time.sleep(0.4)
+  finish("BETA" if beta[0] else "ALPHA")
 for raw in sys.stdin:
  x=json.loads(raw); m=x.get("method"); i=x.get("id")
  if m == "initialize": send({"jsonrpc":"2.0","id":i,"result":{}})
@@ -24,22 +32,14 @@ for raw in sys.stdin:
   if mode == "malformed": print("not json", flush=True)
   if mode == "stderr": sys.stderr.write("x"*200000);sys.stderr.flush()
   if mode == "timeout": time.sleep(30)
-  if mode == "normal": time.sleep(.12)
   if mode == "error": send({"jsonrpc":"2.0","method":"turn/failed","params":{"message":"bad"}}); continue
-  # Give steering requests a chance; final changes only after delivery.
   if mode == "normal":
-   end=time.time()+.35; beta=False
-   while time.time()<end:
-    import select
-    ready,_,_=select.select([sys.stdin],[],[],.02)
-    if ready:
-     q=json.loads(sys.stdin.readline()); beta |= q.get("method")=="turn/steer"
-     if q.get("method")=="turn/steer": send({"jsonrpc":"2.0","id":q["id"],"result":{"turnId":"one"}})
-   word="BETA" if beta else "ALPHA"
-  else: word="ALPHA"
-  send({"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"th","turnId":"one","tokenUsage":{"last":{"inputTokens":3,"outputTokens":5,"cachedInputTokens":1,"reasoningOutputTokens":0,"totalTokens":8},"total":{"inputTokens":7,"outputTokens":11,"cachedInputTokens":2,"reasoningOutputTokens":0,"totalTokens":18}}}})
-  send({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","text":word}}})
-  send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th","turnId":"one"}})
+   threading.Thread(target=finish_later, daemon=True).start()
+   continue
+  finish("ALPHA")
+ elif m == "turn/steer":
+  beta[0]=True
+  send({"jsonrpc":"2.0","id":i,"result":{"turnId":"one"}})
  elif m == "turn/interrupt": send({"jsonrpc":"2.0","id":i,"result":{}})
 '''
 

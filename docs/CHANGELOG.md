@@ -9,7 +9,9 @@
   fail-close the job.
 - Host `steer` / `broadcast` consume the session command ledger at the next
   execution boundary. One-shot adapters queue a successor; Codex `native_steer`
-  can deliver mid-turn. A native ack is not model-applied.
+  can deliver mid-turn. A native ack is not model-applied. The Codex session
+  fake is select-free so Windows CI can prove steer correlation, and a dead
+  app-server child fails closed instead of waiting out the timeout.
 - Opt-in `review_loop` repairs the same adapter on a dirty tree with reviewer
   reasons and does not multiply with model-tier auto-escalation. Opt-in
   `cleanup` is best-effort lint `--fix` on edited paths and cannot fail the
