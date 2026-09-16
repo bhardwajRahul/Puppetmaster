@@ -1,3 +1,15 @@
+## v1.27.25 — 2026-09-16
+
+**Tag CI is not a third flake lottery.**
+
+- Push CI (main or version tag) skips the suite when a successful `CI`
+  run already covers this git tree. Pull requests always run. A lookup
+  failure or conflict-changed tree fails closed and runs.
+- Give Windows an honest budget for the subprocess tests that lost the
+  v1.27.24 tag lottery and the dest PR shard: scoped `puppetmaster run`
+  (30s → 90s, stdin closed), routing-authority discovery isolation
+  (120s → 300s), and the 32-worker SQLite attach stress (60s → 120s).
+
 ## v1.27.24 — 2026-09-16
 
 **Universal worker contracts: verdicts, claims, steering, failure edges, and opt-in quality loops.**

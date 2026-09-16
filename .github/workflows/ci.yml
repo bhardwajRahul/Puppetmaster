@@ -1,11 +1,33 @@
 name: CI
 
+# Push to main or a version tag reuses a successful CI run for the same git
+# tree (dest-into-main PR). Re-running the suite on the merge/tag SHA is a
+# second flake lottery on identical bytes, and this repo has no installer
+# adopt path to recover a red tag. Pull requests always run. A
+# conflict-resolution tree with no match fails closed and runs the matrix.
+
 on:
   push:
   pull_request:
 
 jobs:
+  reuse-green-tree:
+    runs-on: ubuntu-latest
+    outputs:
+      skip_suite: ${{ steps.gate.outputs.skip_suite }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Skip the suite when this push tree is already green
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/ci_skip_if_green.py
+
   test:
+    needs: reuse-green-tree
+    if: needs.reuse-green-tree.outputs.skip_suite != 'true'
     runs-on: ${{ matrix.os }}
     # Linux and macOS stay unsharded here. Windows is the sharded
     # test-windows job below and remains a required green leg.
@@ -79,6 +101,8 @@ jobs:
           PY
 
   test-windows:
+    needs: reuse-green-tree
+    if: needs.reuse-green-tree.outputs.skip_suite != 'true'
     # CI_WINDOWS_RUNNER is an optional hosted-runner swap. Unset, this job
     # stays on GitHub-hosted windows-latest so CI never queues on a missing
     # label. Set the repo variable later if a hosted Windows runner is added.

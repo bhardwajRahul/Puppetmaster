@@ -21,6 +21,21 @@ from puppetmaster.swarm_launch import detach_analysis_swarm
 
 from puppetmaster.identity import make_ref
 
+_CLI_TIMEOUT = 90 if sys.platform == "win32" else 30
+
+
+def _run_cli(command, env=None):
+    child_env = os.environ.copy() if env is None else dict(env)
+    child_env["PYTHONUNBUFFERED"] = "1"
+    return subprocess.run(
+        command,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=_CLI_TIMEOUT,
+        stdin=subprocess.DEVNULL,
+    )
+
 
 def _test_reference(root, job_id, *, expected_incarnation=None, launch_binding=False):
     assert launch_binding is True
@@ -51,7 +66,7 @@ class JobScopeLaunchTests(unittest.TestCase):
                         env = launcher_environment(fields)
                 command.extend(["run", "Scope launch test", "--config", str(config),
                                 "--worker-mode", "inline", "--disable-memory"])
-                result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+                result = _run_cli(command, env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 store = SwarmStore(root / "state")
                 jobs = store.list_jobs()
@@ -88,7 +103,7 @@ class JobScopeLaunchTests(unittest.TestCase):
             command = [sys.executable, "-m", "puppetmaster", "--state-dir", tmp,
                        "--backend", "file", "--origin", "crash-host", "--project-id", "p",
                        "--session-id", "s", "crash-demo", "--goal", "Scope crash demo"]
-            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            result = _run_cli(command)
             self.assertEqual(result.returncode, 0, result.stderr)
             job = SwarmStore(Path(tmp)).list_jobs()[0]
             self.assertEqual((job.origin, job.project_id, job.session_id), ("crash-host", "p", "s"))

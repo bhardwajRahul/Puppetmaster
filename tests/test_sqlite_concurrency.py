@@ -902,7 +902,7 @@ class SqliteMultiprocessAttachTests(unittest.TestCase):
                 process.start()
 
             errors: list[str] = []
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + (120 if sys.platform == "win32" else 60)
             for process, error_path, _ in processes:
                 process.join(timeout=max(0, deadline - time.monotonic()))
             timed_out = [(process, error_path, diagnostic_path)

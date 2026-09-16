@@ -14,7 +14,7 @@ class RoutingAuthorityIsolationTests(unittest.TestCase):
             cwd=str(Path(__file__).resolve().parents[1]),
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=300 if sys.platform == "win32" else 120,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
