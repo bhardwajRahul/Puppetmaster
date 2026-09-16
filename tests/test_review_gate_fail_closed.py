@@ -21,6 +21,28 @@ from puppetmaster.sqlite_store import SQLiteSwarmStore
 
 
 class RequestedReviewFailClosedTests(TestCase):
+
+    def test_string_false_cannot_pass_a_review_gate(self) -> None:
+        import puppetmaster.gates as gates
+
+        with TemporaryDirectory() as root:
+            repo = self._repo(root)
+            task = self._task(repo)
+            judge = Mock(id="cursor/gpt-5-6", adapter="cursor", adapter_model_name="gpt-5.6")
+            marker = gates._REVIEW_VERDICT_MARKER
+            artifacts = [
+                gates.Artifact(
+                    job_id=task.job_id, task_id=task.id, type=gates.ArtifactType.VERIFICATION,
+                    created_by="judge", confidence=1.0, evidence=[],
+                    payload={"stdout": marker + ' {"pass":"false","reasons":[]}'},
+                )
+            ]
+            with patch("puppetmaster.adapters.get_adapter", return_value=Mock(run=Mock(return_value=artifacts))):
+                with patch.dict(os.environ, {"PUPPETMASTER_REVIEW_GATE": "1"}, clear=False):
+                    verdict = gates.default_judge_review(
+                        prompt="review", judge=judge, cwd=repo, timeout=1, task=task
+                    )
+            self.assertFalse(verdict.passed)
     def _store(self, root: str) -> SQLiteSwarmStore:
         store = SQLiteSwarmStore(Path(root) / ".puppetmaster")
         store.init()

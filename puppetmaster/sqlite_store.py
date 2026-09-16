@@ -1622,6 +1622,7 @@ class SQLiteSwarmStore(SwarmStore):
         task_ids: Iterable[str],
         *,
         include_descendants: bool = True,
+        clear_failure_state: bool = False,
     ) -> ResetSubgraphResult:
         """Idempotent subgraph reset in a single SQLite transaction/batch.
 
@@ -1635,7 +1636,8 @@ class SQLiteSwarmStore(SwarmStore):
         self._ensure_attached()
         with self._writer_scope() as connection:
             return self._reset_subgraph_locked(
-                connection, job_id, task_ids, include_descendants=include_descendants
+                connection, job_id, task_ids, include_descendants=include_descendants,
+                clear_failure_state=clear_failure_state,
             )
 
     def _reset_subgraph_locked(
@@ -1645,6 +1647,7 @@ class SQLiteSwarmStore(SwarmStore):
         task_ids: Iterable[str],
         *,
         include_descendants: bool,
+        clear_failure_state: bool = False,
     ) -> ResetSubgraphResult:
         selected = (
             self.consumer_closure(job_id, task_ids)
@@ -1677,6 +1680,11 @@ class SQLiteSwarmStore(SwarmStore):
                 lease_id=None,
                 completed_at=None,
                 updated_at=now_iso(),
+                payload=(
+                    __import__("puppetmaster.failure_policy", fromlist=["clear_failure_edge_state"])
+                    .clear_failure_edge_state(task.payload)
+                    if clear_failure_state else task.payload
+                ),
             )
             task_map[task.id] = cleared_task
             cleared.append(cleared_task)

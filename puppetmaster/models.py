@@ -187,7 +187,9 @@ LEGAL_TASK_TRANSITIONS = {
         }
     ),
     TaskStatus.COMPLETE: frozenset({TaskStatus.QUEUED, TaskStatus.FAILED}),
-    TaskStatus.FAILED: frozenset({TaskStatus.QUEUED, TaskStatus.COMPLETE}),
+    TaskStatus.FAILED: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.COMPLETE, TaskStatus.SKIPPED}
+    ),
     TaskStatus.SKIPPED: frozenset({TaskStatus.QUEUED}),
 }
 
@@ -630,4 +632,3 @@ def graph_edge_from_dict(data: dict[str, Any]) -> GraphEdge:
         created_at=data.get("created_at") or now_iso(),
         meta=data.get("meta") or {},
     )
-

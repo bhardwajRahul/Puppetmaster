@@ -1709,6 +1709,21 @@ def _build_tools() -> list[McpTool]:
             handler=run_reset_subgraph,
         ),
         McpTool(
+            name="puppetmaster_cut_task",
+            description=(
+                "Cooperatively cut one lease-bound task generation. Running tasks "
+                "remain pending until local stop or stale recovery is observed."
+            ),
+            input_schema=cut_task_schema(),
+            handler=run_cut_task,
+        ),
+        McpTool(
+            name="puppetmaster_restore_task",
+            description="Restore a cut task and its transitive consumer closure.",
+            input_schema=restore_task_schema(),
+            handler=run_restore_task,
+        ),
+        McpTool(
             name="puppetmaster_show",
             description="Return the stitched summary for a Puppetmaster job.",
             input_schema=job_schema(required=True),
@@ -3587,6 +3602,43 @@ def run_reset_subgraph(args: JsonObject) -> JsonObject:
     }
 
 
+def run_cut_task(args: JsonObject) -> JsonObject:
+    from puppetmaster.store_factory import create_store
+
+    job_id = require_job_id(args)
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return {"content": [{"type": "text", "text": "task_id is required"}], "isError": True}
+    try:
+        store = create_store(str(args.get("backend") or "sqlite"), mcp_state_dir(args))
+        if args.get("job_ref") is not None:
+            store.bind_job_ref(args["job_ref"])
+        body = store.cut_task(job_id, task_id, request_id=args.get("request_id"))
+        return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+
+
+def run_restore_task(args: JsonObject) -> JsonObject:
+    from puppetmaster.store_factory import create_store
+
+    job_id = require_job_id(args)
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return {"content": [{"type": "text", "text": "task_id is required"}], "isError": True}
+    try:
+        store = create_store(str(args.get("backend") or "sqlite"), mcp_state_dir(args))
+        if args.get("job_ref") is not None:
+            store.bind_job_ref(args["job_ref"])
+        reset = store.restore_task(job_id, task_id)
+        body = {"job_id": job_id, "reset_count": len(reset),
+                "tasks": [{"id": t.id, "status": str(t.status)} for t in reset],
+                "superseded_artifact_ids": list(reset.superseded_artifact_ids)}
+        return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+
+
 def run_list_models(args: JsonObject) -> JsonObject:
     """Return the registry as JSON. Mirrors `puppetmaster models list --json`."""
     from dataclasses import asdict
@@ -4576,6 +4628,21 @@ def reset_subgraph_schema() -> JsonObject:
         ),
     }
     schema["required"] = ["job_id"]
+    return schema
+
+
+def cut_task_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["task_id"] = {"type": "string"}
+    schema["properties"]["request_id"] = {"type": "string"}
+    schema["required"] = ["job_id", "task_id"]
+    return schema
+
+
+def restore_task_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["task_id"] = {"type": "string"}
+    schema["required"] = ["job_id", "task_id"]
     return schema
 
 

@@ -2281,6 +2281,21 @@ class SwarmStore(StoreContracts):
             if task_id not in latest_at or artifact.created_at >= latest_at[task_id]:
                 latest_at[task_id] = artifact.created_at
                 recoverable.add(task_id)
+        # An explicit edge owns the failure until its atomic policy transition
+        # has run. Do not cascade descendants or let legacy provider fallback
+        # race that transition.
+        from puppetmaster.failure_policy import task_failure_policy
+
+        for task in self.list_tasks(job_id):
+            if task.status != TaskStatus.FAILED or task_failure_policy(task.payload) is None:
+                continue
+            # Pending explicit edges keep the coordinator alive long enough to
+            # apply their transition. Once handled, they must not re-enter
+            # provider fallback/review recovery.
+            if (task.payload or {}).get("failure_policy_handled_generation") != task.generation:
+                recoverable.add(task.id)
+            else:
+                recoverable.discard(task.id)
         # A later non-recoverable failure artifact for the same task should win.
         for artifact in artifacts:
             failure = (artifact.payload or {}).get("failure")
@@ -2291,6 +2306,266 @@ class SwarmStore(StoreContracts):
                 recoverable.discard(task_id)
                 latest_at[task_id] = artifact.created_at
         return recoverable
+
+    def _latest_failure_reason(self, task: Task) -> str:
+        latest: Optional[Artifact] = None
+        for artifact in self.list_artifacts(task.job_id):
+            if artifact.task_id != task.id:
+                continue
+            payload = artifact.payload or {}
+            if payload.get("failure") is None and payload.get("result") not in {
+                "failed", "blocked"
+            }:
+                continue
+            if latest is None or artifact.created_at >= latest.created_at:
+                latest = artifact
+        if latest is None:
+            return "task_failed"
+        payload = latest.payload or {}
+        return str(payload.get("failure") or payload.get("result") or "task_failed")
+
+    @staticmethod
+    def _failure_decision_artifact(task: Task, decision: dict[str, Any]) -> Artifact:
+        digest = hashlib.sha256(
+            json.dumps(decision, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:20]
+        return Artifact(
+            id=f"artifact_failure_reroute_{digest}",
+            job_id=task.job_id,
+            task_id=task.id,
+            type=ArtifactType.DECISION,
+            created_by="failure-policy",
+            payload={
+                "decision": decision["action"],
+                "why": decision["reason"],
+                **decision,
+            },
+            confidence=1.0,
+            evidence=[
+                f"task:{task.id}",
+                f"generation:{decision['generation']}",
+                f"source_status:{decision['source_status']}",
+            ],
+        )
+
+    def _ensure_failure_decision(self, task: Task) -> None:
+        decision = (task.payload or {}).get("failure_policy_last_decision")
+        if not isinstance(decision, dict):
+            return
+        artifact = self._failure_decision_artifact(task, decision)
+        if artifact.id not in self.get_artifacts_by_ids(task.job_id, [artifact.id]):
+            self.save_artifact(artifact)
+            self.emit(task.job_id, "task.failure_reroute", decision)
+
+    def apply_failure_policy(self, task_id: str) -> Optional[Task]:
+        """Apply one explicit FAILED edge under a per-task serialization lock."""
+        owner = new_id("failure-policy")
+        lock_name = f"task:{task_id}"
+        if not self.acquire_lock(lock_name, owner, ttl_seconds=30):
+            return None
+        try:
+            task = self.get_task_by_id(task_id)
+            self._ensure_failure_decision(task)
+            from puppetmaster.failure_policy import task_failure_policy
+
+            policy = task_failure_policy(task.payload)
+            if policy is None:
+                return None
+            payload = dict(task.payload or {})
+            if payload.get("failure_policy_handled_generation") == task.generation:
+                return task
+            if task.status != TaskStatus.FAILED:
+                return None
+            reason = self._latest_failure_reason(task)
+            cancelled = reason in {"cancelled", "canceled", "cancellation"}
+            count = int(payload.get("failure_policy_retry_count", 0))
+            limit = int(policy.get("retries", 0))
+            requested = str(policy["action"])
+            action = requested
+            if requested == "retry":
+                action = "retry" if count < limit and not cancelled else "abort"
+            target = {
+                "retry": TaskStatus.QUEUED,
+                "continue": TaskStatus.SKIPPED,
+                "abort": TaskStatus.FAILED,
+            }[action]
+            if action == "retry":
+                count += 1
+            next_generation = task.generation + 1 if action == "retry" else task.generation
+            decision = {
+                "kind": "failure_reroute",
+                "task_id": task.id,
+                "action": action,
+                "configured_action": requested,
+                "source_status": str(task.status),
+                "target_status": str(target),
+                "counter": count,
+                "limit": limit,
+                "generation": task.generation,
+                "reason": "explicit_cancellation" if cancelled else reason,
+                "allow_routing_change": bool(policy.get("allow_routing_change", False)),
+            }
+            payload.update(
+                failure_policy_retry_count=count,
+                failure_policy_handled_generation=task.generation,
+                failure_policy_last_decision=decision,
+            )
+            timed = apply_running_duration(task, target)
+            updated = replace(
+                timed,
+                status=target,
+                payload=payload,
+                attempts=0 if action == "retry" else task.attempts,
+                generation=next_generation,
+                lease_owner=None,
+                lease_expires_at=None,
+                lease_id=None,
+                completed_at=now_iso() if target == TaskStatus.SKIPPED else None,
+                updated_at=now_iso(),
+            )
+            self.save_task(updated)
+            self._ensure_failure_decision(updated)
+            return updated
+        finally:
+            self.release_lock(lock_name, owner=owner)
+
+    def apply_pending_failure_policies(self, job_id: str) -> list[Task]:
+        changed: list[Task] = []
+        self.finalize_pending_cuts(job_id)
+        for task in self.list_tasks(job_id):
+            if task.status != TaskStatus.FAILED:
+                continue
+            updated = self.apply_failure_policy(task.id)
+            if updated is not None:
+                changed.append(updated)
+        return changed
+
+    def cut_task(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        expected_binding: Optional["TaskBinding"] = None,
+        request_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Persist a lease-bound cut request; RUNNING work stops cooperatively."""
+        from dataclasses import asdict
+        from puppetmaster.store_contracts import task_binding
+
+        owner = new_id("cut")
+        lock_name = f"task:{task_id}"
+        if not self.acquire_lock(lock_name, owner, ttl_seconds=30):
+            return {"outcome": "busy", "job_id": job_id, "task_id": task_id}
+        try:
+            task = self.get_task_by_id(task_id)
+            if task.job_id != job_id:
+                raise ValueError("cut target belongs to another job")
+            binding = task_binding(task)
+            if expected_binding is not None and expected_binding != binding:
+                return {"outcome": "stale_binding", "binding": asdict(binding)}
+            existing = (task.payload or {}).get("failure_cut")
+            if isinstance(existing, dict):
+                return {"outcome": existing.get("outcome", "pending"), **existing}
+            if task_is_terminal(task.status):
+                return {"outcome": "already_terminal", "binding": asdict(binding)}
+            rid = request_id or f"failure-cut-{task.id}-{task.generation}"
+            marker = {
+                "request_id": rid,
+                "binding": asdict(binding),
+                "outcome": "pending" if task.status == TaskStatus.RUNNING else "observed",
+            }
+            self.save_task(replace(task, payload={**task.payload, "failure_cut": marker}))
+            receipt = self.request_cancellation(self.job_ref(job_id), rid, [binding])
+        finally:
+            self.release_lock(lock_name, owner=owner)
+        if task.status != TaskStatus.RUNNING and receipt.outcome == "requested":
+            self.observe_cancellation(self.job_ref(job_id), binding)
+            self.finalize_pending_cuts(job_id)
+            marker["outcome"] = "observed"
+        return {
+            "job_id": job_id,
+            "task_id": task_id,
+            "outcome": marker["outcome"],
+            "binding": marker["binding"],
+            "request_id": marker["request_id"],
+            "cancellation_outcome": receipt.outcome,
+        }
+
+    def finalize_pending_cuts(self, job_id: str) -> list[Task]:
+        """Turn observed/non-running cut generations into terminal SKIPPED nodes."""
+        from puppetmaster.contracts import TaskBinding
+        from puppetmaster.store_contracts import task_binding
+
+        # A dead worker may leave RUNNING plus an expired lease. Reap only
+        # that generation; an active lease is never cleared by a cut.
+        self.recover_stale_tasks(job_id)
+        changed: list[Task] = []
+        for task in self.list_tasks(job_id):
+            marker = (task.payload or {}).get("failure_cut")
+            if not isinstance(marker, dict):
+                continue
+            raw_binding = marker.get("binding")
+            if not isinstance(raw_binding, dict):
+                continue
+            binding = TaskBinding(**raw_binding)
+            if binding.generation != task.generation:
+                continue
+            if task.status == TaskStatus.RUNNING:
+                continue
+            if task.status in {TaskStatus.COMPLETE, TaskStatus.SKIPPED}:
+                continue
+            payload = dict(task.payload)
+            marker = {**marker, "outcome": "observed"}
+            decision = {
+                "kind": "failure_reroute",
+                "task_id": task.id,
+                "action": "cut",
+                "configured_action": "cut",
+                "source_status": str(task.status),
+                "target_status": str(TaskStatus.SKIPPED),
+                "counter": 0,
+                "limit": 0,
+                "generation": task.generation,
+                "reason": "operator_cut",
+                "allow_routing_change": False,
+            }
+            payload.update(
+                failure_cut=marker,
+                failure_policy_handled_generation=task.generation,
+                failure_policy_last_decision=decision,
+            )
+            updated = replace(
+                apply_running_duration(task, TaskStatus.SKIPPED),
+                status=TaskStatus.SKIPPED,
+                payload=payload,
+                lease_owner=None,
+                lease_expires_at=None,
+                lease_id=None,
+                completed_at=now_iso(),
+                updated_at=now_iso(),
+            )
+            self.save_task(updated)
+            self._ensure_failure_decision(updated)
+            changed.append(updated)
+        return changed
+
+    def restore_task(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        expected_binding: Optional["TaskBinding"] = None,
+    ) -> ResetSubgraphResult:
+        from puppetmaster.store_contracts import task_binding
+
+        task = self.get_task_by_id(task_id)
+        if task.job_id != job_id:
+            raise ValueError("restore target belongs to another job")
+        if expected_binding is not None and expected_binding != task_binding(task):
+            raise ValueError("stale task binding")
+        return self.reset_subgraph(
+            job_id, [task_id], include_descendants=True, clear_failure_state=True
+        )
 
     def propagate_hard_dependency_failures(self, job_id: str) -> list[Task]:
         """Cascade hard-FAILED deps onto BLOCKED descendants as terminal FAILED.
@@ -2395,6 +2670,7 @@ class SwarmStore(StoreContracts):
         task_ids: Iterable[str],
         *,
         include_descendants: bool = True,
+        clear_failure_state: bool = False,
     ) -> ResetSubgraphResult:
         """Idempotent targeted rerun reset for selected (downstream) tasks.
 
@@ -2436,6 +2712,11 @@ class SwarmStore(StoreContracts):
         for task in tasks:
             if task.id not in selected:
                 continue
+            payload = task.payload
+            if clear_failure_state:
+                from puppetmaster.failure_policy import clear_failure_edge_state
+
+                payload = clear_failure_edge_state(payload)
             cleared = replace(
                 task,
                 status=TaskStatus.BLOCKED,
@@ -2445,6 +2726,7 @@ class SwarmStore(StoreContracts):
                 lease_expires_at=None,
                 lease_id=None,
                 completed_at=None,
+                payload=payload,
                 updated_at=now_iso(),
             )
             self.save_task(cleared)

@@ -1254,6 +1254,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reset only the named tasks; do not include the consumer closure.",
     )
 
+    cut = subcommands.add_parser(
+        "cut", help="Cooperatively cut one task generation and mark it SKIPPED."
+    )
+    cut.add_argument("job_id")
+    cut.add_argument("--task", required=True, dest="task_id")
+    cut.add_argument("--request-id")
+
+    restore = subcommands.add_parser(
+        "restore", help="Restore a cut task and its consumer closure."
+    )
+    restore.add_argument("job_id")
+    restore.add_argument("--task", required=True, dest="task_id")
+
     memory = subcommands.add_parser("memory", help="List or prune promoted memory.")
     memory.add_argument("--json", action="store_true", help="Emit full JSON dump.")
     memory.add_argument("--prune", action="store_true", help="Delete matching memory records.")

@@ -1877,6 +1877,31 @@ def _main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(body, indent=2))
         return 0
 
+    if args.command == "cut":
+        try:
+            body = store.cut_task(
+                args.job_id, args.task_id, request_id=getattr(args, "request_id", None)
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(body, indent=2, default=str))
+        return 0 if body.get("outcome") not in {"busy", "stale_binding"} else 2
+
+    if args.command == "restore":
+        try:
+            reset = store.restore_task(args.job_id, args.task_id)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({
+            "job_id": args.job_id,
+            "reset_count": len(reset),
+            "tasks": [{"id": t.id, "status": str(t.status)} for t in reset],
+            "superseded_artifact_ids": list(reset.superseded_artifact_ids),
+        }, indent=2))
+        return 0
+
     if args.command == "memory":
         records = store.list_memory()
         if getattr(args, "prune", False):

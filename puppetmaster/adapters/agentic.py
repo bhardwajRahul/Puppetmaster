@@ -58,6 +58,7 @@ from puppetmaster.codegraph import (
 )
 from puppetmaster.cancellation import JobCancelled, is_cancelled
 from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.worker_verdict import parse_structured_verdict, worker_verdict_artifact
 from puppetmaster.provider_circuit import (
     get_provider_circuit_breaker,
     resolve_circuit_key,
@@ -1976,6 +1977,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         "type": "string",
                         "description": "Exactly what you ran to verify the change (e.g. the test command and its result).",
                     },
+                    "worker_verdict": {
+                        "type": "object",
+                        "description": "Optional advisory terminal worker verdict; not a runtime gate.",
+                        "properties": {
+                            "verdict": {
+                                "type": "string", "enum": ["PASS", "FAIL", "PARTIAL"],
+                            },
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["verdict", "reason"],
+                    },
                 },
                 ["summary"],
             )
@@ -2045,6 +2057,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         },
                         "required": ["criterion", "status"],
                     },
+                },
+                "worker_verdict": {
+                    "type": "object",
+                    "description": "Optional advisory review verdict; not a runtime gate.",
+                    "properties": {
+                        "verdict": {
+                            "type": "string", "enum": ["PASS", "FAIL", "PARTIAL"],
+                        },
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["verdict", "reason"],
                 },
             },
             ["artifacts"],
@@ -2997,6 +3020,9 @@ def _coerce_submit_findings(args: object) -> tuple[list[dict], list[dict]]:
     for item in items:
         if isinstance(item, dict):
             normalized.append({**item, "type": item.get("type") or "finding"})
+    worker_verdict = args.get("worker_verdict")
+    if isinstance(worker_verdict, dict):
+        normalized.append({"type": "worker_verdict", **worker_verdict})
     criteria_raw = args.get("acceptance_criteria")
     criteria: list[dict] = []
     if isinstance(criteria_raw, list):
@@ -3013,6 +3039,15 @@ def _items_to_artifacts(task: Task, worker_id: str, items: list[dict]) -> list[A
     don't satisfy the finding/risk/decision contract."""
     artifacts: list[Artifact] = []
     for item in items:
+        if item.get("type") == "worker_verdict":
+            verdict = parse_structured_verdict(item)
+            if verdict is not None:
+                artifacts.append(
+                    worker_verdict_artifact(
+                        task, worker_id, verdict, source="agentic:tool"
+                    )
+                )
+            continue
         artifact = cursor_artifact_from_item(task, worker_id, item, adapter="agentic")
         if artifact is not None:
             artifacts.append(artifact)
@@ -3035,6 +3070,11 @@ def _coerce_submit_report(args: object) -> str:
     verification = str(args.get("verification") or "").strip()
     if verification:
         parts.append("Verification: " + verification)
+    worker_verdict = parse_structured_verdict(args.get("worker_verdict"))
+    if worker_verdict is not None:
+        parts.append(
+            "VERDICT: " + worker_verdict.verdict + " - " + worker_verdict.reason
+        )
     return "\n\n".join(parts)
 
 

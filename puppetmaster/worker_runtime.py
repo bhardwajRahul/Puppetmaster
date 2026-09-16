@@ -251,6 +251,12 @@ class WorkerRuntime:
                 except Exception:
                     pass
                 artifacts = self._stamp_evaluator_metadata(task, artifacts)
+                # Optional worker claims are persisted separately from the
+                # runtime's non-bypassable gates. Missing or ambiguous claims
+                # remain absent; neither can imply a PASS.
+                from puppetmaster.worker_verdict import verdict_artifacts
+
+                artifacts = verdict_artifacts(task, self.worker_id, artifacts)
                 for artifact in artifacts:
                     try:
                         from puppetmaster.negative_claims import stamp_failed_gate
@@ -521,6 +527,8 @@ class WorkerRuntime:
             if kind != ArtifactType.VERIFICATION and str(kind) != "verification":
                 continue
             payload = getattr(artifact, "payload", None) or {}
+            if payload.get("kind") == "worker_verdict" and payload.get("advisory") is True:
+                continue
             result = str(payload.get("result") or "").strip().lower()
             exec_status = str(
                 payload.get("execution_status")

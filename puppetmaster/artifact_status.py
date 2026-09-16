@@ -73,7 +73,7 @@ CRITERION_STATUSES = frozenset(
 
 _PASSED = frozenset({"accept", "accepted", "pass", "passed", "ok", "true"})
 _FAILED = frozenset({"reject", "rejected", "fail", "failed", "false", "blocked"})
-_DEGRADED = frozenset({"degraded"})
+_DEGRADED = frozenset({"degraded", "partial"})
 
 # Worker-supplied labels that must not grant independent support.
 _WORKER_SUPPORT_ALIASES = frozenset(

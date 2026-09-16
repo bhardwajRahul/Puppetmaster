@@ -98,3 +98,11 @@ calibration, and drift checks. None of that ships in 1.22.26.
 
 - `puppetmaster/artifact_status.py` — vocabularies, hydrate, admission helper
 - Tests: `tests/test_artifact_status.py`, `tests/test_gist_admission.py`
+
+## Worker terminal verdicts
+
+Adapters may report an optional terminal `PASS`, `FAIL`, or `PARTIAL` verdict.
+`puppetmaster/worker_verdict.py` accepts only one final, well-formed verdict and
+persists it as a `VERIFICATION` artifact with `kind=worker_verdict`. Missing,
+malformed, or conflicting worker claims are deliberately absent rather than
+treated as a pass. Runtime completion gates remain authoritative.

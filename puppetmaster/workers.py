@@ -91,6 +91,9 @@ class WorkerSpec:
     adapter: str = "local"
     payload: dict = field(default_factory=dict)
     depends_on_roles: list[str] = field(default_factory=list)
+    # Optional common task-graph failure edge. Config loaders copy this into
+    # payload.failure_policy so persisted tasks remain self-contained.
+    on_fail: Optional[object] = None
 
 
 def normalize_role_specs(roles: Optional[list[object]], goal: str) -> tuple[list[RoleSpec], bool]:

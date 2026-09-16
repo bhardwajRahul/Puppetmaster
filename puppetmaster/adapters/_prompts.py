@@ -144,6 +144,7 @@ def build_structured_prompt(
     *,
     final_message_note: bool = False,
     acceptance_criteria: object = None,
+    terminal_verdict: bool = False,
 ) -> str:
     from puppetmaster.acceptance_criteria import (
         ensure_acceptance_criteria_in_text,
@@ -201,6 +202,13 @@ def build_structured_prompt(
                 "markdown fences).",
             ]
         )
+        if terminal_verdict:
+            submit_lines.append(
+                "This is a review task. Submit exactly one advisory worker verdict "
+                "using the native `worker_verdict` object: `verdict` is PASS, FAIL, "
+                "or PARTIAL and `reason` is a short non-empty string. Do not also "
+                "emit a VERDICT line when using that structured channel."
+            )
         lines.extend(submit_lines)
     else:
         lines.extend(_PUPPETMASTER_ARTIFACT_CONTRACT_LINES)
@@ -213,6 +221,14 @@ def build_structured_prompt(
                     "`evidence`). passed/failed require current-dispatch evidence; "
                     "unobserved criteria stay unknown.",
                 ]
+            )
+        if terminal_verdict:
+            lines.append(
+                "This is a review task. Include exactly one top-level "
+                '`"worker_verdict":{"verdict":"PASS|FAIL|PARTIAL","reason":"..."}` '
+                "object in JSON-native output. If only free text is available, "
+                "instead make the final non-blank line `VERDICT: PASS - reason` "
+                "(or FAIL/PARTIAL). Never use both verdict channels."
             )
     lines.extend([_ARTIFACT_GROUNDING, _ARTIFACT_EMPTY_GUIDANCE])
     if final_message_note:
@@ -263,6 +279,7 @@ def structured_prompt_for_task(
         body,
         final_message_note=final_message_note,
         acceptance_criteria=acceptance_criteria_for_task(task),
+        terminal_verdict="review" in str(task.role or "").lower(),
     )
 
 
@@ -308,8 +325,9 @@ def build_implement_prompt(prompt: str) -> str:
             "it fails you will be asked to fix it and submit again, so verify first.",
             "When all edits are done AND your checks pass, finish by CALLING the "
             "`submit_report` tool with a short summary, the files you changed, and how "
-            "you verified. If you cannot call tools, end with the same report as your "
-            "final message instead.",
+            "you verified. Include exactly one terminal verdict: PASS, FAIL, or PARTIAL "
+            "with a short reason. If you cannot call tools, end the final message with "
+            "`VERDICT: PASS - reason` (or FAIL/PARTIAL); do not put a verdict inside JSON.",
             _IMPLEMENT_REPORT_CONTRACT,
             "",
             TASK_INSTRUCTION_HEADER,

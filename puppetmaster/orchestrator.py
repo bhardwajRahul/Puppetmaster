@@ -448,6 +448,18 @@ class Orchestrator:
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
+            # Explicit failure edges are coordinator-owned. Apply them before
+            # fallback/review so retry/continue cannot be multiplied by those
+            # older recovery mechanisms, and let retry generations run.
+            for _ in range(11):
+                changed = self.store.apply_pending_failure_policies(job.id)
+                self.store.refresh_blocked_tasks(job.id)
+                retryable = [t for t in changed if t.status == TaskStatus.QUEUED]
+                if not retryable:
+                    break
+                self._run_workers(
+                    job, retryable, lease_seconds=lease_seconds, worker_mode=worker_mode
+                )
             if swarm_mode(specs) == "analysis":
                 self._enforce_analysis_no_worker_diff(job, tasks)
             rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
@@ -1677,6 +1689,14 @@ class Orchestrator:
         tasks_by_role: dict[str, Task] = {}
         for spec in specs:
             payload = dict(spec.payload or {})
+            from puppetmaster.failure_policy import normalize_failure_policy
+
+            if spec.on_fail is not None:
+                payload["failure_policy"] = normalize_failure_policy(spec.on_fail)
+            elif "failure_policy" in payload:
+                payload["failure_policy"] = normalize_failure_policy(
+                    payload["failure_policy"]
+                )
             # Every model-backed task must carry an executable reasoning
             # dialect before it is persisted. Auto-routed tasks already pass
             # through ``merge_routing_payload``; explicit model pins and
