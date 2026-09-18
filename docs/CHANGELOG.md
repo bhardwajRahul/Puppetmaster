@@ -1,3 +1,23 @@
+## v1.27.26 — 2026-09-18
+
+**Read-only work must not take an exclusive write claim.**
+
+- `agentic`, `cursor`, and `hermes` honour `read_only` / `no_edit` /
+  `dry_run` and `sandbox: read-only`, agreeing with `spec_edits_files`.
+  They returned "may write" unconditionally, so every read-only analysis
+  worker claimed its whole write scope: a 5-role swarm serialized to one
+  winner plus four `edit_admission_timeout` failures, reported as "swarm
+  exited with incomplete tasks".
+- An explicitly empty `write_scope` means "writes nothing" instead of being
+  promoted to `["."]`, which turned the narrowest possible declaration into
+  the widest possible lock.
+- `swarm_mode` is honoured instead of discarded. It is a one-way override:
+  it can only remove a claim, never grant one, and an explicit implement
+  payload still wins.
+- The default edit-admission wait is 900s (was 30s), matching the adapter
+  wall timeout, so a waiter queues behind a live holder instead of failing
+  while the holder is still working. The timeout names the holder and wait.
+
 ## v1.27.25 — 2026-09-16
 
 **Tag CI is not a third flake lottery.**
