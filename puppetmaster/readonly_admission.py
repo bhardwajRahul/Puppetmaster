@@ -281,3 +281,20 @@ class ReaderAdmission:
             os.close(fd)
             _fds.remove(fd)
             self.fd = None
+
+
+# Cross-process gate for helper Popen only. Not reader admission: interpreter
+# startup must not look like a source-open lock. Identity is process-global so
+# 32 workers cannot birth 32 python.exe helpers in one Windows stampede.
+_HELPER_SPAWN_IDENTITY = ("puppetmaster-helper-spawn", 1)
+
+
+def helper_spawn_gate(deadline, clock=time):
+    if deadline is None:
+        deadline = clock.monotonic() + 5.0
+    return ReaderAdmission(
+        Path("helper-spawn"),
+        deadline,
+        clock=clock,
+        selected=_HELPER_SPAWN_IDENTITY,
+    )

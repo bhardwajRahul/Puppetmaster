@@ -167,5 +167,46 @@ class AttachReaderContentionTests(unittest.TestCase):
                     self.assertEqual(spawn.call_count, 1)
 
 
+class HelperSpawnGateTests(unittest.TestCase):
+    def test_concurrent_helper_births_do_not_overlap(self):
+        import subprocess
+
+        with TemporaryDirectory() as root:
+            store = SQLiteSwarmStore(root)
+            store.ensure_schema()
+            active = 0
+            peak = 0
+            mutex = threading.Lock()
+
+            class SlowPopen(subprocess.Popen):
+                def __init__(self, *args, **kwargs):
+                    nonlocal active, peak
+                    with mutex:
+                        active += 1
+                        peak = max(peak, active)
+                    try:
+                        time.sleep(0.05)
+                        super().__init__(*args, **kwargs)
+                    finally:
+                        with mutex:
+                            active -= 1
+
+            transports = []
+
+            def launch():
+                transports.append(readonly._Transport(store.db_path))
+
+            with patch.object(readonly, 'ReaderProcess', SlowPopen), \
+                    ThreadPoolExecutor(max_workers=2) as pool:
+                try:
+                    futures = [pool.submit(launch) for _ in range(2)]
+                    for future in futures:
+                        future.result(timeout=10)
+                    self.assertEqual(peak, 1, peak)
+                finally:
+                    for transport in transports:
+                        transport.close()
+
+
 if __name__ == '__main__':
     unittest.main()

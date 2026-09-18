@@ -130,6 +130,52 @@ class SqliteConnectionPragmaTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_existing_wal_is_not_reassigned_on_connect(self) -> None:
+        store = SQLiteSwarmStore(Path("unused"))
+        executed: list[str] = []
+        connection = mock.Mock()
+
+        def execute(sql, *args, **kwargs):
+            executed.append(str(sql))
+            result = mock.Mock()
+            result.fetchone.return_value = ("wal",)
+            return result
+
+        connection.execute.side_effect = execute
+        store._apply_connection_pragmas(connection)
+        assignments = [
+            sql
+            for sql in executed
+            if "journal_mode" in sql.lower() and "=" in sql
+        ]
+        self.assertEqual(assignments, [])
+        self.assertTrue(
+            any(
+                "journal_mode" in sql.lower() and "=" not in sql
+                for sql in executed
+            )
+        )
+
+    def test_delete_journal_is_promoted_to_wal(self) -> None:
+        store = SQLiteSwarmStore(Path("unused"))
+        executed: list[str] = []
+        connection = mock.Mock()
+
+        def execute(sql, *args, **kwargs):
+            executed.append(str(sql))
+            result = mock.Mock()
+            if "journal_mode" in str(sql).lower() and "=" not in str(sql):
+                result.fetchone.return_value = ("delete",)
+            else:
+                result.fetchone.return_value = ("wal",)
+            return result
+
+        connection.execute.side_effect = execute
+        store._apply_connection_pragmas(connection)
+        self.assertTrue(
+            any("journal_mode" in sql.lower() and "=" in sql for sql in executed)
+        )
+
 
 class SqliteIntegrityAndBackupTests(unittest.TestCase):
     def test_integrity_status_ok_on_clean_db(self) -> None:
