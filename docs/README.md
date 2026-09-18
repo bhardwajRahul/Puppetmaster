@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.27.25](CHANGELOG.md#v12725--2026-09-16) — tag CI reuses a green tree instead of a third flake lottery. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.26](CHANGELOG.md#v12726--2026-09-18) — read-only workers no longer take an exclusive write claim. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 

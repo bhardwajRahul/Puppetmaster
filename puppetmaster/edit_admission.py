@@ -21,6 +21,14 @@ from .file_claims import (
 )
 
 
+# How long a worker may queue behind another worker's live claim before it
+# gives up. A holder keeps its claim for its WHOLE run, and the adapter wall
+# timeout is 900s (``agentic.DEFAULT_IMPLEMENT_TIMEOUT_SECONDS``), so a 30s
+# wait could only ever fire while the holder was still legitimately working --
+# turning "queue behind a writer" into a failed task and a failed swarm.
+DEFAULT_ADMISSION_WAIT_SECONDS = 900.0
+
+
 class EditAdmissionTimeout(TimeoutError):
     """The bounded wait elapsed before a conflicting claim was available."""
 
@@ -88,14 +96,22 @@ def edit_admission(store: Any, task: Any, worker_id: str) -> EditAdmissionOwner:
     elif isinstance(scope, (str, Path)):
         requested = [scope]
     elif isinstance(scope, (list, tuple, set)):
-        requested = list(scope) or ["."]
+        requested = list(scope)
+        if not requested:
+            # An explicitly EMPTY write_scope means "this worker writes
+            # nothing" -- it must not be promoted to ["."], which turns the
+            # narrowest possible declaration into the widest possible lock.
+            return _owner(store, task, worker_id, registry, cwd, ())
     else:
         raise ValueError("write_scope must be a path or list of paths")
     identity, normalized = registry._claim_keys(cwd, requested)
     del identity  # normalization is deliberately done by the primitive
     ttl = _positive_number(payload.get("edit_claim_ttl_seconds", 2.0), "edit_claim_ttl_seconds")
     timeout = _positive_number(
-        payload.get("edit_admission_wait_seconds", payload.get("claim_wait_seconds", 30.0)),
+        payload.get(
+            "edit_admission_wait_seconds",
+            payload.get("claim_wait_seconds", DEFAULT_ADMISSION_WAIT_SECONDS),
+        ),
         "edit_admission_wait_seconds",
     )
     deadline = time.monotonic() + timeout
@@ -113,7 +129,10 @@ def edit_admission(store: Any, task: Any, worker_id: str) -> EditAdmissionOwner:
             _emit(store, job_id, "edit_admission.waiting", task, (), worker_id=worker_id,
                   path=exc.path, owner=exc.owner)
             if time.monotonic() >= deadline:
-                raise EditAdmissionTimeout("timed out waiting for edit admission: %s" % exc.path)
+                raise EditAdmissionTimeout(
+                    "timed out waiting for edit admission: %s (held by %s, waited %.0fs)"
+                    % (exc.path, getattr(exc, "owner", "unknown"), timeout)
+                )
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
     admission = _owner(store, task, worker_id, registry, cwd, tuple(claims), ttl=ttl)

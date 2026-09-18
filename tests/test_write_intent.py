@@ -40,6 +40,21 @@ class WriteIntentTests(unittest.TestCase):
             ("agy", {"mode": "plan"}, False),
             ("agy", {"mode": "accept-edits"}, True),
             ("cursor", {}, True),
+            # Regression: the agentic adapter is what the Marionette harness
+            # pins for run_swarm (HARNESS_SWARM_ADAPTER=agentic), and the
+            # harness marks every analysis role read_only/no_edit/dry_run.
+            # agentic was absent from this matrix, so it kept returning True
+            # and every read-only swarm worker took an exclusive claim on its
+            # whole write scope (default ".") -- 1 winner, N-1
+            # EditAdmissionTimeout failures. Read-only must be a hard fence.
+            ("agentic", {}, True),
+            ("agentic", {"read_only": True}, False),
+            ("agentic", {"read_only": True, "no_edit": True, "dry_run": True}, False),
+            ("agentic", {"mode": "implement"}, True),
+            ("agentic", {"sandbox": "read-only"}, False),
+            ("cursor", {"read_only": True}, False),
+            ("hermes", {"no_edit": True}, False),
+            # shell is an acting adapter: a read-only hint never disarms it.
             ("future-adapter", {}, True),
         ]
         for adapter, payload, expected in cases:
@@ -48,3 +63,17 @@ class WriteIntentTests(unittest.TestCase):
                 expected,
                 (adapter, payload),
             )
+
+    def test_swarm_mode_analysis_is_a_conservative_override(self) -> None:
+        """swarm_mode was declared then discarded; honour it one-way only."""
+        # "analysis" can remove a claim but never grant one.
+        self.assertFalse(adapter_may_write("agentic", {}, swarm_mode="analysis"))
+        self.assertFalse(adapter_may_write("cursor", {}, swarm_mode="analysis"))
+        self.assertFalse(adapter_may_write("hermes", {}, swarm_mode="analysis"))
+        # An explicit implement payload still wins (matches spec_edits_files).
+        self.assertTrue(
+            adapter_may_write("agentic", {"mode": "implement"}, swarm_mode="analysis"))
+        # "edit" grants nothing on its own; unknown/None change nothing.
+        self.assertFalse(adapter_may_write("local", {}, swarm_mode="edit"))
+        self.assertTrue(adapter_may_write("agentic", {}, swarm_mode="edit"))
+        self.assertTrue(adapter_may_write("agentic", {}, swarm_mode=None))

@@ -30,18 +30,40 @@ def adapter_may_write(
     Conservative for unknown adapters: treat them as writers so claims and
     dirty-tree guards still fire.
     """
-    del swarm_mode  # reserved; payload/permission fields are authoritative
     name = canonicalize_adapter_name(adapter)
     payload = dict(payload or {})
     implement = (
         str(payload.get("mode") or "").strip().lower() == "implement"
         or bool(payload.get("implement"))
     )
+    # ``swarm_mode`` is the swarm-level verdict from ``workers.swarm_mode``
+    # ("analysis" when no spec in the wave can edit at all). It was declared
+    # and then discarded, so callers believed they were constraining the
+    # decision when nothing read it. Honour it as a conservative one-way
+    # override: it can only ever remove a write claim, never grant one, and an
+    # explicit implement payload still wins (matching ``spec_edits_files``).
+    if str(swarm_mode or "").strip().lower() == "analysis" and not implement:
+        return False
     if name in {"local", "openai"}:
         return implement
     if name == "shell":
         return True
     if name in {"agentic", "cursor", "hermes"}:
+        # An explicit analysis / read-only payload is a hard no-edit fence even
+        # for a full-edit adapter. This is the same predicate as
+        # ``puppetmaster.workers.payload_forbids_writes`` (and therefore
+        # ``spec_edits_files`` / ``swarm_mode``); inlined to avoid an import
+        # cycle with ``workers``. Without it, every read-only agentic swarm
+        # worker took an exclusive file claim on its whole write scope
+        # (default "."), so a 5-role swarm became 1 winner + 4
+        # EditAdmissionTimeout failures ("swarm exited with incomplete tasks").
+        if (
+            payload.get("read_only")
+            or payload.get("no_edit")
+            or payload.get("dry_run")
+            or str(payload.get("sandbox") or "").strip().lower() == "read-only"
+        ):
+            return False
         return True
     if name == "claude-code":
         default = (
