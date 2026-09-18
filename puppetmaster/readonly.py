@@ -25,7 +25,7 @@ from pathlib import Path
 from subprocess import Popen as ReaderProcess
 
 from puppetmaster.readonly_worker import source_stamp
-from puppetmaster.readonly_admission import ReaderAdmission
+from puppetmaster.readonly_admission import ReaderAdmission, helper_spawn_gate
 from puppetmaster.readonly_cleanup import CleanupRegistry
 
 
@@ -137,11 +137,15 @@ class _Transport:
         self.process = None
         self.token = _cleanup.register(self, source_stamp(path)[:2])
         try:
-            if isinstance(process_factory, type):
-                self.process = process_factory.__new__(process_factory)
-                process_factory.__init__(self.process, process_args, **process_kwargs)
-            else:
-                self.process = process_factory(process_args, **process_kwargs)
+            spawn = helper_spawn_gate(deadline)
+            try:
+                if isinstance(process_factory, type):
+                    self.process = process_factory.__new__(process_factory)
+                    process_factory.__init__(self.process, process_args, **process_kwargs)
+                else:
+                    self.process = process_factory(process_args, **process_kwargs)
+            finally:
+                spawn.release()
         except BaseException:
             _cleanup.retire(self.token)
             raise

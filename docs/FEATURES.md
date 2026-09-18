@@ -34,6 +34,7 @@ Six production adapters live plus the keys-only `agentic` standalone worker; cur
 | --- | --- |
 | Universal worker contracts (v1.27.24) | Structured verdicts, file-claim admission, `on_fail` abort/continue/retry, live `steer`/`broadcast` at the next execution boundary, and opt-in `review_loop` / `cleanup`. Enforced in the shared runtime for every registered adapter, not a single CLI path. |
 | Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
+| Windows helper spawn gate (v1.27.27) | Readonly helper `Popen` is single-file across workers (not reader admission). In-process `connect()` assigns WAL only when the file is not already WAL |
 | SQLite backend | Default backend with WAL, integrity checks, and persisted events. Supervisor initialization migrates to schema v5 and repairs stale triggers; restart all long-lived processes at cutover. No historical consumption is invented |
 | Embedded store contracts (v1.24.0) | Bounded metadata projections and change pages, JobRef validation and origin/project/session scope, immutable completion receipts, scoped durable cancellation with queued-task fairness, and opt-in effect replay fences. SQLite transactional projections; file pending-write detection. [Guarantees and limits](STORE_CONTRACTS.md) |
 | Process outcomes and cleanup (v1.24.0) | Job receipts expose `attempt_consumption.attempts[].process_outcomes` separately from artifact delivery quality. Owned cleanup uses POSIX group/nonce checks or Windows Job Objects; local stop does not prove remote cancellation |

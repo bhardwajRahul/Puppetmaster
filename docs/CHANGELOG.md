@@ -1,3 +1,17 @@
+## v1.27.27 — 2026-09-18
+
+**Windows attach must not birth a helper herd.**
+
+- Helper `Popen` now takes a process-global spawn gate that is not reader
+  admission. Interpreter startup still does not look like a source-open lock;
+  32 workers can no longer create 32 `python.exe` helpers in one stampede.
+  Tag canary `v1.27.26` lost 11 of 32 attach workers to
+  `STATUS_ACCESS_VIOLATION` (`3221225477`) on the same SHA that passed on
+  `main`.
+- In-process `connect()` queries `journal_mode` and assigns WAL only when
+  the file is not already WAL. Re-assigning WAL remaps the Windows `-shm`
+  under a live cohort. Connection-local PRAGMAs are still reapplied.
+
 ## v1.27.26 — 2026-09-18
 
 **Read-only work must not take an exclusive write claim.**

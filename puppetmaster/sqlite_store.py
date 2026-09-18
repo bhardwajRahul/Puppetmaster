@@ -581,8 +581,12 @@ class SQLiteSwarmStore(SwarmStore):
         # Install the lock wait before journal_mode: concurrent first-openers
         # can otherwise fail immediately while another process initializes WAL.
         connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
-        # Fetch journal_mode so the result row does not linger unread.
-        connection.execute("PRAGMA journal_mode = WAL").fetchone()
+        # journal_mode persists on the file. Re-assigning WAL on every worker
+        # connect remaps the Windows -shm under a live cohort.
+        journal = connection.execute("PRAGMA journal_mode").fetchone()
+        mode = str(journal[0]).lower() if journal else ""
+        if mode != "wal":
+            connection.execute("PRAGMA journal_mode = WAL").fetchone()
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA synchronous = {self.synchronous_policy}")
 
