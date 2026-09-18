@@ -63,6 +63,17 @@ class EditAdmissionTests(unittest.TestCase):
                     ("agy", {"mode": "plan"}, 0),
                     ("agy", {"mode": "accept-edits"}, 1),
                     ("future-adapter", {}, 1),
+                    # Regression: the adapter Marionette pins for run_swarm was
+                    # the one row missing here, so "read-only does not claim"
+                    # was never asserted for the adapter every real analysis
+                    # swarm uses. Read-only agentic workers must take 0 claims.
+                    ("agentic", {"read_only": True, "no_edit": True, "dry_run": True}, 0),
+                    ("agentic", {"read_only": True}, 0),
+                    ("agentic", {"sandbox": "read-only"}, 0),
+                    ("cursor", {"read_only": True}, 0),
+                    ("hermes", {"no_edit": True}, 0),
+                    ("agentic", {}, 1),
+                    ("agentic", {"mode": "implement"}, 1),
                 ]:
                     task = Task(adapter=adapter, payload={"cwd": str(root), **payload})
                     with edit_admission(Store(), task, "worker") as owner:
@@ -88,6 +99,41 @@ class EditAdmissionTests(unittest.TestCase):
                         edit_admission(Store(), other, "two")
                 finally:
                     first.close()
+
+    def test_empty_write_scope_claims_nothing(self):
+        """An explicit [] means "writes nothing", not "the whole workspace"."""
+        with tempfile.TemporaryDirectory() as directory:
+            root, db = Path(directory), Path(directory) / "claims.sqlite3"
+            with patch("puppetmaster.edit_admission.default_file_claim_db_path", return_value=db):
+                task = Task(payload={"cwd": str(root), "write_scope": []})
+                with edit_admission(Store(), task, "worker") as owner:
+                    self.assertEqual(0, len(owner.claims))
+                # control: an ABSENT scope still means the whole workspace
+                with edit_admission(Store(), Task(payload={"cwd": str(root)}), "worker") as owner:
+                    self.assertEqual((".",), tuple(c.path for c in owner.claims))
+
+    def test_timeout_names_the_holder_and_the_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, db = Path(directory), Path(directory) / "claims.sqlite3"
+            with patch("puppetmaster.edit_admission.default_file_claim_db_path", return_value=db):
+                holder = edit_admission(Store(), Task(payload={"cwd": str(root)}), "holder")
+                try:
+                    other = Task(id="task-2", payload={
+                        "cwd": str(root), "edit_admission_wait_seconds": 0.1})
+                    with self.assertRaises(EditAdmissionTimeout) as ctx:
+                        edit_admission(Store(), other, "waiter")
+                    self.assertIn("holder", str(ctx.exception))
+                    self.assertIn("waited", str(ctx.exception))
+                finally:
+                    holder.close()
+
+    def test_default_wait_outlasts_the_adapter_wall_timeout(self):
+        """A holder fences its claim for its WHOLE run, so the default wait has
+        to cover that or a waiter fails while the holder is still working."""
+        import puppetmaster.edit_admission as admission
+        from puppetmaster.adapters.agentic import DEFAULT_IMPLEMENT_TIMEOUT_SECONDS
+        self.assertGreaterEqual(
+            admission.DEFAULT_ADMISSION_WAIT_SECONDS, DEFAULT_IMPLEMENT_TIMEOUT_SECONDS)
 
     def test_exception_releases_claim(self):
         with tempfile.TemporaryDirectory() as directory:
