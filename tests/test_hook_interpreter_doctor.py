@@ -90,14 +90,15 @@ class HookInterpreterDoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             home = root / "home"
-            missing = str(root / "no-such-python")
+            raw_missing = str(root / "no-such-python")
             _write_hooks(
                 root / ".cursor" / "hooks.json",
-                {"version": 1, "hooks": render_cursor_hooks(missing)},
+                {"version": 1, "hooks": render_cursor_hooks(raw_missing)},
             )
+            stored = owned_hook_interpreters(root, home=home)[0][1]
             check = _hooks_check(root, home=home)
             self.assertEqual(check.status, "warn")
-            self.assertIn(missing, check.detail)
+            self.assertIn(stored, check.detail)
             self.assertIn("missing", check.detail)
             self.assertIn("install-hooks --force", check.detail)
 
