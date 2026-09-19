@@ -73,6 +73,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _guard("state-identity", lambda: _state_identity_check(root, state_path)),
         _guard("git-status", lambda: _git_clean_check(root)),
         _guard("agent-rules", lambda: _agent_rules_check(root)),
+        _guard("hooks", lambda: _hooks_check(root)),
     ]
     checks.extend(_guard_many(_credential_env_checks))
     checks.extend(_guard_many(_billing_checks))
@@ -439,6 +440,80 @@ def _agent_rules_check(root: Path) -> Check:
             "Fix: `puppetmaster install-rules` (workspace) or `puppetmaster install-rules --global` (user-level)."
         ),
     )
+
+
+def _probe_hook_interpreter(exe: str) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` for a hook interpreter's ``import puppetmaster``."""
+    path = Path(exe)
+    try:
+        exists = path.is_file()
+    except OSError:
+        exists = False
+    if not exists:
+        return False, "missing"
+    try:
+        proc = subprocess.run(
+            [exe, "-c", "import puppetmaster"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "unusable"
+    if proc.returncode != 0:
+        return False, "cannot-import"
+    return True, "ok"
+
+
+def _hooks_check(root: Path, home: Optional[Path] = None) -> Check:
+    """Warn when a Puppetmaster-owned hook interpreter cannot import the package.
+
+    Existence-only checks miss Homebrew python that is still on disk but no
+    longer has puppetmaster installed. Quiet when no owned hooks are present.
+    """
+    from puppetmaster.hook_installers import owned_hook_interpreters
+
+    rows = owned_hook_interpreters(root, home=home)
+    if not rows:
+        return Check("hooks", "optional", "no Puppetmaster-owned host hooks")
+
+    by_exe: dict[str, list[str]] = {}
+    for label, exe in rows:
+        by_exe.setdefault(exe, []).append(label)
+
+    broken: list[tuple[str, str, list[str]]] = []
+    healthy = 0
+    for exe, labels in by_exe.items():
+        ok, reason = _probe_hook_interpreter(exe)
+        if ok:
+            healthy += 1
+            continue
+        broken.append((exe, reason, labels))
+
+    if not broken:
+        return Check(
+            "hooks",
+            "ok",
+            f"{healthy} Puppetmaster hook interpreter(s) import puppetmaster",
+            evidence=[f"interpreter:{exe}" for exe in by_exe],
+        )
+
+    lines = []
+    evidence = []
+    for exe, reason, labels in broken:
+        where = ", ".join(labels)
+        if reason == "missing":
+            lines.append(f"{exe} (in {where}) is missing")
+        else:
+            lines.append(f"{exe} (in {where}) cannot import puppetmaster")
+        evidence.append(f"interpreter:{exe}")
+        evidence.extend(f"file:{label}" for label in labels)
+    detail = (
+        "; ".join(lines)
+        + ". reinstall with `puppetmaster setup` or `puppetmaster install-hooks --force` "
+        "so hooks use a python that can import puppetmaster"
+    )
+    return Check("hooks", "warn", detail, evidence=evidence)
 
 
 def _codex_check() -> Check:

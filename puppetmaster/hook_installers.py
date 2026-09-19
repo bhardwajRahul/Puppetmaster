@@ -35,10 +35,11 @@ disables them by deleting our entries (or setting
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Optional
+from typing import Iterable, Mapping, Optional, Sequence
 
 _GATE_MARKER = "puppetmaster invocation-gate"
 
@@ -99,6 +100,65 @@ def _gate_command(host: str, event: str, python: Optional[str] = None) -> str:
 def _is_ours(entry: object) -> bool:
     """True if a hook entry is one we wrote (matched by the gate command)."""
     return _GATE_MARKER in json.dumps(entry)
+
+
+def _collect_owned_commands(node: object) -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        command = node.get("command")
+        if isinstance(command, str) and _GATE_MARKER in command:
+            found.append(command)
+        for value in node.values():
+            found.extend(_collect_owned_commands(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_collect_owned_commands(item))
+    return found
+
+
+def executable_from_hook_command(command: str) -> Optional[str]:
+    """Leading interpreter from a gate command we wrote."""
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    exe = str(parts[0]).strip()
+    return exe or None
+
+
+def owned_hook_interpreters(
+    root: Path,
+    home: Optional[Path] = None,
+) -> list[tuple[str, str]]:
+    """``(file_label, interpreter)`` for Puppetmaster-owned host hooks.
+
+    Reads the Cursor and Claude files ``install-hooks`` writes. Missing or
+    unreadable files contribute nothing. Duplicate commands in one file
+    collapse to one interpreter row.
+    """
+    home_dir = home if home is not None else Path.home()
+    files: Sequence[tuple[str, Path]] = (
+        (".cursor/hooks.json", root / ".cursor" / "hooks.json"),
+        (".claude/settings.json", root / ".claude" / "settings.json"),
+        ("~/.cursor/hooks.json", home_dir / ".cursor" / "hooks.json"),
+        ("~/.claude/settings.json", home_dir / ".claude" / "settings.json"),
+    )
+    rows: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for label, path in files:
+        data = _read_json(path)
+        for command in _collect_owned_commands(data.get("hooks")):
+            exe = executable_from_hook_command(command)
+            if not exe:
+                continue
+            key = (label, exe)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(key)
+    return rows
 
 
 def render_cursor_hooks(python: Optional[str] = None) -> dict:
