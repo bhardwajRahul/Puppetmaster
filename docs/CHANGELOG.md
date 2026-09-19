@@ -1,3 +1,16 @@
+## v1.27.28 — 2026-09-18
+
+**Opt-in Jev can skip a redundant conflict-auditor.**
+
+- `PUPPETMASTER_JEV=1` plus an OpenRouter key scores four analysis graph
+  edges and prints `## Jev` on `show`. Unset never opens a Decisions
+  socket. Product does not read Marionette `keys.json`.
+- Conflict-auditor (V1) may skip when peer FINDINGs do not contradict.
+  That replaces a model call the kernel would have made anyway.
+- Already-answered, FINDING admission, and stop-spawn stay observe-only
+  unless `PUPPETMASTER_JEV_ACT` is also set. Those edges cancel work no
+  model currently votes on, so they are not the ship default.
+
 ## v1.27.27 — 2026-09-18
 
 **Windows attach must not birth a helper herd.**
