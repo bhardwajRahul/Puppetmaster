@@ -3096,6 +3096,26 @@ def _enabled_swarm_adapters() -> list[str]:
     return [a for a in SWARM_ANALYSIS_ADAPTERS if a in enabled or a == "local"]
 
 
+def _maybe_reuse_analysis_swarm(args: JsonObject, goal: str) -> Optional[JsonObject]:
+    """Return an MCP start receipt for an already-answered analysis, or None."""
+    try:
+        from puppetmaster.swarm_launch import reuse_analysis_if_answered
+
+        store = create_store(
+            str(args.get("backend") or "sqlite"), mcp_state_dir(args)
+        )
+        store.init()
+        body = reuse_analysis_if_answered(store, goal, cwd(args))
+    except Exception:
+        return None
+    if body is None:
+        return None
+    return {
+        "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
+        "isError": False,
+    }
+
+
 def start_swarm(args: JsonObject) -> JsonObject:
     from puppetmaster.workers import normalize_role_specs
 
@@ -3103,6 +3123,9 @@ def start_swarm(args: JsonObject) -> JsonObject:
     blocked_playbook = _prepare_playbook(args)
     if blocked_playbook is not None:
         return blocked_playbook
+    reused = _maybe_reuse_analysis_swarm(args, goal)
+    if reused is not None:
+        return reused
     command = ["run", goal]
     role_inputs = normalized_role_specs(args)
     adapter = args.get("adapter")
@@ -3271,6 +3294,9 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
     blocked_playbook = _prepare_playbook(args)
     if blocked_playbook is not None:
         return blocked_playbook
+    reused = _maybe_reuse_analysis_swarm(args, require_string(args, "goal"))
+    if reused is not None:
+        return reused
     roles = normalized_role_specs(args)
     try:
         config_path = write_generated_swarm_config(args, roles, "cursor")

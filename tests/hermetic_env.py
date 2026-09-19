@@ -45,6 +45,11 @@ _PIN_KEYS_TO_CLEAR = (
     "PUPPETMASTER_CURSOR_INPUT",
     "PUPPETMASTER_WORKER",
     "PUPPETMASTER_ALLOW_NESTED",
+    # Host opt-in for the Jev transition oracle must not leak into the suite.
+    # Tests that exercise it set PUPPETMASTER_JEV themselves.
+    "PUPPETMASTER_JEV",
+    "PUPPETMASTER_JEV_ACT",
+    "PUPPETMASTER_OPENROUTER_API_KEY",
     # A provider the developer disconnected in Marionette Settings must not
     # change what the suite sees either — tests that care set it themselves.
     "PUPPETMASTER_DISABLED_PROVIDERS",

@@ -1369,7 +1369,23 @@ def _main(argv: Optional[list[str]] = None) -> int:
         from puppetmaster.swarm_launch import (
             build_analysis_swarm_specs,
             detach_analysis_swarm,
+            reuse_analysis_if_answered,
         )
+
+        if args.command == "swarm":
+            reused = reuse_analysis_if_answered(store, args.goal, args.cwd)
+            if reused is not None:
+                if getattr(args, "json", False):
+                    print(json.dumps(reused, indent=2))
+                else:
+                    print(reused["job_id"])
+                    print(
+                        "# reused prior analysis  "
+                        f"handle={reused.get('handle_job_id')}  "
+                        f"reason={reused.get('reason')}",
+                        file=sys.stderr,
+                    )
+                return 0
 
         if args.command == "review":
             from puppetmaster.workers import NoReviewAdapterError, pick_review_adapter

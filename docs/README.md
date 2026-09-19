@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.27.27](CHANGELOG.md#v12727--2026-09-18) — Windows attach no longer births a helper herd. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.28](CHANGELOG.md#v12728--2026-09-18) — Opt-in Jev can skip a redundant conflict-auditor. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 

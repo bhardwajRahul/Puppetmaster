@@ -45,6 +45,29 @@ SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
 )
 
 
+def reuse_analysis_if_answered(store: Any, goal: str, cwd: str) -> Optional[dict[str, Any]]:
+    """Return a start receipt pointing at a prior job, or None to launch."""
+    try:
+        from puppetmaster.jev.edges import apply_already_answered
+
+        reused = apply_already_answered(store, goal, cwd)
+    except Exception:
+        return None
+    if reused is None:
+        return None
+    return {
+        "job_id": reused.prior_job_id,
+        "handle_job_id": reused.handle_job_id,
+        "reused": True,
+        "gate": "jev_transition",
+        "edge": "already_answered",
+        "action": "skip",
+        "reason": reused.decision.reason,
+        "max_noul": reused.decision.max_noul,
+        "launcher_pid": None,
+    }
+
+
 def analysis_swarm_prompt(*, role: str, goal: str) -> str:
     """Build the analysis worker instruction.
 

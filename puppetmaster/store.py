@@ -1106,6 +1106,15 @@ class SwarmStore(StoreContracts):
                     extra={"artifact_id": artifact.id},
                 )
             return []
+        try:
+            from puppetmaster.jev.edges import apply_stop_spawn
+
+            if apply_stop_spawn(
+                self, artifact.job_id, task_id=str(producing_id or "")
+            ):
+                return []
+        except Exception:
+            pass
         from puppetmaster.continuous_plan import (
             REASON_INTENT_SPEC,
             follow_up_limit_for,

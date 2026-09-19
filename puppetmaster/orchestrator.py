@@ -456,6 +456,7 @@ class Orchestrator:
             self._ensure_job_brief(job, goal, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
+            self._maybe_record_already_answered(job, goal, specs, tasks)
             self._run_workers_and_successors(
                 job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode
             )
@@ -2504,6 +2505,46 @@ class Orchestrator:
             )
         return total
 
+    def _maybe_record_already_answered(
+        self,
+        job: Job,
+        goal: str,
+        specs: list[WorkerSpec],
+        tasks: Optional[list[Task]] = None,
+    ) -> None:
+        """Observe-only V2 receipt on the launched analysis job. Never raises."""
+        try:
+            if swarm_mode(specs) != "analysis" or swarm_is_acting(specs):
+                return
+            from puppetmaster.jev.edges import record_already_answered_on_job
+
+            cwd = ""
+            for spec in specs or []:
+                payload = getattr(spec, "payload", None) or {}
+                candidate = payload.get("cwd")
+                if candidate:
+                    cwd = str(candidate)
+                    break
+            if not cwd:
+                cwd = os.getcwd()
+            task_id = ""
+            if tasks:
+                task_id = str(getattr(tasks[0], "id", "") or "")
+            record_already_answered_on_job(
+                self.store, job.id, goal, cwd, task_id=task_id
+            )
+        except Exception:
+            return
+
+    def _maybe_gate_conflict_auditor(self, job: Job) -> None:
+        """Apply the conflict-auditor edge. Opt-in may skip that model call."""
+        try:
+            from puppetmaster.jev.edges import apply_ready_conflict_auditor_gates
+
+            apply_ready_conflict_auditor_gates(self.store, job.id)
+        except Exception:
+            return
+
     def _run_workers(
         self,
         job: Job,
@@ -2542,6 +2583,18 @@ class Orchestrator:
                 if task.id in allowed_task_ids
                 and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
             ]
+        if not tasks:
+            if self._should_fail_closed(job, allowed_task_ids):
+                raise RuntimeError("swarm exited with incomplete tasks")
+            return
+
+        self._maybe_gate_conflict_auditor(job)
+        tasks = [
+            task
+            for task in self.store.list_tasks(job.id)
+            if task.id in allowed_task_ids
+            and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+        ]
         if not tasks:
             if self._should_fail_closed(job, allowed_task_ids):
                 raise RuntimeError("swarm exited with incomplete tasks")
@@ -2623,6 +2676,7 @@ class Orchestrator:
                 record_orchestrator_heartbeat(self.store, job.id)
                 self.store.recover_stale_tasks(job.id)
                 self.store.refresh_blocked_tasks(job.id)
+                self._maybe_gate_conflict_auditor(job)
                 ready_tasks = [
                     task
                     for task in self.store.list_tasks(job.id)

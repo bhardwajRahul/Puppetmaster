@@ -172,6 +172,13 @@ class Stitcher:
         for artifact_type, count in sorted(counts.items()):
             lines.append(f"- {artifact_type}: {count}")
 
+        try:
+            from puppetmaster.jev.render import render_transition_section
+
+            lines.extend(render_transition_section(artifacts))
+        except Exception:
+            pass
+
         lines.extend(["", "## Promoted Memory"])
         for memory in memories:
             lines.append(f"- [{memory.scope}] {memory.statement}")
