@@ -16,10 +16,11 @@ def enabled() -> bool:
 
 
 def acting() -> bool:
-    """Opt-in plus ``PUPPETMASTER_JEV_ACT``. Default is observe-only.
+    """V2–V4 experiment switch. Requires opt-in plus ``PUPPETMASTER_JEV_ACT``.
 
-    Observe still scores and writes GATE rows. It never skips, demotes,
-    reuses, or stops. ACT is a later experiment switch, not a ship default.
+    Conflict-auditor (V1) acts on opt-in alone. Already-answered,
+    FINDING admission, and stop-spawn stay observe-only unless this
+    returns true.
     """
     if not opted_in():
         return False

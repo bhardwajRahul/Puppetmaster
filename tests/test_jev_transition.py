@@ -18,10 +18,13 @@ import hermetic_env  # noqa: F401
 from puppetmaster.jev import acting, decide_noul, enabled, opted_in
 from puppetmaster.jev.client import decide, resolve_openrouter_key
 from puppetmaster.jev.edges import (
+    EDGE_ALREADY_ANSWERED,
+    EDGE_CONFLICT_AUDITOR,
     apply_already_answered,
     apply_conflict_auditor_gate,
     decide_already_answered,
     decide_conflict_auditor,
+    may_act,
     record_already_answered_on_job,
 )
 from puppetmaster.orchestrator import Orchestrator
@@ -158,6 +161,12 @@ class JevOptInTests(unittest.TestCase):
         os.environ["PUPPETMASTER_JEV_ACT"] = "1"
         self.assertTrue(acting())
 
+    def test_v1_may_act_on_opt_in_without_act_flag(self) -> None:
+        os.environ["PUPPETMASTER_JEV"] = "1"
+        self.assertTrue(may_act(EDGE_CONFLICT_AUDITOR))
+        self.assertFalse(may_act(EDGE_ALREADY_ANSWERED))
+        self.assertFalse(acting())
+
     def test_opt_in_with_puppetmaster_key_enables(self) -> None:
         os.environ["PUPPETMASTER_JEV"] = "true"
         os.environ["PUPPETMASTER_OPENROUTER_API_KEY"] = "sk-pm"
@@ -258,7 +267,7 @@ class ConflictAuditorGateTests(unittest.TestCase):
         self.assertFalse(gates[0].payload["acted"])
         self.assertTrue(gates[0].payload["passed"])
 
-    def test_observe_low_noul_records_would_skip_and_leaves_auditor(self) -> None:
+    def test_opt_in_low_noul_skips_auditor(self) -> None:
         os.environ["PUPPETMASTER_JEV"] = "1"
         os.environ["PUPPETMASTER_OPENROUTER_API_KEY"] = "sk-test"
         _job, _explore, auditor, _findings = _job_with_auditor(self.store)
@@ -272,18 +281,18 @@ class ConflictAuditorGateTests(unittest.TestCase):
 
         with patch("puppetmaster.jev.edges.decide", _fake_decide):
             decision = apply_conflict_auditor_gate(self.store, auditor)
-        self.assertEqual(decision.action, "spawn")
+        self.assertEqual(decision.action, "skip")
         self.assertEqual(decision.would_action, "skip")
-        self.assertFalse(decision.acted)
+        self.assertTrue(decision.acted)
         self.assertEqual(decision.reason, "no_pair_above_threshold")
         self.assertEqual(decision.max_noul, 0.12)
         stored = self.store.get_task_by_id(auditor.id)
-        self.assertEqual(stored.status, TaskStatus.QUEUED)
+        self.assertEqual(stored.status, TaskStatus.SKIPPED)
         gates = self._gates(auditor.job_id)
         self.assertEqual(len(gates), 1)
-        self.assertEqual(gates[0].payload["action"], "spawn")
+        self.assertEqual(gates[0].payload["action"], "skip")
         self.assertEqual(gates[0].payload["would_action"], "skip")
-        self.assertFalse(gates[0].payload["acted"])
+        self.assertTrue(gates[0].payload["acted"])
         self.assertTrue(gates[0].payload["passed"])
         verifications = [
             artifact
@@ -292,7 +301,7 @@ class ConflictAuditorGateTests(unittest.TestCase):
             and (artifact.payload or {}).get("check")
             == "jev_transition:conflict_auditor"
         ]
-        self.assertEqual(verifications, [])
+        self.assertEqual(verifications[0].payload["result"], "skipped")
 
     def test_act_compatible_low_noul_skips_auditor(self) -> None:
         os.environ["PUPPETMASTER_JEV"] = "1"
@@ -431,7 +440,6 @@ class ConflictAuditorGateTests(unittest.TestCase):
 
     def test_quality_ok_after_skip_with_explore_finding(self) -> None:
         os.environ["PUPPETMASTER_JEV"] = "1"
-        os.environ["PUPPETMASTER_JEV_ACT"] = "1"
         os.environ["PUPPETMASTER_OPENROUTER_API_KEY"] = "sk-test"
         _job, _explore, auditor, findings = _job_with_auditor(self.store)
 
@@ -447,7 +455,6 @@ class ConflictAuditorGateTests(unittest.TestCase):
 
     def test_worker_runtime_skip_does_not_construct_local_worker(self) -> None:
         os.environ["PUPPETMASTER_JEV"] = "1"
-        os.environ["PUPPETMASTER_JEV_ACT"] = "1"
         os.environ["PUPPETMASTER_OPENROUTER_API_KEY"] = "sk-test"
         _job, _explore, auditor, _findings = _job_with_auditor(self.store)
 

@@ -1,11 +1,12 @@
-# Observe-only receipts
+# V2–V4 observe receipts
 
-Opt-in without `PUPPETMASTER_JEV_ACT` scores edges and writes GATE
-rows. The graph stays spawn / admit / enqueue.
+Opt-in without `PUPPETMASTER_JEV_ACT` scores already-answered,
+FINDING admission, and stop-spawn. Those graph actions stay
+launch / admit / enqueue.
 
 ## Sub-features
 
-- `observe-v1` records `would_action=skip` and leaves the auditor queued.
+- `observe-v2` records a score on the launched job and still launches.
 - `observe-v3` records a plumbing `would_action=skip` and still admits.
 - `observe-v4` records a stop score and still enqueues.
 
@@ -21,9 +22,9 @@ Export `PUPPETMASTER_JEV=1` and an OpenRouter key. Do not set
 ```
 
 Proof: `/tmp/verify-this/puppetmaster-jev/observe.json` shows
-`observe_matches_today=true` and every GATE `acted=false`.
-`python -m puppetmaster show <job_id>` includes `## Jev observe`
-when a GATE exists, and omits that section when unset.
+`v234_match_today=true`. `python -m puppetmaster show <job_id>`
+includes `## Jev` when a GATE exists, and omits that section when
+unset.
 
 ## Gotchas
 

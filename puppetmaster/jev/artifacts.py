@@ -30,8 +30,8 @@ def build_transition_gate(
     verdict. ``quality.py`` treats ``passed is False`` as fail-closed.
 
     ``action`` is what the graph did. ``would_action`` is Jev's
-    recommendation. Observe-only writes ``acted=false`` and keeps
-    ``action`` on today's spawn/admit/enqueue path.
+    recommendation. V2–V4 observe-only writes ``acted=false`` and
+    keeps today's launch/admit/enqueue path.
     """
     recommended = would_action if would_action else action
     payload: dict[str, Any] = {

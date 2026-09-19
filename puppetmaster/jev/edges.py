@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-"""Transition-oracle edges. Observe-only by default; ACT may skip or demote.
+"""Transition-oracle edges.
 
-Jev never invents FINDINGs.
+Conflict-auditor (V1) may skip on opt-in: that replaces a model call.
+Already-answered, FINDING admission, and stop-spawn stay observe-only
+unless ``PUPPETMASTER_JEV_ACT``. Jev never invents FINDINGs.
 """
 
 from dataclasses import dataclass, replace
@@ -63,10 +65,19 @@ def _would(decision: TransitionDecision) -> str:
     return decision.would_action or decision.action
 
 
-def _bind_applied(decision: TransitionDecision) -> TransitionDecision:
-    """Stamp applied action. Observe-only never returns skip."""
+def may_act(edge: str) -> bool:
+    """V1 acts on opt-in. Other edges need the ACT experiment switch."""
+    if edge == EDGE_CONFLICT_AUDITOR:
+        return opted_in()
+    return acting()
+
+
+def _bind_applied(
+    decision: TransitionDecision, *, edge: str
+) -> TransitionDecision:
+    """Stamp applied action. Non-V1 observe-only never returns skip."""
     would = _would(decision)
-    applied = "skip" if acting() and would == "skip" else "spawn"
+    applied = "skip" if may_act(edge) and would == "skip" else "spawn"
     return replace(
         decision,
         action=applied,
@@ -83,7 +94,7 @@ def _persist_bound_gate(
     edge: str,
     decision: TransitionDecision,
 ) -> TransitionDecision:
-    bound = _bind_applied(decision)
+    bound = _bind_applied(decision, edge=edge)
     if decision.write_gate:
         _persist(
             store,
@@ -711,7 +722,7 @@ def record_already_answered_on_job(
             store, goal, cwd, exclude_job_ids=(job_id,)
         )
         if not decided.write_gate:
-            return _bind_applied(decided)
+            return _bind_applied(decided, edge=EDGE_ALREADY_ANSWERED)
         return _persist_bound_gate(
             store,
             job_id=job_id,
@@ -738,7 +749,7 @@ def apply_already_answered(
             return None
         decided = decide_already_answered(store, goal, cwd)
         prior_job_id = decided.evidence[0] if decided.evidence else ""
-        bound = _bind_applied(decided)
+        bound = _bind_applied(decided, edge=EDGE_ALREADY_ANSWERED)
         if not bound.acted:
             return None
         if not prior_job_id:

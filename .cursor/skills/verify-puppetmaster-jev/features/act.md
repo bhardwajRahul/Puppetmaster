@@ -1,28 +1,29 @@
 # ACT experiment skips
 
-`PUPPETMASTER_JEV_ACT=1` restores skip / demote / reuse / stop. This
-can be worse than today. It is not the ship default.
+`PUPPETMASTER_JEV_ACT=1` lets V2–V4 reuse / demote / stop. That
+cancels work the kernel does not currently put to a model. It is
+not the ship default.
 
 ## Sub-features
 
-- `act-v1` skips a compatible-pair auditor.
 - `act-v2` returns a prior job handle instead of launching.
 - `act-v3` refuses gist admission on a plumbing FINDING.
 - `act-v4` drops `enqueue_subtasks`.
 
+V1 already acts on opt-in alone.
+
 ## How to get to it (user POV)
 
-Do not. Tonight's opt-in testing stays observe-only.
+Do not set this on a real swarm.
 
 ## Driving it with unittest
 
 ```bash
-python -m unittest tests.test_jev_transition.ConflictAuditorGateTests.test_act_compatible_low_noul_skips_auditor -v
+python -m unittest tests.test_jev_transition.AlreadyAnsweredTests.test_act_high_noul_reuses_prior_and_writes_handle_gate -v
 ```
 
-Proof: auditor `SKIPPED` and GATE `acted=true` only when ACT is set.
+Proof: reuse / demote / stop only when ACT is set.
 
 ## Gotchas
 
-Never set ACT on a real user swarm. Forced high noul plus ACT swallows
-a new goal.
+Forced high already-answered noul plus ACT can swallow a new goal.

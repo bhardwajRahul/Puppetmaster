@@ -227,8 +227,8 @@ def _run(*, act: bool) -> dict:
             "v4_acted": None
             if v4_gate is None
             else bool((v4_gate.payload or {}).get("acted")),
-            "stitch_has_jev_observe": "## Jev observe" in stitch,
-            "unset_like_has_jev_observe": "## Jev observe" in unset_like,
+            "stitch_has_jev": "## Jev" in stitch,
+            "unset_like_has_jev": "## Jev" in unset_like,
             "observe_lines": render_transition_section(store.list_artifacts(job.id)),
         }
 
@@ -236,41 +236,39 @@ def _run(*, act: bool) -> dict:
 def main() -> int:
     observe = _run(act=False)
     act = _run(act=True)
-    today = {
-        "v1_auditor": "queued",
-        "v2_reused": False,
-        "v3_gist": True,
-        "v4_followups": 1,
-    }
-    observe_matches_today = (
-        observe["v1_auditor"] == today["v1_auditor"]
-        and observe["v2_reused"] is False
+    v1_acts_on_opt_in = (
+        observe["v1_auditor"] == "skipped"
+        and observe["v1_would"] == "skip"
+        and observe["v1_acted"] is True
+        and observe["stitch_has_jev"] is True
+    )
+    v234_match_today = (
+        observe["v2_reused"] is False
         and observe["v3_gist"] is True
         and observe["v4_followups"] == 1
         and observe["v2_prior_gates"] == 0
         and observe["v2_launched_gates"] == 1
-        and observe["v1_would"] == "skip"
         and observe["v2_would"] == "skip"
         and observe["v3_would"] == "skip"
         and observe["v4_would"] == "skip"
-        and not observe["v1_acted"]
         and not observe["v2_acted"]
         and observe["v3_acted"] is False
         and observe["v4_acted"] is False
-        and observe["stitch_has_jev_observe"] is True
-        and observe["unset_like_has_jev_observe"] is False
+        and observe["unset_like_has_jev"] is False
     )
     body = {
         "observe": observe,
         "act": act,
-        "observe_matches_today": observe_matches_today,
+        "v1_acts_on_opt_in": v1_acts_on_opt_in,
+        "v234_match_today": v234_match_today,
         "would_skip_recorded": (
             observe["v1_would"] == "skip"
             and observe["v2_would"] == "skip"
             and observe["v3_would"] == "skip"
             and observe["v4_would"] == "skip"
         ),
-        "ok": observe_matches_today
+        "ok": v1_acts_on_opt_in
+        and v234_match_today
         and act["v1_auditor"] == "skipped"
         and act["v2_reused"] is True
         and act["v3_gist"] is False

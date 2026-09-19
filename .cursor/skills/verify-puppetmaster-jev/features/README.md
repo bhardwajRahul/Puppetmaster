@@ -1,7 +1,8 @@
 # Feature map
 
 Jev is an opt-in overlay on Puppetmaster analysis graph edges. Unset
-is today's kernel. Observe scores. ACT may skip.
+is today's kernel. Opt-in may skip the conflict-auditor. V2–V4
+score and stay observe unless ACT.
 
 ## Baseline
 
@@ -12,12 +13,14 @@ is today's kernel. Observe scores. ACT may skip.
 ## Proof
 
 - Unset: `urlopen` not called.
-- Observe: same graph actions as unset, plus `GATE` with `acted=false`.
-- ACT: documented experiment only. Do not drive it against a real swarm.
+- Opt-in: V1 may skip a compatible-pair auditor. V2–V4 match today
+  plus `GATE` with `acted=false`.
+- ACT: V2–V4 experiment only. Do not drive it against a real swarm.
 
 ## Features
 
 - [Unset stays today's kernel](./unset.md)
-- [Observe-only receipts](./observe.md)
+- [V1 acts on opt-in](./v1-on-opt-in.md)
+- [V2–V4 observe receipts](./observe.md)
 - [ACT experiment skips](./act.md)
 - [Launched-job V2 receipt](./v2-on-job.md)

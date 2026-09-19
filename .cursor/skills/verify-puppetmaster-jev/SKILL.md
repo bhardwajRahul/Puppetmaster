@@ -2,7 +2,7 @@
 name: verify-puppetmaster-jev
 description: >-
   Prove the Puppetmaster Jev transition oracle: unset never networks,
-  observe-only never changes the graph, ACT is required to skip.
+  opt-in may skip the conflict-auditor, V2–V4 stay observe unless ACT.
 disable-model-invocation: true
 ---
 
@@ -56,11 +56,10 @@ Mapped features: [features/README.md](features/README.md).
 A pass is:
 
 1. Helper JSON at `/tmp/verify-this/puppetmaster-jev/observe.json`
-2. `observe_matches_today=true`
-3. `would_skip_recorded=true` for V1 and V3 plumbing
-4. `acted=false` on every GATE
-5. Unittest exit 0
-6. `show` / stitcher preview contains `## Jev observe` only when a
+2. `v1_acts_on_opt_in=true` (auditor skipped without `JEV_ACT`)
+3. `v234_match_today=true` (launch / admit / enqueue unchanged)
+4. Unittest exit 0
+5. `show` / stitcher preview contains `## Jev` only when a
    `jev_transition` GATE exists
 
 Live Decisions are optional and only when the user named a key source.

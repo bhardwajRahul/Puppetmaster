@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Human-readable Jev observe receipts for stitch / show."""
+"""Human-readable Jev receipts for stitch / show."""
 
 from typing import Any, Iterable, List
 
@@ -65,7 +65,7 @@ def render_transition_section(artifacts: Iterable[Artifact]) -> List[str]:
     rows = transition_gates(artifacts)
     if not rows:
         return []
-    lines = ["", "## Jev observe"]
+    lines = ["", "## Jev"]
     seen = set()
     for artifact in rows:
         line = format_transition_line(artifact)

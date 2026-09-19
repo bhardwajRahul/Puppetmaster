@@ -34,7 +34,7 @@ class JevRenderTests(unittest.TestCase):
             max_noul=0.3,
         )
         lines = render_transition_section([gate])
-        self.assertEqual(lines[1], "## Jev observe")
+        self.assertEqual(lines[1], "## Jev")
         self.assertIn("would skip noul=0.30", lines[2])
         self.assertIn("ran", lines[2])
 
@@ -89,7 +89,7 @@ class JevRenderTests(unittest.TestCase):
                 )
             )
             text = Stitcher(store).preview(job.id)
-        self.assertIn("## Jev observe", text)
+        self.assertIn("## Jev", text)
         self.assertIn("finding-admission: would skip noul=0.46 — admitted", text)
         self.assertIn("## Findings", text)
         findings = text.split("## Findings")[1].split("## Conflicts")[0]

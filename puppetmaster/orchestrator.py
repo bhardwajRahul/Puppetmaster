@@ -2537,7 +2537,7 @@ class Orchestrator:
             return
 
     def _maybe_gate_conflict_auditor(self, job: Job) -> None:
-        """Apply the conflict-auditor edge. Observe-only unless JEV_ACT."""
+        """Apply the conflict-auditor edge. Opt-in may skip that model call."""
         try:
             from puppetmaster.jev.edges import apply_ready_conflict_auditor_gates
 
