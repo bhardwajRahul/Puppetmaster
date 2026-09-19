@@ -119,6 +119,19 @@ class WorkerRuntime:
         from puppetmaster.prerun import prerun_skip_reason
 
         skip_reason = prerun_skip_reason(task)
+        if not skip_reason and task.role == "conflict-auditor":
+            try:
+                from puppetmaster.jev.edges import apply_conflict_auditor_gate
+
+                jev_decision = apply_conflict_auditor_gate(
+                    self.store, task, worker_id=self.worker_id
+                )
+            except Exception:
+                jev_decision = None
+            if jev_decision is not None and getattr(
+                jev_decision, "acted", False
+            ):
+                skip_reason = "jev_transition:conflict_auditor"
         if skip_reason:
             skipped_run = AgentRun(
                 job_id=self.job_id,

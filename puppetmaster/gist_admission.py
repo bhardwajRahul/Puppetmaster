@@ -143,6 +143,8 @@ def is_admitted_for_shared_context(
 
     if is_coordination_protocol_payload(artifact):
         return False
+    if _payload(artifact).get("jev_injectable") is False:
+        return False
     if not is_cross_job_injectable(artifact, for_job_id=for_job_id):
         return False
     if not _freshness_allows_shared_context(artifact):
@@ -348,6 +350,13 @@ def maybe_admit_finding_as_gist(
     claim = str((finding.payload or {}).get("claim") or "").strip()
     if not claim:
         return None
+    try:
+        from puppetmaster.jev.edges import apply_finding_admission
+
+        if apply_finding_admission(store, finding) is False:
+            return None
+    except Exception:
+        pass
     evidence_digests: List[str] = []
     if finding.sha256:
         evidence_digests.append(str(finding.sha256))
