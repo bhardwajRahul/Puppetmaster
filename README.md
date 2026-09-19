@@ -111,7 +111,7 @@ Puppetmaster is a supervisor and job store for agent CLIs and provider adapters.
 
 ```text
 pilots (MCP):  Cursor Agent / Grok Bot / Claude Desktop / Pi / OMP
-workers:       cursor / claude-code / codex / hermes / antigravity / agentic
+workers:       cursor / claude-code / codex / hermes / antigravity / fx / agentic
                                 |
                                 v
       supervisor -> model router -> independent workers -> SQLite artifacts

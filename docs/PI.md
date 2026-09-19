@@ -24,7 +24,7 @@ puppetmaster doctor includes pi-pilot: ok when CLI + package + MCP are present; 
 4. Do not read worker transcripts
 5. gc / nuke the finished job. Do not keep a worker warm.
 
-Workers are cursor / claude-code / codex / hermes / antigravity / agentic — never pi.
+Workers are cursor / claude-code / codex / hermes / antigravity / fx / agentic — never pi.
 
 ## Uninstall
 

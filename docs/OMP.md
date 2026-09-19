@@ -24,7 +24,7 @@ Use `puppetmaster install-omp-mcp` or `setup --platforms omp` (alias: `ohmypi`).
 4. Do not read worker transcripts
 5. gc / nuke the finished job. Do not keep a worker warm.
 
-Workers are cursor / claude-code / codex / hermes / antigravity / agentic — never omp.
+Workers are cursor / claude-code / codex / hermes / antigravity / fx / agentic — never omp.
 
 ## Uninstall
 

@@ -423,12 +423,13 @@ report and ignore the diff — that's a supported mode, not a degraded one.
 
 ## Scope and honesty
 
-Six production CLI adapters plus the keys-only `agentic` standalone worker
+Seven production CLI adapters plus the keys-only `agentic` standalone worker
 ship today: `cursor` (Cursor SDK via `@cursor/sdk`), `claude-code`
 (Anthropic via the `claude` CLI), `openai` (direct Chat Completions via
 `OPENAI_API_KEY`, added in v0.6.1-beta.1), `codex` (official OpenAI Codex
 CLI via `codex exec --json`, added in v0.7.0), `hermes` (NousResearch
 Hermes CLI), `antigravity` (Google Antigravity `agy`, added in v1.22.16),
+`fx` (`fx ask --json`, added in v1.27.29; last implement pick),
 and `agentic` (direct provider HTTP APIs with your own key — no external
 CLI). Discover curated Gemini rows with
 `models discover --source antigravity` after `agy` is installed (`models
