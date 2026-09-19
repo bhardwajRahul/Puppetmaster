@@ -169,6 +169,48 @@ If it returns `failure=missing_cli`, install the CLI with `npm install -g @opena
 
 Like Claude Code, when Codex edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
+### `fx`
+
+Shells out to the [fx](https://fx.sh) CLI (`fx ask --json`). One JSON object on stdout carries billing-grade `usage.input_tokens` / `output_tokens`. The prompt goes on stdin, never argv.
+
+Requirements:
+
+- fx CLI on PATH (`FX_COMMAND` or `payload.executable` to override).
+- A configured fx model provider. There is no `--model` flag. `payload.model` is forwarded as `FX_MODEL`; the verification payload records the model fx reports as `model` and keeps the request in `model_requested`.
+
+Defaults for unattended runs: `--auto` (fx's own safety reviewer) and `--no-save`. `--full-access` is opt-in and never inferred from write capability.
+
+| `payload` key | effect |
+|---|---|
+| `permission_mode` | `auto` (default), `full-access`, or `ask` |
+| `full_access` | shorthand for `permission_mode="full-access"` |
+| `model` | forwarded as `FX_MODEL` |
+| `save_session` | keep the fx session instead of `--no-save` |
+| `resume_session_id` | continue an existing fx session (`--resume-id`) |
+| `system_prompt` | replace fx's built-in base prompt (`--system`) |
+| `max_worker_depth` | allow fx-inside-Puppetmaster-inside-fx (default `0`) |
+| `allow_mcp` | load the operator MCP profile (default off via `FX_DISABLE_MCP=1`) |
+
+`ask` has no read-only flag, so an analyze task is instructed read-only (`enforcement: "prompt-only"`) and stamped `write_capable=False`. Auto-pick never prefers fx: it is last in `IMPLEMENT_ADAPTER_PRIORITY`, and `adapter_is_available` is false unless the CLI is on PATH.
+
+Failure codes: `fx_unparseable_result`, `fx_exit_code`, `nested_fx_worker`, `missing_cli`.
+
+```json
+{
+  "role": "fx-implement",
+  "instruction": "Implement the requested change and run the relevant tests.",
+  "adapter": "fx",
+  "payload": {
+    "prompt": "Implement the change and run the relevant tests.",
+    "cwd": ".",
+    "permission_mode": "auto",
+    "timeout_seconds": 900
+  }
+}
+```
+
+When fx edits or creates files, Puppetmaster records a `patch` artifact alongside the verification artifact, including untracked files added by the worker.
+
 ### `hermes`
 
 Shells out to the NousResearch [Hermes](https://hermes-agent.nousresearch.com) CLI (`hermes chat`) — a personal AI agent with its own terminal, browser, memory, and skills. The adapter runs Hermes headlessly (`-q`/`--quiet`/`--cli`) as either an **analyze** worker (read-only findings) or a **full-edit** worker (`payload.mode="implement"`), mirroring the Claude Code / Codex subprocess, git-snapshot, sidecar-spool, and PATCH-attribution semantics.

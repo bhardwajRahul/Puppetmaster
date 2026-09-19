@@ -53,6 +53,7 @@ REQUIRED_ADAPTERS = frozenset(
         "codex",
         "hermes",
         "antigravity",
+        "fx",
         "agentic",
         "shell",
     }
@@ -124,6 +125,7 @@ class AdapterInventoryGuards(unittest.TestCase):
             "codex",
             "hermes",
             "antigravity",
+            "fx",
             "agentic",
         ):
             self.assertIn(name, known)

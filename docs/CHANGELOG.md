@@ -1,3 +1,17 @@
+## v1.27.29 — 2026-09-18
+
+**Optional fx CLI worker (`fx ask --json`).**
+
+- New `fx` adapter: prompt on stdin, usage parsed from one JSON object,
+  `--auto` default, no invented model. Analyze is `write_capable=False`
+  and `enforcement: "prompt-only"` because `ask` has no sandbox flag.
+- MCP is off (`FX_DISABLE_MCP=1`) unless `payload.allow_mcp`. Nesting
+  fails closed at `max_worker_depth` 0 (`nested_fx_worker`).
+- Last in implement priority. `adapter_is_available` and `doctor` only
+  treat fx as runnable when the CLI is on PATH (`FX_COMMAND` override).
+  Unspecified implement never prefers it over cursor / claude / codex /
+  hermes / antigravity / agentic.
+
 ## v1.27.28 — 2026-09-18
 
 **Opt-in Jev can skip a redundant conflict-auditor.**

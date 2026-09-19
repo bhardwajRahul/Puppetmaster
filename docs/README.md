@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.27.28](CHANGELOG.md#v12728--2026-09-18) — Opt-in Jev can skip a redundant conflict-auditor. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.29](CHANGELOG.md#v12729--2026-09-18) — Optional fx CLI worker (`fx ask --json`). See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 
@@ -41,7 +41,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md) | #88 inventory: confidence vs execution/grounding/claim-support/criterion status |
 | [CELL.md](CELL.md) | Named cells: inspectable sqlite, serial inbox, hibernate/alarm (celld slice) |
 | [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, the starter tiers |
-| [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, antigravity, agentic) + shell + how to add a new one |
+| [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, antigravity, fx, agentic) + shell + how to add a new one |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
 | [GROK_BOT.md](GROK_BOT.md) | Grok Bot as remote MCP pilot (streamable HTTP; supervise-first; not a worker adapter) |

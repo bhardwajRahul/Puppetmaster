@@ -133,7 +133,8 @@ def normalize_role_specs(roles: Optional[list[object]], goal: str) -> tuple[list
 
 # Shared by DEFAULT_WORKERS and write_generated_swarm_config so analysis
 # swarms keep read-only intent when auto_route lands on an edit-capable
-# adapter (claude-code → permission_mode=plan; codex → sandbox read-only).
+# adapter (claude-code → permission_mode=plan; codex → sandbox read-only;
+# antigravity → mode=plan; fx → write_capable=False + prompt-only).
 # Without these, a Claude-only lock routing the "implement" *planning*
 # role to claude-code incorrectly takes acceptEdits and trips worktree
 # / dirty-tree guards.
@@ -485,6 +486,8 @@ IMPLEMENT_ADAPTER_PRIORITY = (
     "hermes",
     "antigravity",
     "agentic",
+    # Newest full-edit CLI. Last so an unspecified implement never prefers it.
+    "fx",
 )
 
 # Platforms that can run a read-only analysis worker. This is deliberately a
@@ -496,6 +499,7 @@ REVIEW_ADAPTERS = (
     "cursor",
     "claude-code",
     "codex",
+    "fx",
     "openai",
     "hermes",
     "antigravity",
@@ -599,7 +603,8 @@ def adapter_is_available(
 
     * ``local``/``shell`` run no provider, so they're always available.
     * ``cursor`` needs both ``CURSOR_API_KEY`` and the @cursor/sdk runner.
-    * ``claude-code`` / ``codex`` / ``hermes`` need their CLI resolvable.
+    * ``claude-code`` / ``codex`` / ``hermes`` / ``fx`` / ``antigravity``
+      need their CLI resolvable.
     * ``openai`` needs ``OPENAI_API_KEY``.
     """
     env = env if env is not None else os.environ
@@ -618,6 +623,8 @@ def adapter_is_available(
         return diagnostics._codex_cli_installed()
     if name == "hermes":
         return diagnostics._hermes_cli_installed()
+    if name == "fx":
+        return diagnostics._fx_cli_installed()
     if name == "antigravity":
         return diagnostics._antigravity_installed()
     if name == "openai":

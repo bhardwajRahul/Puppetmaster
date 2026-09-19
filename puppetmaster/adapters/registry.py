@@ -10,6 +10,7 @@ from .antigravity import AntigravityAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .cursor import CursorAdapter
+from .fx import FxAdapter
 from .hermes import HermesAdapter
 from .local import LocalAdapter, ShellAdapter
 from .openai import OpenAIAdapter
@@ -22,6 +23,7 @@ ADAPTERS: dict[str, WorkerAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
     "openai": OpenAIAdapter(),
     "codex": CodexAdapter(),
+    "fx": FxAdapter(),
     "hermes": HermesAdapter(),
     "antigravity": AntigravityAdapter(),
     "agy": AntigravityAdapter(),
@@ -86,6 +88,20 @@ ADAPTER_INFO = [
         requires=[
             "codex CLI (`npm install -g @openai/codex`)",
             "OPENAI_API_KEY or `codex login`",
+        ],
+    ),
+    AdapterInfo(
+        name="fx",
+        status="optional",
+        description=(
+            "Runs the fx CLI (`fx ask --json`) non-interactively. Usage is "
+            "parsed from one JSON object (`input_tokens` / `output_tokens`), "
+            "not estimated. MCP is off unless payload.allow_mcp is true. A "
+            "depth guard fails closed on fx-inside-Puppetmaster-inside-fx."
+        ),
+        requires=[
+            "fx CLI on PATH (`FX_COMMAND` or payload.executable to override)",
+            "fx model provider configured (fx login / FX_MODEL)",
         ],
     ),
     AdapterInfo(
