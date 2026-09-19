@@ -1,3 +1,20 @@
+## v1.27.30 — 2026-09-19
+
+**Public budget caps no longer create doomed jobs.**
+
+- CLI/MCP launches that set `budget_max_tokens_*`, `budget_max_usd`, or
+  `budget_max_elapsed_seconds` now require a bounded per-invocation
+  allowance before the job is created. The error names the cap, adapter,
+  and how to fix it.
+- Elapsed allowance is derived from `--timeout-seconds` /
+  `payload.timeout_seconds` (capped at the job limit). Output tokens
+  derive from `max_output_tokens` / `max_tokens`. Plan billing may
+  supply zero marginal USD. Input-token and API USD caps still need an
+  explicit `payload.budget_allowance`.
+- Unknown post-dispatch liability and `pending_reconciliation` still
+  block later capped admission. Unknown is never treated as zero.
+- Fixes #226 (reported by @kbentonferguson).
+
 ## v1.27.29 — 2026-09-18
 
 **Optional fx CLI worker (`fx ask --json`).**

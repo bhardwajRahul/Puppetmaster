@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.27.29](CHANGELOG.md#v12729--2026-09-18) — Optional fx CLI worker (`fx ask --json`). See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.30](CHANGELOG.md#v12730--2026-09-19) — Public budget caps no longer create doomed jobs. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 

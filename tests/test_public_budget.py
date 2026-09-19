@@ -19,10 +19,27 @@ from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.store import SwarmStore
 from puppetmaster.swarm_launch import detach_analysis_swarm
+from puppetmaster.workers import WorkerSpec
 
 
 POLICY = BudgetPolicy(0.25, 10000, 2000, 2, 60.5)
 INPUTS = {'budget_' + key: value for key, value in asdict(POLICY).items()}
+POLICY_PAYLOAD = {
+    'timeout_seconds': 60,
+    'max_output_tokens': 2000,
+    'billing': 'plan',
+    'budget_allowance': {
+        'billing': 'plan',
+        'cost_state': 'known',
+        'plan_marginal_usd': 0,
+        'tokens_in': 10000,
+        'tokens_out': 2000,
+        'elapsed_seconds': 60.5,
+    },
+}
+POLICY_SPECS = [WorkerSpec(
+    role='explore', instruction='test', adapter='local', payload=dict(POLICY_PAYLOAD),
+)]
 
 
 from puppetmaster.identity import make_ref
@@ -116,15 +133,17 @@ class PublicBudgetTests(unittest.TestCase):
                     config = Path(root) / 'workflow.json'
                     config.write_text(json.dumps({'workers': [
                         {'role': 'explore', 'instruction': 'test', 'adapter': 'local',
-                         'payload': {'max_cost_usd': 9}}
+                         'payload': dict(POLICY_PAYLOAD, max_cost_usd=9)}
                     ]}))
                     suffix = ['--config', str(config)] if configured else []
                     with patch.dict('os.environ', {'PUPPETMASTER_WORKER': '0',
                                                   'PUPPETMASTER_LAUNCH_KEY': ''}):
                         for source_policy in (POLICY, BudgetPolicy(max_attempts=0), None):
+                            source_kwargs = {'budget_policy': source_policy, 'on_job_created': stop}
+                            if source_policy == POLICY:
+                                source_kwargs['specs'] = POLICY_SPECS
                             with self.assertRaises(InterruptedError) as source:
-                                original_run(Orchestrator(store), 'test', budget_policy=source_policy,
-                                             on_job_created=stop)
+                                original_run(Orchestrator(store), 'test', **source_kwargs)
                             source_id = str(source.exception)
                             # Exercise dispatch and real durable creation, stopping before workers.
                             def capture(instance, *args, **kwargs):
@@ -133,6 +152,8 @@ class PublicBudgetTests(unittest.TestCase):
                                 Orchestrator, 'run', autospec=True, side_effect=capture
                             ):
                                 command = ['rerun', source_id, *suffix]
+                                if source_policy == POLICY and not configured:
+                                    command.extend(['--config', str(config)])
                                 with self.assertRaises(InterruptedError) as rerun:
                                     _main(command)
                                 reopened = store_type(Path(root))
@@ -147,9 +168,12 @@ class PublicBudgetTests(unittest.TestCase):
                                         with self.assertRaisesRegex(ValueError, 'preserves the source budget'):
                                             _main([*command, '--budget-' + field.replace('_', '-'), '99999'])
                                 if source_policy is None:
-                                    with self.assertRaises(InterruptedError) as explicit:
-                                        _main([*command, *budget_cli_flags(POLICY)])
-                                    self.assertEqual(store.get_job(str(explicit.exception)).budget_policy, POLICY)
+                                    explicit = [*command, *budget_cli_flags(POLICY)]
+                                    if not configured:
+                                        explicit.extend(['--config', str(config)])
+                                    with self.assertRaises(InterruptedError) as launched:
+                                        _main(explicit)
+                                    self.assertEqual(store.get_job(str(launched.exception)).budget_policy, POLICY)
                                 # A launch-key replay stays idempotent; conflicting persisted policy fails closed.
                                 with patch.dict('os.environ', {'PUPPETMASTER_LAUNCH_KEY': 'rerun-' + source_id}):
                                     with self.assertRaises(InterruptedError) as keyed:
@@ -160,9 +184,14 @@ class PublicBudgetTests(unittest.TestCase):
                                     if source_policy is None:
                                         with self.assertRaises(ValueError):
                                             _main([*command, *budget_cli_flags(POLICY)])
+                                    conflict_kwargs = {
+                                        'budget_policy': (
+                                            None if source_policy is not None else POLICY),
+                                    }
+                                    if source_policy is None:
+                                        conflict_kwargs['specs'] = POLICY_SPECS
                                     with self.assertRaises(ValueError):
-                                        original_run(Orchestrator(store), 'test', budget_policy=(
-                                            None if source_policy is not None else POLICY))
+                                        original_run(Orchestrator(store), 'test', **conflict_kwargs)
                                     self.assertEqual(store.get_job(str(keyed.exception)).budget_policy, source_policy)
 
     def test_mcp_handlers_propagate_policy(self):
@@ -207,15 +236,16 @@ class PublicBudgetTests(unittest.TestCase):
                     raise InterruptedError(job.id)
                 orchestrator = Orchestrator(store)
                 with self.assertRaises(InterruptedError) as caught:
-                    orchestrator.run('test', launch_key='public-budget', budget_policy=POLICY,
-                                     on_job_created=stop)
+                    orchestrator.run('test', specs=POLICY_SPECS, launch_key='public-budget',
+                                     budget_policy=POLICY, on_job_created=stop)
                 job_id = str(caught.exception)
                 reopened = store_type(Path(root))
                 self.assertEqual(reopened.get_job(job_id).budget_policy, POLICY)
                 self.assertEqual(reopened.status_snapshot(job_id, compact=True)['job']['budget_policy'], asdict(POLICY))
                 self.assertEqual(read_job_state(reopened, job_id)['budget_policy'], asdict(POLICY))
                 self.assertEqual(build_job_snapshot(reopened, job_id)['budget']['policy'], asdict(POLICY))
-                replay = Orchestrator(reopened).run('test', launch_key='public-budget', budget_policy=POLICY)
+                replay = Orchestrator(reopened).run(
+                    'test', specs=POLICY_SPECS, launch_key='public-budget', budget_policy=POLICY)
                 self.assertEqual(replay.job.id, job_id)
                 for other in (None, BudgetPolicy(max_attempts=3)):
                     with self.assertRaises(ValueError):
