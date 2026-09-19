@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from puppetmaster.budget import BudgetPolicy
+from puppetmaster.budget import BudgetPolicy, stamp_payload_budget_allowance
 from puppetmaster.hermes_spawn_tree import emit_spawn_tree
 from puppetmaster.liveness import record_orchestrator_heartbeat
 from puppetmaster.models import (
@@ -388,6 +388,16 @@ class Orchestrator:
         if session_id is None:
             session_id = os.environ.get("PUPPETMASTER_JOB_SESSION_ID")
         launch_specs = specs or specs_for_roles(roles)
+        if budget_policy is not None:
+            launch_specs = [
+                replace(
+                    spec,
+                    payload=stamp_payload_budget_allowance(
+                        budget_policy, spec.payload, adapter=spec.adapter,
+                    ),
+                )
+                for spec in launch_specs
+            ]
         output_limit = os.environ.get("PUPPETMASTER_MAX_OUTPUT_BYTES")
         if output_limit:
             try:

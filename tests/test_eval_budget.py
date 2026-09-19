@@ -92,7 +92,7 @@ class EvalBudgetTests(unittest.TestCase):
 
     def test_real_job_persistence_and_admission_are_independent_per_case(self):
         original_run = Orchestrator.run
-        for policy in [POLICY, None]:
+        for policy in [BudgetPolicy(max_attempts=1), None]:
             jobs = []
             class Captured(Exception):
                 pass
