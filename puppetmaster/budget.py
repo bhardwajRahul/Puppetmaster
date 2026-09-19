@@ -137,6 +137,92 @@ BUDGET_FIELDS = {
 }
 
 
+_PUBLIC_CAP_NAMES = {
+    "max_usd": "budget_max_usd",
+    "max_tokens_in": "budget_max_tokens_in",
+    "max_tokens_out": "budget_max_tokens_out",
+    "max_elapsed_seconds": "budget_max_elapsed_seconds",
+}
+
+_CAP_REMEDIATION = {
+    "budget_max_usd": (
+        "set payload.billing=plan or payload.budget_allowance "
+        "api_usd/plan_marginal_usd"
+    ),
+    "budget_max_tokens_in": "set payload.budget_allowance.tokens_in",
+    "budget_max_tokens_out": (
+        "set payload.max_output_tokens or payload.budget_allowance.tokens_out"
+    ),
+    "budget_max_elapsed_seconds": (
+        "set --timeout-seconds or payload.timeout_seconds"
+    ),
+}
+
+
+def stamp_payload_budget_allowance(policy, payload, *, adapter):
+    """Derive a conservative per-invocation allowance or refuse the launch.
+
+    Public job caps are fail-closed. Unknown is never treated as zero. Elapsed
+    and output-token bounds come only from an enforceable timeout or provider
+    output limit. Attempt caps need no allowance.
+    """
+    payload = dict(payload or {})
+    if policy is None:
+        return payload
+    values = dict(payload.get("budget_allowance") or {})
+    values.setdefault("billing", values.get("billing") or payload.get("billing") or "unknown")
+    if values["billing"] == "plan":
+        values.setdefault("plan_marginal_usd", 0)
+        values.setdefault("cost_state", "known")
+    if values.get("elapsed_seconds") is None:
+        timeout = payload.get("timeout_seconds")
+        if timeout is None:
+            timeout = payload.get("max_timeout_seconds")
+        if timeout is not None:
+            bound = float(timeout)
+            if policy.max_elapsed_seconds is not None:
+                bound = min(bound, float(policy.max_elapsed_seconds))
+            values["elapsed_seconds"] = bound
+    if values.get("tokens_out") is None:
+        for key in ("max_output_tokens", "max_tokens"):
+            raw = payload.get(key)
+            if raw is not None:
+                bound = int(raw)
+                if policy.max_tokens_out is not None:
+                    bound = min(bound, int(policy.max_tokens_out))
+                values["tokens_out"] = bound
+                break
+    try:
+        allowance = BudgetLiability(**values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "payload.budget_allowance is invalid for adapter %s: %s" % (adapter, exc)
+        ) from exc
+    missing = []
+    if policy.max_usd is not None and allowance.marginal_usd is None:
+        missing.append("budget_max_usd")
+    if policy.max_tokens_in is not None and allowance.tokens_in is None:
+        missing.append("budget_max_tokens_in")
+    if policy.max_tokens_out is not None and allowance.tokens_out is None:
+        missing.append("budget_max_tokens_out")
+    if policy.max_elapsed_seconds is not None and allowance.elapsed_seconds is None:
+        missing.append("budget_max_elapsed_seconds")
+    if missing:
+        named = ", ".join(missing)
+        tips = "; ".join(_CAP_REMEDIATION[name] for name in missing)
+        raise ValueError(
+            "%s unsupported for adapter %s: no bounded per-invocation "
+            "allowance. %s. Or use budget_max_attempts." % (named, adapter, tips)
+        )
+    if any(getattr(policy, field) is not None for field in _PUBLIC_CAP_NAMES):
+        payload["budget_allowance"] = {
+            key: value for key, value in asdict(allowance).items() if value is not None
+        }
+        if allowance.billing != "unknown":
+            payload.setdefault("billing", allowance.billing)
+    return payload
+
+
 def budget_policy_from_inputs(values: Mapping[str, object]) -> Optional[BudgetPolicy]:
     """Validate public job-total inputs; omission preserves legacy launches.
 

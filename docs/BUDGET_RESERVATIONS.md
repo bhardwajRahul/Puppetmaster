@@ -157,17 +157,23 @@ It does not set a cumulative job budget. For example, this MCP request sets both
   "adapter": "codex",
   "launch_key": "budget-review-canary-001",
   "max_cost_usd": 0.10,
-  "budget_max_usd": 0.25,
-  "budget_max_tokens_in": 20000,
-  "budget_max_tokens_out": 2000,
+  "timeout_seconds": 120,
   "budget_max_attempts": 1,
   "budget_max_elapsed_seconds": 120
 }
 ```
 
-Pass this to `puppetmaster_start_swarm`. Admission may block before dispatch when
-the adapter cannot supply a bounded allowance for a capped metric. This is
-expected fail-closed behavior, not permission to invent a price or usage value.
+Pass this to `puppetmaster_start_swarm`. A public CLI/MCP launch refuses to
+create a job when a requested cap has no bounded per-invocation allowance. The
+error names the cap, adapter, and remediation. Elapsed caps derive a
+conservative allowance from `timeout_seconds` / `--timeout-seconds` (capped at
+the job limit). Output-token caps derive from `max_output_tokens` /
+`max_tokens`. Plan billing may supply zero marginal USD. Input-token and API
+USD caps require an explicit `payload.budget_allowance`. Unknown liability is
+never treated as zero.
+
+`budget_max_attempts` needs no allowance and is the safe first canary. This is
+fail-closed, not permission to invent a price or usage value.
 
 For a first live Codex canary, use a read-only review and cap invocation count,
 which does not depend on provider pricing or token estimates:
@@ -180,13 +186,13 @@ python -m puppetmaster review \
   --label 'Codex budget canary'
 ```
 
-This command invokes a real provider; run it deliberately. To exercise all five
-limits on the same CLI surface, additionally pass `--budget-max-usd 0.25
---budget-max-tokens-in 20000 --budget-max-tokens-out 2000
---budget-max-elapsed-seconds 120` and use a new launch key. Inspect `status` (the
-job's `budget_policy`), `wait`/`await` JSON, or the dashboard job-detail JSON
-(`budget.policy`, `budget.totals`, and reservations). The persisted policy
-survives reopening either store backend.
+This command invokes a real provider; run it deliberately. Adding
+`--budget-max-elapsed-seconds 120` is valid because the command already sets
+`--timeout-seconds 120`. Adding `--budget-max-tokens-in` or API
+`--budget-max-usd` without `payload.budget_allowance` is rejected before the
+job exists. Inspect `status` (the job's `budget_policy`), `wait`/`await` JSON,
+or the dashboard job-detail JSON (`budget.policy`, `budget.totals`, and
+reservations). The persisted policy survives reopening either store backend.
 
 A budget gates subsequent admission; opaque provider overruns cannot guarantee
 an absolute billed ceiling. Final consumption can exceed the reservation, and
