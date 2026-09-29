@@ -416,35 +416,63 @@ def codegraph_ready(cwd: Union[Path, str, None]) -> bool:
     return codegraph_available() and codegraph_initialized(cwd)
 
 
+def _index_root(cwd_key: str) -> Optional[Path]:
+    """Nearest directory at or above ``cwd_key`` holding an initialized index."""
+    current = Path(cwd_key) if cwd_key else Path.cwd()
+    for candidate in (current, *current.parents):
+        if (candidate / ".codegraph" / "codegraph.db").is_file():
+            return candidate
+    return None
+
+
 @lru_cache(maxsize=32)
 def _codegraph_context_cached(
     task: str,
     cwd_key: str,
     max_nodes: int,
     timeout_seconds: int,
+    index_signature: tuple = (),
 ) -> Optional[str]:
-    """Memoized CodeGraph CLI context lookup (cwd normalized to str)."""
+    """Memoized CodeGraph context lookup.
+
+    Keyed on the index signature as well, so a re-index is never answered from
+    an older graph. ``explore`` runs through a warm per-workspace helper when
+    the install allows it (same ToolHandler call, identical output); the CLI
+    is the fallback for everything else.
+    """
     started = time.monotonic()
     context_args = _modernize_cli_args(
         ["context", task, "--max-nodes", str(max_nodes), "--format", "markdown"]
     )
-    try:
-        completed = subprocess.run(
-            resolve_codegraph_invocation() + context_args,
-            cwd=cwd_key or None,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    output = (completed.stdout or "").strip()
+    invocation = resolve_codegraph_invocation()
+    output = None
+    if context_args[0] == "explore":
+        from puppetmaster import codegraph_warm
+
+        max_files = int(context_args[context_args.index("--max-files") + 1]) if "--max-files" in context_args else 0
+        try:
+            output = codegraph_warm.explore(invocation, cwd_key, context_args[1], max_files,
+                                            float(timeout_seconds)).strip()
+        except codegraph_warm.Unavailable:
+            output = None
+    if output is None:
+        try:
+            completed = subprocess.run(
+                invocation + context_args,
+                cwd=cwd_key or None,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        output = (completed.stdout or "").strip()
     if not output:
         return None
     output = output[:MAX_CONTEXT_CHARS]
@@ -479,7 +507,24 @@ def codegraph_context(
         cwd_key = str(Path(cwd).resolve()) if cwd is not None else ""
     except Exception:
         cwd_key = str(cwd or "")
-    return _codegraph_context_cached(task, cwd_key, int(max_nodes), int(timeout_seconds))
+    root = _index_root(cwd_key)
+    from puppetmaster.codegraph_warm import index_signature
+
+    signature = index_signature(root) if root is not None else ()
+    return _codegraph_context_cached(task, cwd_key, int(max_nodes), int(timeout_seconds), signature)
+
+
+def prewarm_codegraph_context(cwd: Union[Path, str, None]) -> bool:
+    """Start the warm explore helper for ``cwd`` so the first turn does not pay it."""
+    if not codegraph_ready(cwd):
+        return False
+    try:
+        from puppetmaster import codegraph_warm
+
+        cwd_key = str(Path(cwd).resolve()) if cwd is not None else ""
+        return codegraph_warm.prewarm(resolve_codegraph_invocation(), cwd_key)
+    except Exception:
+        return False
 
 
 def puppetmaster_source_root() -> str:
