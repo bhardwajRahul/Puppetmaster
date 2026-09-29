@@ -1,3 +1,23 @@
+## v1.27.31 — 2026-09-29
+
+**Long-lived hosts stop accumulating helpers, and dashboard polls stop writing.**
+
+- Readonly helpers whose store was garbage-collected are reaped: opening a
+  read connection first closes at most one idle retired helper (50 ms
+  bound, before any read budget). Hosts that build a store per request
+  (MCP server, dashboard, Marionette bridge) no longer keep one helper
+  interpreter per collected store until exit.
+- Ownership scans close their helper through the cleanup registry, so no
+  owner entry is left behind per `job_id` resolution.
+- Dashboard requests open stores in attach mode instead of running
+  `ensure_schema` (writer lock + DDL) on every 1.5 s poll; a new project
+  with no schema falls back once. Job snapshots derive the frontier from
+  data already loaded instead of `status_snapshot` (which could promote
+  blocked tasks), and read budgets through a lock-free `budget_view`.
+- `/api/jobs` orders and limits in SQL instead of decoding every job.
+- The dashboard page pauses polling while hidden and polls settled jobs
+  every 15 s.
+
 ## v1.27.30 — 2026-09-19
 
 **Public budget caps no longer create doomed jobs.**
