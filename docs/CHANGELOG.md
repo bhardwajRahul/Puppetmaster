@@ -17,9 +17,11 @@
 - Agentic worker provider calls (`_post_json` and streaming) reuse keep-alive
   connections instead of a new TCP + TLS handshake per request. Reuse only
   after a fully read response and a liveness check; requests are never resent.
-- Tests: the setup-wizard tests now stub the installers where `setup` calls
-  them; before, a machine with the `claude` CLI re-registered the real
-  Puppetmaster MCP server to the test interpreter.
+- `setup` runs its Claude Code step through the same `puppetmaster.cli` seam
+  as the Cursor and Codex steps. The Claude step bypassed it, so the
+  setup-wizard tests' stubs never applied and, on a machine with the `claude`
+  CLI, the suite re-registered the real Puppetmaster MCP server to the test
+  interpreter.
 
 ## v1.27.31 — 2026-09-29
 
