@@ -26462,12 +26462,12 @@ class SetupHooksStepTests(unittest.TestCase):
             cwd0 = Path.cwd()
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                with patch("puppetmaster.cli.commands_install.ensure_cursor_sdk", return_value=MagicMock(
                             status="unchanged", detail="stubbed: no real npm in tests")), \
-                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
-                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
-                        patch.object(cli, "install_claude_mcp", return_value=_Res()), \
-                        patch.object(cli, "resolve_claude_command", return_value="claude"), \
+                        patch("puppetmaster.cli.commands_install.install_cursor_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_claude_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.resolve_claude_command", return_value="claude"), \
                         patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters",
                               return_value={"cursor", "claude-code"}):
@@ -26489,10 +26489,10 @@ class SetupHooksStepTests(unittest.TestCase):
             cwd0 = Path.cwd()
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                with patch("puppetmaster.cli.commands_install.ensure_cursor_sdk", return_value=MagicMock(
                             status="unchanged", detail="stubbed: no real npm in tests")), \
-                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
-                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_cursor_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_codex_mcp", return_value=_Res()), \
                         patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}):
                     rc = cli._run_setup(self._args(skip_hooks=True))
@@ -26514,10 +26514,10 @@ class SetupHooksStepTests(unittest.TestCase):
             home = Path(home_tmp)
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                with patch("puppetmaster.cli.commands_install.ensure_cursor_sdk", return_value=MagicMock(
                             status="unchanged", detail="stubbed: no real npm in tests")), \
-                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
-                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_cursor_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_codex_mcp", return_value=_Res()), \
                         patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}), \
                         patch.object(hook_installers.Path, "home", return_value=home):
@@ -26550,10 +26550,10 @@ class SetupHooksStepTests(unittest.TestCase):
             cwd0 = Path.cwd()
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                with patch("puppetmaster.cli.commands_install.ensure_cursor_sdk", return_value=MagicMock(
                             status="unchanged", detail="stubbed: no real npm in tests")), \
-                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
-                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_cursor_mcp", return_value=_Res()), \
+                        patch("puppetmaster.cli.commands_install.install_codex_mcp", return_value=_Res()), \
                         patch.object(cli, "install_hermes_mcp", return_value=_Res()), \
                         patch.object(cli, "install_hermes_hooks", side_effect=fake_hermes_hooks), \
                         patch.object(cli, "_seed_hermes_registry"), \
