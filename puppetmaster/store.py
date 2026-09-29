@@ -3336,10 +3336,18 @@ class SwarmStore(StoreContracts):
     def budget_snapshot(self, job_id: str) -> dict[str, Any]:
         """Consistent reservation liability only; does not sum telemetry observations."""
         with self._budget_scope(job_id):
-            job = self.get_job(job_id)
-            records = self._budget_records(job_id)
-            return {"policy": asdict(job.budget_policy) if job.budget_policy else None,
-                    "totals": budget_totals(records), "reservations": records}
+            return self.budget_view(job_id)
+
+    def budget_view(self, job_id: str) -> dict[str, Any]:
+        """The same payload without the admission lock, for read-only viewers.
+
+        A dashboard poll must not take the writer lock the workers reserve
+        budget under; a point-in-time read is enough to display.
+        """
+        job = self.get_job(job_id)
+        records = self._budget_records(job_id)
+        return {"policy": asdict(job.budget_policy) if job.budget_policy else None,
+                "totals": budget_totals(records), "reservations": records}
 
     def record_attempt(self, attempt: ExecutionAttempt) -> bool:
         """Insert immutable launch facts; True if new, False on exact replay."""

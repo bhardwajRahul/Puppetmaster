@@ -617,9 +617,9 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
     adapters, primary_adapter = _adapters_from_tasks(tasks)
     cost_report = build_cost_report(store, job_id)
     token_usage = cost_report.get("token_usage") or {}
-    frontier = store.status_snapshot(job_id).get("frontier")
-    if frontier is None:
-        frontier = SwarmStore._frontier_signals(tasks, artifacts)
+    # status_snapshot would re-read everything and can promote blocked tasks;
+    # a viewer derives the frontier from what it already loaded.
+    frontier = SwarmStore._frontier_signals(tasks, artifacts)
 
     return {
         "job": {
@@ -637,7 +637,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         "reroutes": reroutes,
         "cost": cost_report,
         "attempt_consumption": build_attempt_consumption_report(store, job_id).to_dict(),
-        "budget": store.budget_snapshot(job_id),
+        "budget": store.budget_view(job_id),
         "alerts": collect_alerts(artifacts),
         "tokens_total": int(token_usage.get("total_tokens") or 0),
         "primary_model": _primary_model_from_routing(artifacts),
@@ -733,7 +733,6 @@ def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> 
     trace anywhere — no log line, no wire field, nothing.
     """
     from puppetmaster.state import list_project_state_dirs
-    from puppetmaster.store_factory import create_store
 
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -743,7 +742,7 @@ def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> 
             # create_store stays inside the try: SwarmStore.__init__ runs
             # ensure_state_dir, which can legitimately raise a per-project
             # OSError (unwritable or vanished directory).
-            store = create_store(backend, project_dir)
+            store = viewer_store(backend, project_dir)
             for job in store.list_jobs():
                 rows.append(
                     {
@@ -999,6 +998,23 @@ def state_dir_diagnosis_payload(
         return {"diagnosis": None}
 
 
+def viewer_store(backend: str, state_dir) -> SwarmStore:
+    """A read-only store for dashboard requests.
+
+    The default (deferred) mode runs ensure_schema on open, which takes the
+    SQLite writer lock and replays DDL: once per poll, per open tab,
+    contending with live workers. Only a store with no schema yet (a brand
+    new project) falls back to it, once.
+    """
+    from puppetmaster.sqlite_store import SqliteSchemaError
+    from puppetmaster.store_factory import create_store
+
+    try:
+        return create_store(backend, state_dir, mode="attach")
+    except SqliteSchemaError:
+        return create_store(backend, state_dir)
+
+
 def make_handler(
     store_factory: Callable[[], SwarmStore],
     *,
@@ -1111,9 +1127,8 @@ def make_handler(
                     try:
                         if all_projects:
                             from puppetmaster.state import find_state_dir_for_job
-                            from puppetmaster.store_factory import create_store as _cs
                             found = find_state_dir_for_job(job_id)
-                            store = _cs(backend, found) if found else store_factory()
+                            store = viewer_store(backend, found) if found else store_factory()
                         else:
                             store = store_factory()
                         self._json(200, build_job_snapshot(store, job_id))
@@ -1751,8 +1766,6 @@ def serve(
     (which may differ from the requested one) should use ``on_bound`` rather
     than assuming it equals ``port``.
     """
-    from puppetmaster.store_factory import create_store
-
     allow_external = allow_external or os.environ.get(
         "PUPPETMASTER_DASHBOARD_ALLOW_EXTERNAL", ""
     ).strip() not in ("", "0", "false", "False")
@@ -1769,7 +1782,7 @@ def serve(
     def store_factory() -> SwarmStore:
         # Fresh store per request keeps SQLite connections thread-local and
         # avoids cross-thread cursor reuse under the threading server.
-        return create_store(backend, resolved)
+        return viewer_store(backend, resolved)
 
     handler = make_handler(
         store_factory, all_projects=all_projects, backend=backend, state_dir=resolved
