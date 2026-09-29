@@ -92,6 +92,15 @@ class CleanupRegistry:
     def maintain(self, limit=8, deadline=None):
         self._close_tokens(self._collect(lambda owner: owner.retired, limit), deadline)
 
+    def reap_idle(self, limit=1, deadline=None):
+        """Close helpers whose store was collected and which hold no permit.
+
+        Nothing else reaps them before exit, so a long-lived host that builds
+        a store per request kept one idle helper interpreter per store.
+        """
+        self._close_tokens(self._collect(lambda owner: owner.retired and owner.permit is None, limit),
+                           deadline)
+
     def recover(self, identity, deadline):
         tokens = self._collect(lambda owner: owner.retired and owner.permit is not None
                                and owner.identity == identity, 8)

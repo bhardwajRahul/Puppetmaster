@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.27.30](CHANGELOG.md#v12730--2026-09-19) — Public budget caps no longer create doomed jobs. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.31](CHANGELOG.md#v12731--2026-09-29) — Long-lived hosts stop accumulating helpers, and dashboard polls stop writing. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 

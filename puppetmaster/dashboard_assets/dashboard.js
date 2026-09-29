@@ -442,5 +442,18 @@ document.addEventListener("keydown", event => {
 document.getElementById("refresh").addEventListener("click", tick);
 window.addEventListener("resize", () => { if (activeView === "job" && activeTab === "overview") requestAnimationFrame(drawGraphEdges); });
 
+// Every poll rebuilds the job from the store server-side. A hidden tab (or a
+// collapsed embed) has nobody to show it to, and a finished job cannot change.
+const SETTLED_JOB = new Set(["complete", "failed", "cancelled"]);
+let lastTickAt = 0;
+function pollTick() {
+  if (document.hidden) return;
+  const settled = activeView === "job" && SETTLED_JOB.has(latestJob?.job?.status);
+  if (settled && Date.now() - lastTickAt < 15000) return;
+  lastTickAt = Date.now();
+  tick();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { lastTickAt = 0; pollTick(); } });
+
 Promise.allSettled([loadMeta(), loadDiagnostics()]).then(tick);
-window.setInterval(tick, 1500);
+window.setInterval(pollTick, 1500);
