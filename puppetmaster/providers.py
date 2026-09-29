@@ -42,6 +42,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
+from puppetmaster import http_pool
 from puppetmaster.failure import (
     NETWORK_ERROR,
     OPENAI_SERVER_ERROR,
@@ -681,7 +682,7 @@ def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
     )
     try:
         check_external_dispatch()
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with http_pool.urlopen(request, timeout=timeout) as response:
             _harvest_response_headers(getattr(response, "headers", None), http_status=200)
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
@@ -1172,7 +1173,7 @@ def _open_stream(url: str, *, headers: dict, body: dict, timeout: int):
     )
     try:
         check_external_dispatch()
-        response = urllib.request.urlopen(request, timeout=timeout)
+        response = http_pool.urlopen(request, timeout=timeout)
         _harvest_response_headers(getattr(response, "headers", None), http_status=200)
         return response
     except urllib.error.HTTPError as exc:
