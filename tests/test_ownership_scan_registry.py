@@ -11,8 +11,11 @@ class OwnershipScanRegistryTests(unittest.TestCase):
     def test_scan_does_not_grow_the_owner_registry(self):
         with TemporaryDirectory() as root:
             SQLiteSwarmStore(root).ensure_schema()
+            before = set(readonly._cleanup.owners)
             _owning_state_dirs([root], 'job_000000000000')
-            stale = [o for o in readonly._cleanup.owners.values() if o.transport.closed]
+            # Other tests may leave their own entries; only this scan's count.
+            stale = [o for t, o in readonly._cleanup.owners.items()
+                     if t not in before and o.transport.closed]
             self.assertEqual(stale, [])
 
 
