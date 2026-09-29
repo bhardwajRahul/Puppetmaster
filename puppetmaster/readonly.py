@@ -316,6 +316,8 @@ class ReadConnection:
                  attach_deadline=None, ordinary_deadline=None, deadline=None, contention_window=None,
                  retry_deadline=None):
         self._pid = os.getpid()
+        # Before any read budget starts: a bounded sweep of one abandoned helper.
+        _cleanup.reap_idle(limit=1, deadline=time.monotonic() + 0.05)
         ordinary_window = .1 if reuse else 1.0
         self.store = store
         self.selected = selection(store)

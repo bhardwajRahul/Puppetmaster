@@ -2020,6 +2020,20 @@ class SQLiteSwarmStore(SwarmStore):
             for row in self._all("SELECT data FROM jobs ORDER BY id")
         ]
 
+    def recent_jobs(self, limit: int) -> list[Job]:
+        # The dashboard index shows 50; decode only those, not every job ever run.
+        if not self.db_path.exists():
+            return []
+        self._ensure_attached()
+        return [
+            job_from_dict(json.loads(row["data"]))
+            for row in self._all(
+                "SELECT data FROM jobs "
+                "ORDER BY json_extract(data, '$.created_at') DESC, id DESC LIMIT ?",
+                (max(0, int(limit)),),
+            )
+        ]
+
     def latest_job(self) -> Optional[Job]:
         self._ensure_attached()
         # Sort by the embedded created_at on the SQLite side and only

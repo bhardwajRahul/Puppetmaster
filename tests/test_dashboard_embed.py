@@ -57,8 +57,10 @@ class DashboardEmbedModeTests(unittest.TestCase):
         self.assertIn("jobHref(job.id, embedMode)", _PAGE_APP_JS)
         self.assertNotIn("?job=${encodeURIComponent(job.id)}", _PAGE_APP_JS)
 
-    def test_live_polling_is_unchanged(self) -> None:
-        self.assertIn("window.setInterval(tick, 1500)", _PAGE_APP_JS)
+    def test_live_polling_pauses_when_hidden_and_backs_off_when_settled(self) -> None:
+        self.assertIn("window.setInterval(pollTick, 1500)", _PAGE_APP_JS)
+        self.assertIn("if (document.hidden) return;", _PAGE_APP_JS)
+        self.assertIn('SETTLED_JOB = new Set(["complete", "failed", "cancelled"])', _PAGE_APP_JS)
         self.assertIn('requestJson("/api/job?id=" + encodeURIComponent(jobId))', _PAGE_APP_JS)
         self.assertIn('requestJson("/api/jobs")', _PAGE_APP_JS)
 
