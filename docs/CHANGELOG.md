@@ -1,3 +1,26 @@
+## v1.27.32 — 2026-09-29
+
+**Faster turns for hosts: warm CodeGraph context and keep-alive provider calls.**
+
+- `codegraph_context` runs `codegraph explore` through a warm per-workspace
+  helper that keeps the graph open and makes the same
+  `ToolHandler.execute('codegraph_explore')` call as the CLI, so output is
+  byte-identical. On a mid-size repo: 265-365 ms -> 134-165 ms per new
+  question; in a small workspace the host's pre-request overhead dropped from
+  ~135 ms to ~33 ms. The CLI remains the fallback (unknown install layout,
+  start failure, timeout, error reply). Helpers restart when the index files
+  change, idle out after 5 minutes, cap at 4 workspaces and exit with their
+  owner. `prewarm_codegraph_context(cwd)` lets a host start one early.
+  `PUPPETMASTER_CODEGRAPH_WARM=0` disables it.
+- The context cache is keyed on the index signature, so a re-index is never
+  answered from an older graph.
+- Agentic worker provider calls (`_post_json` and streaming) reuse keep-alive
+  connections instead of a new TCP + TLS handshake per request. Reuse only
+  after a fully read response and a liveness check; requests are never resent.
+- Tests: the setup-wizard tests now stub the installers where `setup` calls
+  them; before, a machine with the `claude` CLI re-registered the real
+  Puppetmaster MCP server to the test interpreter.
+
 ## v1.27.31 — 2026-09-29
 
 **Long-lived hosts stop accumulating helpers, and dashboard polls stop writing.**
