@@ -655,7 +655,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
 
 def list_jobs_snapshot(store: SwarmStore, *, limit: int = 50) -> list[dict[str, Any]]:
     """Compact list of jobs (most recent first) for the dashboard index."""
-    jobs = store.list_jobs()
+    jobs = store.recent_jobs(limit)
     rows = []
     for job in jobs:
         rows.append(

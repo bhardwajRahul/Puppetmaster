@@ -3504,6 +3504,11 @@ class SwarmStore(StoreContracts):
             jobs.append(job_from_dict(self.read_json(path)))
         return jobs
 
+    def recent_jobs(self, limit: int) -> list[Job]:
+        """Newest ``limit`` jobs by created_at, newest first."""
+        jobs = sorted(self.list_jobs(), key=lambda job: job.created_at or "", reverse=True)
+        return jobs[:limit]
+
     def latest_job(self) -> Optional[Job]:
         jobs = self.list_jobs()
         if not jobs:

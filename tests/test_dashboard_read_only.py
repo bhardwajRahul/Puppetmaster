@@ -31,3 +31,18 @@ class DashboardReadOnlyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DashboardIndexCostTests(unittest.TestCase):
+    def test_index_decodes_only_the_rows_it_shows(self):
+        from puppetmaster import sqlite_store
+        with TemporaryDirectory() as root:
+            supervisor = create_store("sqlite", root, mode="ensure")
+            ids = [supervisor.create_job(f"goal {i}").id for i in range(12)]
+            decoded = []
+            real = sqlite_store.job_from_dict
+            with patch.object(sqlite_store, "job_from_dict", side_effect=lambda d: decoded.append(1) or real(d)):
+                rows = list_jobs_snapshot(viewer_store("sqlite", root), limit=5)
+            self.assertEqual(len(rows), 5)
+            self.assertEqual(len(decoded), 5)
+            self.assertEqual({r["id"] for r in rows} <= set(ids), True)
