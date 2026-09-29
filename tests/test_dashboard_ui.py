@@ -23,7 +23,7 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("html.embed .rail { display: none; }", INDEX_HTML)
         self.assertIn("function isEmbedSearch", INDEX_HTML)
         self.assertIn("jobHref(job.id, embedMode)", INDEX_HTML)
-        self.assertIn("window.setInterval(tick, 1500)", INDEX_HTML)
+        self.assertIn("window.setInterval(pollTick, 1500)", INDEX_HTML)
 
     def test_embed_query_helpers_parse_job_and_embed_flags(self) -> None:
         node = shutil.which("node")
