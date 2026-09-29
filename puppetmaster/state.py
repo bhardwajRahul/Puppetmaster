@@ -248,9 +248,15 @@ def _owning_state_dirs(candidates, job_id, *, job_ref=None, required_root=None):
             raise ValueError("ambiguous job_id; provide job_ref or state_dir")
         return matches
     finally:
-        transport = getattr(reader, '_readonly_transport', None)
-        if transport is not None:
-            transport.close()
+        # Close through the slot so the cleanup registry drops its owner too;
+        # a direct transport.close() left one registry entry per scan.
+        slot = getattr(reader, '_readonly_slot', None)
+        if slot is not None:
+            slot.discard()
+        else:
+            transport = getattr(reader, '_readonly_transport', None)
+            if transport is not None:
+                transport.close()
 
 
 def state_owns_job(root: Path, job_id: str, *, job_ref=None, _reader=None) -> bool:
