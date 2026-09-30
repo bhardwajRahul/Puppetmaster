@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -88,9 +89,11 @@ class _Helper:
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # The workspace is an argument, never the process's cwd: Windows cannot
+        # delete or rename a directory that a live process sits in.
         self.proc = subprocess.Popen(
             [node, str(_HELPER_JS), lib, cwd],
-            cwd=cwd,
+            cwd=tempfile.gettempdir(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
