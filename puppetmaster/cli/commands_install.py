@@ -1032,14 +1032,16 @@ def _run_setup(args) -> int:
     print("=== step 6/9: install-claude-mcp ===")
     if "claude-code" not in enabled_adapters:
         print("  skipped  claude-code platform disabled by the platform lock — not installing its MCP client")
-    elif resolve_claude_command() is None:
+    # Through the cli namespace like the cursor/codex steps above, so the one
+    # seam callers and tests stub covers every installer this wizard runs.
+    elif cli.resolve_claude_command() is None:
         print(
             "  skipped  Claude Code CLI not found — install with "
             "`npm install -g @anthropic-ai/claude-code` (or set CLAUDE_CODE_COMMAND) "
             "and re-run `puppetmaster install-claude-mcp` later"
         )
     else:
-        claude_result = install_claude_mcp(
+        claude_result = cli.install_claude_mcp(
             force=getattr(args, "force", False),
             dry_run=False,
             skip_handshake=False,
