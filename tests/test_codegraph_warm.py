@@ -24,7 +24,7 @@ class ToolHandler {
   async execute(name, args) {
     if (args.query === 'sleep') { await new Promise(r => setTimeout(r, 2000)); }
     if (args.query === 'fail') return { isError: true, content: [{ text: 'boom' }] };
-    return { content: [{ text: `${name}|${args.query}|${args.maxFiles}|${process.pid}|${this.cg.root}` }] };
+    return { content: [{ text: `${name}|${args.query}|${args.maxFiles}|${process.pid}|${this.cg.root}|${process.cwd()}` }] };
   }
 }
 exports.ToolHandler = ToolHandler;
@@ -65,9 +65,11 @@ class WarmExploreTests(unittest.TestCase):
     def test_one_helper_answers_repeated_queries_from_the_resolved_root(self):
         first = codegraph_warm.explore(self.invocation, str(self.repo / "sub"), "a b", 15, 10)
         second = codegraph_warm.explore(self.invocation, str(self.repo / "sub"), "c", 15, 10)
-        name, query, max_files, pid, root = first.split("|")
+        name, query, max_files, pid, root, helper_cwd = first.split("|")
         self.assertEqual((name, query, max_files), ("codegraph_explore", "a b", "15"))
         self.assertEqual(Path(root).resolve(), self.repo.resolve())
+        # Windows cannot delete or rename a directory a live process sits in.
+        self.assertNotIn(str(self.repo.resolve()), str(Path(helper_cwd).resolve()))
         self.assertEqual(second.split("|")[3], pid)
 
     def test_index_change_restarts_the_helper(self):

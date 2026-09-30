@@ -1,3 +1,13 @@
+## v1.27.33 — 2026-09-30
+
+**The warm CodeGraph helper no longer holds the workspace directory.**
+
+- The helper started with the workspace as its working directory. Windows
+  cannot delete or rename a directory that a live process sits in, so an
+  idle helper (up to 5 minutes) blocked renaming or removing the project
+  folder. It now starts in the system temp directory; the workspace is only
+  an argument. Output is unchanged.
+
 ## v1.27.32 — 2026-09-29
 
 **Faster turns for hosts: warm CodeGraph context and keep-alive provider calls.**
