@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.27.32](CHANGELOG.md#v12732--2026-09-29) — Faster turns for hosts: warm CodeGraph context and keep-alive provider calls. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+**Current release:** [v1.27.33](CHANGELOG.md#v12733--2026-09-30) — The warm CodeGraph helper no longer holds the workspace directory. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
 
 ## Start here
 
